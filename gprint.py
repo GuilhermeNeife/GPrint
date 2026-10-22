@@ -3481,7 +3481,7 @@ def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific, filacolor)
         return None
 # --- INICIALIZAÇÃO ---
 CONFIG = carregar_configuracoes()
-COMMON_FORMATS_PB = ["A4", "A3", "SRA3", "22X32", "24X32", "24,5X34", "25,2X35,6", "32X45", "32X48"]
+COMMON_FORMATS_PB = ["A4", "A3", "SRA3", "22X32", "24X32","24X33", "25X36", "26X36", "32X45", "32X48"]
 COMMON_PAPERS_PB  = ["OFFSET 63G", "OFFSET 70G", "OFFSET 75G", "OFFSET 90G", "AVENA 70G", "AVENA 80G", "BOLD 90G"]
 COMMON_FORMATS_CL = ["22X32", "24X32", "25X36", "32X45", "32X48"]
 COMMON_PAPERS_CL  = ["COUCHE 90G", "OFFSET 63G", "OFFSET 70G", "OFFSET 75G", "OFFSET 90G", "AVENA 70G", "AVENA 80G", "BOLD 90G"]
