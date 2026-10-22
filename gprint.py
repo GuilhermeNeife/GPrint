@@ -1,3 +1,4 @@
+from builtins import super
 import os
 import sys
 import shutil
@@ -32,7 +33,7 @@ import uuid
 from openpyxl.utils import get_column_letter
 import random
 
-DATA_LIMITE = "31/12/2026"
+DATA_LIMITE = "29/07/2027"
 PASTA_BASE = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\UICLAP\LOTES"
 PASTA_TRABALHO = os.path.join(os.environ.get('TEMP', os.path.expanduser("~")), "UICLAP_TEMP")
 CONFIG_FILE = os.path.expanduser("~/uiclap_config.json")
@@ -935,9 +936,9 @@ class MioloTab(ttk.Frame):
                 self.log(f"✅ PDF gerado: {os.path.basename(output_path)}", "SUCESSO")
                 
                 # Quantidade de envios conforme o modo de montagem
-                if p["MODO"] == "dois_na_folha":
+                if p["MODO"] == "dois_na_folha" or p["MODO"] == "um_na_folha_atexco" and p["QTD"] >= 10:
                     qtd_envios = 1
-                    self.log(f"🔢 Modo 2 na folha: {p['QTD']} exemplares -> 1 envio", "INFO")
+                    self.log(f"🔢 Modo 1 envio/: {p['QTD']} exemplares -> 1 envio", "INFO")
                 else:
                     qtd_envios = p["QTD"]
                     self.log(f"🔢 Modo {p['MODO']}: {p['QTD']} exemplares -> {qtd_envios} envios", "INFO")
