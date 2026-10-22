@@ -31,7 +31,7 @@ import io
 import math
 
 # --- CONSTANTES ---
-DATA_LIMITE = "31/07/2027"
+DATA_LIMITE = "31/10/2026"
 PASTA_BASE = r"N:\____REPOSITORIO GERAL POD\UICLAP\LOTES"
 PASTA_TRABALHO = os.path.join(os.environ.get('TEMP', os.path.expanduser("~")), "UICLAP_TEMP")
 CONFIG_FILE = os.path.expanduser("~/uiclap_config.json")
@@ -136,7 +136,7 @@ def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific,filacolor):
         cor_marca = CONFIG['cor_fosco'] if laminacao.upper() == "FOSCO" else CONFIG['cor_brilho']
 
         if codigoacab == "3":
-            deslocamento_y = CONFIG['deslocamento_padrao']+8
+            deslocamento_y = CONFIG['deslocamento_padrao']
         elif codigoacab == "2":
             deslocamento_y = CONFIG['deslocamento_padrao'] + 12
         else:
@@ -1562,7 +1562,6 @@ class Application:
     def setup_ui(self):
         self.root.title("Sistema de Processamento de Arquivos")
         self.root.geometry("900x700")
-        self.root.state('zoomed')
         self.center_window()
         
         self.criar_menu_superior()
@@ -1719,6 +1718,14 @@ class Application:
         )
         self.listbox_arquivos.pack(fill=BOTH, expand=True, padx=5, pady=(0, 10))
         
+        scrollbar = ttk.Scrollbar(
+            selection_frame,
+            orient=VERTICAL,
+            command=self.listbox_arquivos.yview,
+            bootstyle=PRIMARY
+        )
+        scrollbar.pack(side=RIGHT, fill=Y)
+        self.listbox_arquivos.config(yscrollcommand=scrollbar.set)
         
         self.checkbox_imprimir = ttk.Checkbutton(
             selection_frame, 
