@@ -24,9 +24,16 @@ from pikepdf import Pdf, Rectangle
 from reportlab.lib.pagesizes import A3, A4
 from reportlab.pdfgen import canvas
 from PIL import Image
+import re
+import sqlite3
+import openpyxl
+from openpyxl import Workbook, load_workbook
+import uuid
+from openpyxl.utils import get_column_letter
+import random
 
 DATA_LIMITE = "31/12/2026"
-PASTA_BASE = r"N:\____REPOSITORIO GERAL POD\UICLAP\LOTES"
+PASTA_BASE = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\UICLAP\LOTES"
 PASTA_TRABALHO = os.path.join(os.environ.get('TEMP', os.path.expanduser("~")), "UICLAP_TEMP")
 CONFIG_FILE = os.path.expanduser("~/uiclap_config.json")
 MM = 2.83465 # Fator de conversão mm para pontos
@@ -41,11 +48,28 @@ logging.basicConfig(
 # Garantir que a pasta de trabalho exista
 if not os.path.exists(PASTA_TRABALHO):
     os.makedirs(PASTA_TRABALHO, exist_ok=True)
-# Lista de temas do ttkbootstrap
-TEMAS_DISPONIVEIS = [
-    "cosmo", "flatly", "journal", "litera", "lumen", "minty", "pulse",
-    "sandstone", "united", "yeti", "morph", "darkly", "superhero",
-    "solar", "cyborg", "vapor"]
+# Temas claros
+TEMAS_CLAROS = [
+    "cosmo",
+    "flatly",
+    "journal",
+    "litera",
+    "lumen",
+    "minty",
+    "pulse",
+    "sandstone",
+    "united",
+    "yeti",
+    "morph"
+]
+# Temas escuros
+TEMAS_ESCUROS = [
+    "darkly",
+    "superhero",
+    "solar",
+    "cyborg",
+    "vapor"
+]
 DEFAULT_CONFIG = {
     'cor_fosco': (0, 0, 1),
     'cor_brilho': (1, 0.7, 0.1),
@@ -323,12 +347,130 @@ class MioloTab(ttk.Frame):
         self.thread = None
         self.log_queue = queue.Queue()
         self.impressora_var = tk.StringVar()
-        self.status_var = tk.StringVar(value="Aguardando arquivo TXT...")
+        self.status_var = tk.StringVar(value="✅ Pronto para processar")
+        
+        # Caminho do banco SQLite
+        self.log_db_path = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\UICLAP\LOGS\impressoes.db"
+        self.log_db_local_path = os.path.join(os.path.expanduser("~"), "Desktop", "impressoes_fallback.db")
+        
         self.setup_ui()
         self.atualizar_log_queue()
-        
         logging.info("Sistema iniciado")
 
+    # ------------------------------------------------------------
+    # Mecanismo de trava para escrita concorrente no SQLite
+    # ------------------------------------------------------------
+    def _adquirir_trava(self, caminho_trava, timeout=5):
+        inicio = time.time()
+        while True:
+            try:
+                fd = os.open(caminho_trava, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                os.close(fd)
+                return True
+            except FileExistsError:
+                if time.time() - inicio > timeout:
+                    return False
+                time.sleep(random.uniform(0.1, 0.4))
+            except Exception:
+                return False
+
+    def _liberar_trava(self, caminho_trava):
+        try:
+            os.remove(caminho_trava)
+        except:
+            pass
+
+    # ------------------------------------------------------------
+    # REGISTRO DE LOG NO BANCO SQLite (sem total_paginas)
+    # ------------------------------------------------------------
+    def registrar_log_sqlite(self, dados):
+        caminho_db = self.log_db_path
+        try:
+            diretorio = os.path.dirname(caminho_db)
+            if not os.path.exists(diretorio):
+                raise Exception("Diretório de rede inacessível")
+            teste = os.path.join(diretorio, ".write_test")
+            with open(teste, 'w') as f:
+                f.write("test")
+            os.remove(teste)
+        except:
+            caminho_db = self.log_db_local_path
+            self.log(f"⚠️ Usando fallback local para banco: {caminho_db}", "INFO")
+
+        os.makedirs(os.path.dirname(caminho_db), exist_ok=True)
+
+        trava = caminho_db + ".lock"
+
+        if not self._adquirir_trava(trava, timeout=5):
+            self.log("❌ Não foi possível adquirir trava de escrita no banco", "ERRO")
+            return False
+
+        try:
+            conn = sqlite3.connect(caminho_db, timeout=10)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            cursor = conn.cursor()
+
+            # Tabela original (sem total_paginas)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    data_hora TEXT,
+                    lote TEXT,
+                    pilha TEXT,
+                    arquivo TEXT,
+                    maquina TEXT,
+                    ip TEXT,
+                    formato TEXT,
+                    modo TEXT,
+                    quantidade INTEGER,
+                    status TEXT,
+                    erro TEXT,
+                    copia TEXT,
+                    usuario TEXT,
+                    montagem_ok INTEGER DEFAULT 0,
+                    envio_ok INTEGER DEFAULT 0
+                );
+            """)
+
+            valores = (
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                dados.get('lote', ''),
+                dados.get('pilha', ''),
+                dados.get('arquivo', ''),
+                dados.get('maquina', ''),
+                dados.get('ip', ''),
+                dados.get('formato', ''),
+                dados.get('modo', ''),
+                dados.get('quantidade', 0),
+                dados.get('status', ''),
+                dados.get('erro', ''),
+                dados.get('copia', ''),
+                dados.get('usuario', ''),
+                dados.get('montagem_ok', 0),
+                dados.get('envio_ok', 0)
+            )
+
+            cursor.execute("""
+                INSERT INTO logs 
+                (data_hora, lote, pilha, arquivo, maquina, ip,
+                 formato, modo, quantidade, status, erro, copia, usuario,
+                 montagem_ok, envio_ok)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, valores)
+
+            conn.commit()
+            conn.close()
+            self._liberar_trava(trava)
+            return True
+
+        except Exception as e:
+            self._liberar_trava(trava)
+            self.log(f"❌ Erro ao gravar no banco SQLite: {e}", "ERRO")
+            return False
+
+    # ------------------------------------------------------------
+    # Interface gráfica (setup_ui) - layout ajustado
+    # ------------------------------------------------------------
     def setup_ui(self):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
@@ -338,23 +480,25 @@ class MioloTab(ttk.Frame):
 
         main_frame.columnconfigure(0, weight=1)
         main_frame.rowconfigure(2, weight=1)
-        main_frame.rowconfigure(3, weight=1)
+        main_frame.rowconfigure(3, weight=2)
 
         # ================= CONFIG =================
         config_frame = ttk.LabelFrame(main_frame, text="⚙️ Configurações de Impressão", bootstyle=(PRIMARY))
         config_frame.grid(row=0, column=0, sticky="ew", pady=5)
 
-        config_frame.columnconfigure(1, weight=1)
+        # Agora teremos 3 colunas: label, IP, toggle (e checkboxes ocupam as 3)
+        config_frame.columnconfigure(0, weight=0)  # labels
+        config_frame.columnconfigure(1, weight=1)  # IP
+        config_frame.columnconfigure(2, weight=1)  # toggle
 
         ttk.Label(config_frame, text="Impressora:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
 
         impressoras = [
             "ATEXCO - 192.168.200.121",
+            "BALTORO - 192.168.200.73",
             "OCÉ 1 - 192.168.200.80",
-            "OCÉ 2 - 192.168.200.81",
             "OCÉ 3 - 192.168.200.85",
             "RICOH - 192.168.200.84"
-            
         ]
 
         self.combo_impressora = ttk.Combobox(
@@ -364,7 +508,7 @@ class MioloTab(ttk.Frame):
             state="readonly"
         )
         self.combo_impressora.current(0)
-        self.combo_impressora.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        self.combo_impressora.grid(row=0, column=1, columnspan=2, padx=5, pady=5, sticky="ew")
 
         ttk.Label(config_frame, text="IP selecionado:").grid(row=1, column=0, padx=5, pady=2, sticky="w")
 
@@ -378,47 +522,49 @@ class MioloTab(ttk.Frame):
 
         self.combo_impressora.bind('<<ComboboxSelected>>', self.atualizar_ip_label)
 
-
+        # Toggle de impressão automática agora na MESMA LINHA do IP (coluna 2)
         self.impressao_auto_var = tk.BooleanVar(value=True)
-
         self.toggle_impressao = ttk.Checkbutton(
             config_frame,
-            text="enviar para impressora automaticamente após processar",
+            text="enviar para impressora automaticamente",
             variable=self.impressao_auto_var,
             bootstyle="success-round-toggle"
         )
-
         self.toggle_impressao.grid(
-            row=2,
-            column=0,
-            columnspan=2,
-            padx=5,
-            pady=10,
+            row=1, column=2,
+            padx=5, pady=2,
             sticky="w"
         )
 
         # =========================================
         # CHECKBOX COMPRIMIR PDF
         # =========================================
-
         self.comprimir_pdf_var = tk.BooleanVar(value=False)
-
         self.checkbox_comprimir = ttk.Checkbutton(
             config_frame,
             text="comprimir PDF antes do envio (Deixar selecionado somente em casos extremos)",
             variable=self.comprimir_pdf_var,
             bootstyle="info-square-toggle"
         )
-
         self.checkbox_comprimir.grid(
-            row=3,
-            column=0,
-            columnspan=2,
-            padx=5,
-            pady=5,
-            sticky="w"
+            row=2, column=0, columnspan=3,
+            padx=5, pady=5, sticky="w"
         )
-        
+
+        # =========================================
+        # NOVO CHECKBOX "Enviar apenas uma cópia"
+        # =========================================
+        self.enviar_uma_copia_var = tk.BooleanVar(value=False)
+        self.chk_enviar_uma = ttk.Checkbutton(
+            config_frame,
+            text="Enviar apenas uma cópia (ignora regra padrão de divisão)",
+            variable=self.enviar_uma_copia_var,
+            bootstyle="info-square-toggle"
+        )
+        self.chk_enviar_uma.grid(
+            row=3, column=0, columnspan=3,
+            padx=5, pady=5, sticky="w"
+        )
 
         # ================= ARQUIVO =================
         file_frame = ttk.LabelFrame(
@@ -436,10 +582,6 @@ class MioloTab(ttk.Frame):
 
         file_frame.columnconfigure(1, weight=1)
 
-        # =========================================
-        # BOTÃO
-        # =========================================
-
         self.btn_select = ttk.Button(
             file_frame,
             text="Selecionar TXT",
@@ -454,10 +596,6 @@ class MioloTab(ttk.Frame):
             pady=5,
             sticky="w"
         )
-
-        # =========================================
-        # LABEL
-        # =========================================
 
         self.file_label = ttk.Label(
             file_frame,
@@ -528,21 +666,20 @@ class MioloTab(ttk.Frame):
         self.log_text.grid(row=0, column=0, sticky="nsew")
         log_scroll.grid(row=0, column=1, sticky="ns")
 
-        # ================= PROGRESS =================
-        progress_frame = ttk.Frame(main_frame)
+        # ================= ANDAMENTO =================
+        progress_frame = ttk.LabelFrame(main_frame, text="⏳ Andamento", bootstyle=(SUCCESS))
         progress_frame.grid(row=4, column=0, sticky="ew", pady=5)
-
         progress_frame.columnconfigure(0, weight=1)
 
         self.progress = ttk.Progressbar(
             progress_frame,
             mode='determinate',
-            bootstyle="success-striped"
+            bootstyle=SUCCESS 
         )
-        self.progress.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.progress.grid(row=0, column=0, sticky="ew", padx=5, pady=(5, 5))
 
         self.progress_label = ttk.Label(progress_frame, text="0/0")
-        self.progress_label.grid(row=0, column=1)
+        self.progress_label.grid(row=0, column=1, padx=(0, 10), pady=5)
 
         # ================= STATUS =================
         status_frame = ttk.Frame(main_frame)
@@ -566,6 +703,7 @@ class MioloTab(ttk.Frame):
             width=22
         )
         self.btn_processar.grid(row=0, column=1, sticky="e")
+
     def atualizar_ip_label(self, event=None):
         impressora = self.impressora_var.get()
         if ' - ' in impressora:
@@ -573,6 +711,7 @@ class MioloTab(ttk.Frame):
             self.ip_label.config(text=ip)
         else:
             self.ip_label.config(text=impressora)
+
     def atualizar_log_queue(self):
         try:
             while True:
@@ -585,12 +724,12 @@ class MioloTab(ttk.Frame):
             pass
         finally:
             self.after(100, self.atualizar_log_queue)
+
     def log(self, mensagem, tipo="INFO"):
         timestamp = datetime.now().strftime("%H:%M:%S")
         cores = {"INFO": "", "SUCESSO": "✅ ", "ERRO": "❌ ", "ENVIO": "🚀 "}
         prefixo = cores.get(tipo, "")
         msg_formatada = f"[{timestamp}] {prefixo}{mensagem}"
-        
         self.log_queue.put(msg_formatada)
         
         if tipo == "ERRO":
@@ -601,6 +740,7 @@ class MioloTab(ttk.Frame):
             logging.info(f"📤 {mensagem}")
         else:
             logging.info(mensagem)
+
     def iniciar_processamento(self):
         if not self.processos:
             messagebox.showwarning("Aviso", "Carregue um arquivo TXT primeiro.")
@@ -625,49 +765,18 @@ class MioloTab(ttk.Frame):
         
         self.thread = threading.Thread(target=self._executar, daemon=True)
         self.thread.start()
+
     def enviar_por_lpr(self, caminho_arquivo, ip, formato, job_name, copia_numero, total_copias):
-        """Envia arquivo via protocolo LPR com parâmetro -J para nome do job"""
-
         try:
-
-            import uuid
-
-            # =========================
-            # LOG INICIAL
-            # =========================
-
-            self.log(
-                f"📤 Enviando cópia {copia_numero}/{total_copias}...",
-                "ENVIO"
-            )
-
-            self.log(
-                f"   IP: {ip}, Fila: {formato}, Job: {job_name}",
-                "ENVIO"
-            )
-
-            # =========================
-            # CRIA PDF TEMPORÁRIO ÚNICO
-            # =========================
-
+            self.log(f"📤 Enviando cópia {copia_numero}/{total_copias}...", "ENVIO")
+            self.log(f"   IP: {ip}, Fila: {formato}, Job: {job_name}", "ENVIO")
+            
             pasta_temp = tempfile.gettempdir()
-
             nome_temp = f"{uuid.uuid4()}.pdf"
+            arquivo_temp = os.path.join(pasta_temp, nome_temp)
 
-            arquivo_temp = os.path.join(
-                pasta_temp,
-                nome_temp
-            )
-
-            # copia PDF original
             shutil.copy2(caminho_arquivo, arquivo_temp)
-
-            # pequena pausa
             time.sleep(1)
-
-            # =========================
-            # COMANDO LPR
-            # =========================
 
             comando = [
                 "lpr",
@@ -684,18 +793,10 @@ class MioloTab(ttk.Frame):
                 timeout=120
             )
 
-            # =========================
-            # REMOVE TEMPORÁRIO
-            # =========================
-
             try:
                 os.remove(arquivo_temp)
             except:
                 pass
-
-            # =========================
-            # DEBUG
-            # =========================
 
             print(f"\n--- LPR DEBUG (cópia {copia_numero}) ---")
             print(f"Arquivo original: {caminho_arquivo}")
@@ -706,72 +807,27 @@ class MioloTab(ttk.Frame):
             print(f"STDERR: {resultado.stderr}")
             print(f"-----------------\n")
 
-            # =========================
-            # LOGS
-            # =========================
-
             if resultado.stdout:
-                self.log(
-                    f"   Saída: {resultado.stdout}",
-                    "ENVIO"
-                )
-
+                self.log(f"   Saída: {resultado.stdout}", "ENVIO")
             if resultado.stderr:
-                self.log(
-                    f"   Erro: {resultado.stderr}",
-                    "ERRO"
-                )
-
-            # =========================
-            # RESULTADO
-            # =========================
+                self.log(f"   Erro: {resultado.stderr}", "ERRO")
 
             if resultado.returncode == 0:
-
-                self.log(
-                    f"✅ Cópia {copia_numero} enviada com sucesso",
-                    "SUCESSO"
-                )
-
+                self.log(f"✅ Cópia {copia_numero} enviada com sucesso", "SUCESSO")
                 return True
-
             else:
-
-                self.log(
-                    f"❌ Falha no envio da cópia {copia_numero} "
-                    f"(código {resultado.returncode})",
-                    "ERRO"
-                )
-
+                self.log(f"❌ Falha no envio da cópia {copia_numero} (código {resultado.returncode})", "ERRO")
                 return False
 
         except subprocess.TimeoutExpired:
-
-            self.log(
-                f"❌ Timeout no envio da cópia {copia_numero} (120s)",
-                "ERRO"
-            )
-
+            self.log(f"❌ Timeout no envio da cópia {copia_numero} (120s)", "ERRO")
             return False
-
         except Exception as e:
-
-            self.log(
-                f"❌ Exceção no envio: {str(e)}",
-                "ERRO"
-            )
-
+            self.log(f"❌ Exceção no envio: {str(e)}", "ERRO")
             print(f"Erro detalhado: {e}")
-
             return False
-    def _executar(self):
-        import math
-        import shutil
-        import time
-        import os
-        import re
-        from datetime import datetime
 
+    def _executar(self):
         desktop = os.path.join(os.path.expanduser("~"), "Desktop")
         output_dir = os.path.join(desktop, "PDFs_PROCESSADOS")
         os.makedirs(output_dir, exist_ok=True)
@@ -788,19 +844,32 @@ class MioloTab(ttk.Frame):
         impressora_selecionada = self.impressora_var.get()
         ip_extraido = impressora_selecionada.split(' - ')[1].strip() if ' - ' in impressora_selecionada else impressora_selecionada
         
+        # ===== EXTRAÇÃO DE LOTE (CAMINHO COMPLETO) E PILHA (NOME DO TXT) =====
+        if hasattr(self, 'arquivo_txt') and self.arquivo_txt:
+            lote = os.path.dirname(self.arquivo_txt)
+            pilha = os.path.splitext(os.path.basename(self.arquivo_txt))[0]
+        else:
+            lote = "desconhecido"
+            pilha = "desconhecido"
+
+        # ===== NOME DO USUÁRIO DO WINDOWS =====
+        try:
+            usuario = os.getlogin()
+        except:
+            usuario = os.environ.get('USERNAME', 'desconhecido')
+
         self.log(f"\n{'='*50}", "INFO")
         self.log(f"🚀 INICIANDO PROCESSAMENTO", "INFO")
+        self.log(f"👤 Usuário: {usuario}", "INFO")
+        self.log(f"📁 Lote (pasta): {lote}", "INFO")
+        self.log(f"📄 Pilha (arquivo TXT): {pilha}", "INFO")
         self.log(f"📠 Impressora: {impressora_selecionada}", "INFO")
         self.log(f"📠 IP: {ip_extraido}", "INFO")
         self.log(f"📁 Pasta de saída: {output_dir}", "INFO")
         self.log(f"{'='*50}", "INFO")
 
-        # ==========================================================
-        # DETERMINA O NOME DA PASTA PARA SALVAR PDFS QUANDO DESLIGADO
-        # ==========================================================
+        # Pasta para salvamento (envio desligado)
         nome_pasta_salvos = None
-        
-        # Tenta obter o nome do arquivo TXT carregado
         if hasattr(self, 'nome_base_txt') and self.nome_base_txt:
             nome_pasta_salvos = self.nome_base_txt
         elif hasattr(self, 'nome_arquivo_txt') and self.nome_arquivo_txt:
@@ -808,14 +877,12 @@ class MioloTab(ttk.Frame):
         elif hasattr(self, 'file_path') and self.file_path:
             nome_pasta_salvos = os.path.splitext(os.path.basename(self.file_path))[0]
         else:
-            # Fallback: usa o nome do primeiro processo (NOMEFIC) + timestamp
             if self.processos:
                 primeiro_nome = self.processos[0].get('NOMEFIC', 'desconhecido')
                 nome_pasta_salvos = f"{primeiro_nome}_{timestamp}"
             else:
                 nome_pasta_salvos = f"PDFs_SALVOS_{timestamp}"
         
-        # Sanitiza o nome (remove caracteres inválidos para pasta no Windows)
         nome_pasta_salvos = re.sub(r'[<>:"/\\|?*]', '_', nome_pasta_salvos)
         pasta_salvos = os.path.join(output_dir, nome_pasta_salvos)
         os.makedirs(pasta_salvos, exist_ok=True)
@@ -865,16 +932,48 @@ class MioloTab(ttk.Frame):
                 
                 self.log(f"✅ PDF gerado: {os.path.basename(output_path)}", "SUCESSO")
                 
-                qtd_envios = p["QTD"]
+                # Quantidade de envios conforme o modo de montagem
                 if p["MODO"] == "dois_na_folha":
-                    qtd_envios = math.ceil(p["QTD"] / 2)
-                    self.log(f"🔢 Modo 2 na folha: {p['QTD']} exemplares -> {qtd_envios} envios", "INFO")
-                if qtd_envios > 10:
-                    self.log(f"⚠️ Limite de envios excedido ({qtd_envios}). Enviando apenas 1 para teste.", "INFO")
+                    qtd_envios = 1
+                    self.log(f"🔢 Modo 2 na folha: {p['QTD']} exemplares -> 1 envio", "INFO")
+                else:
+                    qtd_envios = p["QTD"]
+                    self.log(f"🔢 Modo {p['MODO']}: {p['QTD']} exemplares -> {qtd_envios} envios", "INFO")
+
+                # Forçar apenas uma cópia caso a opção esteja marcada
+                if self.enviar_uma_copia_var.get():
+                    self.log("📌 Opção 'Enviar apenas uma cópia' ativada. Enviando 1 cópia.", "INFO")
                     qtd_envios = 1
                     
                 formato_base = p["FORMATO"]
-                job_name = p['NOMEFIC']
+               
+
+                if "RICOH" in impressora_selecionada:
+                    job_name = f"{p['IDENTIFIC']}_{p['NOMEFIC']}"
+                elif "BALTORO" in impressora_selecionada:
+                    job_name = f"{p['NOMEFIC']}_{p['IDENTIFIC']}"
+                else:
+                    job_name = p["NOMEFIC"]
+                
+
+                # ===== REGISTRO DE MONTAGEM COM SUCESSO =====
+                dados_montagem = {
+                    'lote': lote,
+                    'pilha': pilha,
+                    'arquivo': p['NOMEFIC'],
+                    'maquina': impressora_selecionada,
+                    'ip': ip_extraido,
+                    'formato': p['FORMATO'],
+                    'modo': p['MODO'],
+                    'quantidade': qtd_envios,
+                    'status': 'Montagem OK',
+                    'erro': '',
+                    'copia': '0/0',
+                    'usuario': usuario,
+                    'montagem_ok': 1,
+                    'envio_ok': 0
+                }
+                self.registrar_log_sqlite(dados_montagem)
                 
                 # Loop de envios (ou salvamentos)
                 for envio_idx in range(qtd_envios):
@@ -899,29 +998,62 @@ class MioloTab(ttk.Frame):
 
                     if self.impressao_auto_var.get():
                         self.log("🖨️ Impressão automática ativada", "INFO")
-                        if self.enviar_por_lpr(
+                        sucesso = self.enviar_por_lpr(
                             output_path,
                             ip_extraido,
                             formato_base,
                             job_name,
                             copia_num,
                             qtd_envios
-                        ):
+                        )
+                        if sucesso:
                             envio_count += 1
+                            status = "Enviado"
+                            erro = ""
+                            envio_ok_val = 1
                         else:
                             envio_erro_count += 1
+                            status = "Falha no envio"
+                            erro = "Falha no envio via LPR"
+                            envio_ok_val = 0
                     else:
-                        # MODO DESLIGADO: SALVA O PDF NA PASTA CRIADA
+                        # MODO DESLIGADO: SALVA O PDF
                         self.log(f"💾 Envio desligado. Salvando cópia {copia_num}/{qtd_envios} em {pasta_salvos}", "INFO")
-                        
                         nome_base_pdf = os.path.splitext(os.path.basename(output_path))[0]
                         nome_copia = f"{nome_base_pdf}_c{copia_num}.pdf"
                         destino = os.path.join(pasta_salvos, nome_copia)
-                        
-                        shutil.copy2(output_path, destino)
-                        self.log(f"✅ PDF salvo: {destino}", "SUCESSO")
-                        salvos_count += 1
-                        
+                        try:
+                            shutil.copy2(output_path, destino)
+                            self.log(f"✅ PDF salvo: {destino}", "SUCESSO")
+                            salvos_count += 1
+                            sucesso = True
+                            status = "Salvo"
+                            erro = ""
+                        except Exception as e:
+                            self.log(f"❌ Erro ao salvar: {e}", "ERRO")
+                            sucesso = False
+                            status = "Falha ao salvar"
+                            erro = str(e)
+                        envio_ok_val = 0   # salvar não conta como envio real
+
+                    # ===== REGISTRO DE ENVIO/SALVAMENTO =====
+                    dados_log = {
+                        'lote': lote,
+                        'pilha': pilha,
+                        'arquivo': p['NOMEFIC'],
+                        'maquina': impressora_selecionada,
+                        'ip': ip_extraido,
+                        'formato': p['FORMATO'],
+                        'modo': p['MODO'],
+                        'quantidade': qtd_envios,
+                        'status': status,
+                        'erro': erro,
+                        'copia': f"{copia_num}/{qtd_envios}",
+                        'usuario': usuario,
+                        'montagem_ok': 0,
+                        'envio_ok': envio_ok_val
+                    }
+                    self.registrar_log_sqlite(dados_log)
 
                     time.sleep(1.5)
                 
@@ -931,6 +1063,25 @@ class MioloTab(ttk.Frame):
                 self.log(f"❌ Erro: {str(e)}", "ERRO")
                 error_count += 1
                 logging.error(f"Erro detalhado: {e}", exc_info=True)
+                
+                # ===== REGISTRO DE FALHA NA MONTAGEM =====
+                dados_erro_montagem = {
+                    'lote': lote,
+                    'pilha': pilha,
+                    'arquivo': p.get('NOMEFIC', 'desconhecido'),
+                    'maquina': impressora_selecionada,
+                    'ip': ip_extraido,
+                    'formato': p.get('FORMATO', ''),
+                    'modo': p.get('MODO', ''),
+                    'quantidade': 0,
+                    'status': 'Montagem Erro',
+                    'erro': str(e),
+                    'copia': '0/0',
+                    'usuario': usuario,
+                    'montagem_ok': 0,
+                    'envio_ok': 0
+                }
+                self.registrar_log_sqlite(dados_erro_montagem)
 
         shutil.rmtree(sessao_temp, ignore_errors=True)
         
@@ -966,14 +1117,16 @@ class MioloTab(ttk.Frame):
                         f"🚀 Envios: {envio_count}\n"
                         f"💾 PDFs salvos: {salvos_count}\n"
                         f"📁 Pasta: {output_dir}\n"
-                        f"📂 Salvos em: {pasta_salvos}") 
+                        f"📂 Salvos em: {pasta_salvos}")
+
+
     def selecionar_txt(self):
-        """Seleciona um arquivo TXT usando diálogo de arquivo"""
         file_path = filedialog.askopenfilename(filetypes=[("Arquivos TXT", "*.txt")])
         if file_path:
             self.arquivo_txt = file_path
             self.file_label.config(text=os.path.basename(file_path))
             self.ler_arquivo_txt_miolo()
+
     def ler_arquivo_txt_miolo(self):
         try:
             self.processos = []
@@ -981,7 +1134,6 @@ class MioloTab(ttk.Frame):
             for item in self.tree.get_children():
                 self.tree.delete(item)
 
-            # 🔥 TENTA DIFERENTES ENCODINGS
             lines = None
             encodings = ['utf-8', 'cp1252', 'latin-1']
 
@@ -989,47 +1141,35 @@ class MioloTab(ttk.Frame):
                 try:
                     with open(self.arquivo_txt, 'r', encoding=enc) as f:
                         lines = f.readlines()
-
                     self.log(f"Arquivo lido com encoding: {enc}", "INFO")
                     self.nome_base_txt = os.path.splitext(os.path.basename(self.arquivo_txt))[0]
-
                     break
-
                 except UnicodeDecodeError:
                     continue
 
-            # SE NÃO CONSEGUIR LER
             if lines is None:
                 raise Exception("Não foi possível identificar o encoding do arquivo.")
 
             for idx, linha in enumerate(lines):
                 linha = linha.strip()
-
                 if not linha or linha.startswith('#'):
                     continue
 
                 campos = linha.split('|')
-
                 if len(campos) < 13:
                     continue
 
                 cod_acab = campos[9].strip()
-
                 mapa_acab = {
                     "1": "Corta e Empilha / 2 na folha",
                     "2": "Grampo",
                     "3": "1 na folha",
                     "4": "Corta e Empilha Rotacionado"
                 }
-
                 desc_acab = mapa_acab.get(cod_acab, "Desconhecido")
 
-                # QTD
                 qtd = int(campos[2].strip()) if campos[2].strip().isdigit() else 1
-
-                # QTD TOTAL
                 qtd_total_str = campos[10].strip() if len(campos) > 10 else "0"
-
                 try:
                     qtd_total = int(qtd_total_str)
                 except:
@@ -1044,48 +1184,52 @@ class MioloTab(ttk.Frame):
                     "QTD_total": qtd_total,
                     "NOMEFIC": campos[11].strip(),
                     "FORMATO": campos[12].strip(),
-                    "IDENTIFIC": campos[13].strip()
+                    "IDENTIFIC": campos[13].strip() if len(campos) > 13 else ""
                 }
 
-                # DEFINIÇÃO DE MODO
                 if cod_acab == "1":
-                    modo = "Corta_empilha" if qtd == 1 else "dois_na_folha"
-
+                    modo = "corta_empilha_rotacionado" if qtd < 10 else "dois_na_folha"
                 elif cod_acab == "2":
                     modo = "grampo"
-
                 elif cod_acab == "3":
                     modo = "um_na_folha"
-
                 elif cod_acab == "4":
-                    modo = "corta_empilha_rotacionado"
-
+                    modo = "corta_empilha_rotacionado" if qtd < 10 else "dois_na_folha"
                 elif cod_acab == "5":
                     modo = "dois_na_folha_rotacionado"
-
                 else:
                     modo = "Corta_empilha"
 
-                # EXTRAÇÃO DO FORMATO
-                formato_str = processo["FORMATO"].split('_')[0]
+                partes = processo["FORMATO"].split('_')
+                if len(partes) >= 2:
+                    formato_str = partes[1]
+                else:
+                    formato_str = partes[0]
 
+                formato_limpo = formato_str.lower().replace(',', '.')
                 try:
-                    formato_limpo = formato_str.lower().replace(',', '.')
-                    partes = formato_limpo.split('x')
+                    if 'x' in formato_limpo:
+                        dim_parts = formato_limpo.split('x')
+                    elif 'X' in formato_limpo:
+                        dim_parts = formato_limpo.lower().split('x')
+                    else:
+                        raise ValueError("Formato não contém 'x'")
 
-                    dim1 = float(partes[0])
-                    dim2 = float(partes[1])
+                    dim1 = float(dim_parts[0])
+                    dim2 = float(dim_parts[1])
 
                     if cod_acab == "3":
                         largura_mm = min(dim1, dim2) * 10
                         altura_mm = max(dim1, dim2) * 10
                         espacamento = 0
-
                     else:
                         largura_mm = max(dim1, dim2) * 10
                         altura_mm = min(dim1, dim2) * 10
-
-                        espacamento = 3 if f"{int(dim1)}x{int(dim2)}" in ["22x32", "32x22"] else 0
+                        if (int(round(dim1)) == 22 and int(round(dim2)) == 32) or \
+                           (int(round(dim1)) == 32 and int(round(dim2)) == 22):
+                            espacamento = 3
+                        else:
+                            espacamento = 0
 
                     processo.update({
                         "LARGURA_MM": largura_mm,
@@ -1095,7 +1239,8 @@ class MioloTab(ttk.Frame):
                         "DESC_ACAB": desc_acab
                     })
 
-                except:
+                except Exception as e:
+                    self.log(f"Erro ao converter formato da linha {idx+1}: {e} - usando valores padrão", "AVISO")
                     processo.update({
                         "LARGURA_MM": 480,
                         "ALTURA_MM": 320,
@@ -1106,11 +1251,10 @@ class MioloTab(ttk.Frame):
 
                 self.processos.append(processo)
 
-                # TREEVIEW
                 self.tree.insert('', 'end', values=(
                     f"L{processo['LINHA']}",
                     os.path.basename(processo['ARQUIVO']),
-                    processo['FORMATO'].split('_')[0],
+                    formato_str.upper(),
                     processo['CODIGOACAB'],
                     processo['MODO'],
                     processo['QTD'],
@@ -1118,24 +1262,13 @@ class MioloTab(ttk.Frame):
                 ))
 
             self.status_var.set(f"✅ {len(self.processos)} processos carregados")
-
             self.log(f"Arquivo carregado: {os.path.basename(self.arquivo_txt)}", "SUCESSO")
             self.log(f"Total de processos: {len(self.processos)}", "INFO")
-            
-            # ========== ADICIONE ESTA LINHA AQUI ==========
             self.nome_base_txt = os.path.splitext(os.path.basename(self.arquivo_txt))[0]
-            # ==============================================
 
         except Exception as e:
             messagebox.showerror("Erro", f"Erro ao ler arquivo: {e}")
             self.log(f"ERRO ao ler arquivo: {e}", "ERRO")
-    def atualizar_log(self, mensagem):
-        """Atualiza o log de mensagens"""
-        self.txt_view.config(state='normal')
-        self.txt_view.insert(tk.END, mensagem + "\n")
-        self.txt_view.see(tk.END)
-        self.txt_view.config(state='disabled')
-        self.winfo_toplevel().update()  # Atualiza a interface
 def get_border_pixmap(page, rect, zoom=2.0):
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, clip=rect)
@@ -1315,21 +1448,7 @@ def ajustar_para_media_box(rect, largura, altura):
     x1 = max(x0 + 1, min(rect.x1, largura))
     y1 = max(y0 + 1, min(rect.y1, altura))
     return fitz.Rect(x0, y0, x1, y1)
-def corta_empilha_rotacionado(input_path, output_path, output_width, output_height,
-                              sangria_mm=3, add_marcas=True,
-                              texto_offset_normal_mm=0.5, texto_offset_180_mm=0.5,
-                              comprimir_entrada=False):
-    """
-    Montagem corta‑empilha inteligente (frente e verso):
-    - Caderno único garantido (total ajustado para múltiplo de 4).
-    - Margem vertical adaptativa (5 mm, expandida para acomodar textos).
-    - Textos de identificação centralizados na margem de 5 mm.
-    - Textos desenhados por último → sobrepõem sangrias e marcas.
-    - Opção de comprimir PDF de entrada antes da montagem.
-    """
-
-    import os
-    import tempfile
+def corta_empilha_rotacionado(input_path, output_path, output_width, output_height,sangria_mm=3, add_marcas=True,texto_offset_normal_mm=0.5, texto_offset_180_mm=0.5,comprimir_entrada=False):
 
     # Se solicitado, comprime o PDF de entrada num arquivo temporário
     if comprimir_entrada:
@@ -1347,33 +1466,44 @@ def corta_empilha_rotacionado(input_path, output_path, output_width, output_heig
 
     nome_arquivo = os.path.basename(input_path)
 
-    def _dimensoes_referencia(doc):
-        try:
-            ref = doc.load_page(0)
-            if ref is not None:
-                return ref.rect.width, ref.rect.height
-        except Exception:
-            pass
-        try:
-            ref = doc[0]
-            if ref is not None:
-                return ref.rect.width, ref.rect.height
-        except Exception:
-            pass
-        print("Aviso: Usando tamanho A4 como referência para páginas em branco.")
-        return 210 * MM, 297 * MM
+    # ------------------------------------------------------------
+    # 1. Determinar tamanho padronizado para páginas em branco
+    # ------------------------------------------------------------
+    def _tamanho_padronizado(doc):
+        larguras = []
+        alturas = []
+        for i in range(len(doc)):
+            page = doc[i]
+            # Tenta obter trim box já definida, ou media box
+            trim = page.trimbox
+            if trim.is_infinite or trim.is_empty:
+                trim = page.mediabox
+            larguras.append(trim.width)
+            alturas.append(trim.height)
+        if not larguras:
+            return 210 * MM, 297 * MM  # fallback A4
+        # Usa mediana para evitar outliers
+        largura_pad = sorted(larguras)[len(larguras)//2]
+        altura_pad = sorted(alturas)[len(alturas)//2]
+        return largura_pad, altura_pad
 
+    largura_padrao, altura_padrao = _tamanho_padronizado(doc)
+
+    # ------------------------------------------------------------
+    # 2. Ajustar total de páginas para múltiplo de 4
+    # ------------------------------------------------------------
     total_original = len(doc)
     if total_original % 2 != 0:
-        w_ref, h_ref = _dimensoes_referencia(doc)
-        doc.new_page(width=w_ref, height=h_ref)
-        print(f"Total ímpar ({total_original}). Adicionada 1 página em branco (total: {len(doc)}).")
+        doc.new_page(width=largura_padrao, height=altura_padrao)
+        # Define trimbox igual à mediabox
+        doc[-1].set_trimbox(doc[-1].mediabox)
+        print(f"Total ímpar ({total_original}). Adicionada 1 página em branco (tamanho padronizado).")
 
     if len(doc) % 4 != 0:
-        w_ref, h_ref = _dimensoes_referencia(doc)
         for _ in range(2):
-            doc.new_page(width=w_ref, height=h_ref)
-        print(f"Total não múltiplo de 4. Adicionadas 2 páginas em branco (total: {len(doc)}).")
+            doc.new_page(width=largura_padrao, height=altura_padrao)
+            doc[-1].set_trimbox(doc[-1].mediabox)
+        print(f"Total não múltiplo de 4. Adicionadas 2 páginas em branco (tamanho padronizado).")
 
     out = fitz.open()
     sangria_pt = sangria_mm * MM
@@ -1399,11 +1529,10 @@ def corta_empilha_rotacionado(input_path, output_path, output_width, output_heig
     # Função de identificação (mantida)
     # =========================================================================
     def _adicionar_identificacao(nova_page, texto_esq, texto_dir, destino_esq, destino_dir, rot_esq, rot_dir):
-        font_size = 5                 # ajustado para caber na margem de 5 mm
-        altura_texto = 4 * MM         # 4 mm de altura
+        font_size = 5
+        altura_texto = 4 * MM
         margem_min = 0.5 * MM
 
-        # --- Página esquerda ---
         if texto_esq:
             if rot_esq == 180:
                 y0 = destino_esq.y1 + offset_180_pt
@@ -1424,7 +1553,6 @@ def corta_empilha_rotacionado(input_path, output_path, output_width, output_heig
                 nova_page.insert_textbox(rect, texto_esq, fontsize=font_size, fontname="helv",
                                          align=fitz.TEXT_ALIGN_CENTER, rotate=0)
 
-        # --- Página direita ---
         if texto_dir:
             if rot_dir == 180:
                 y0 = destino_dir.y1 + offset_180_pt
@@ -1506,15 +1634,13 @@ def corta_empilha_rotacionado(input_path, output_path, output_width, output_heig
         else:
             y_esq, y_dir = y_inf, y_sup
 
-        if sangria_pt > 0:
-            cabe_esq = (y_esq >= sangria_pt and y_esq + h_esq <= output_height - sangria_pt)
-            cabe_dir = (y_dir >= sangria_pt and y_dir + h_dir <= output_height - sangria_pt)
-        else:
-            cabe_esq = cabe_dir = True
-
+        # CENTRALIZAÇÃO HORIZONTAL (CORRIGIDA)
         largura_total = w_esq + w_dir + espaco_horizontal_pt + 2 * sangria_pt
-        x_inicio = 0.0 if largura_total > output_width else (output_width - largura_total) / 2
+        x_inicio = (output_width - largura_total) / 2
         x1 = x_inicio + sangria_pt
+
+        if largura_total > output_width:
+            print(f"Aviso: largura total ({largura_total/MM:.2f} mm) excede a folha ({output_width/MM:.2f} mm). Centralizado, mas haverá corte nas laterais.")
 
         destino_esq = fitz.Rect(x1, y_esq, x1 + w_esq, y_esq + h_esq)
         destino_dir = fitz.Rect(x1 + w_esq + espaco_horizontal_pt, y_dir,
@@ -1532,14 +1658,17 @@ def corta_empilha_rotacionado(input_path, output_path, output_width, output_heig
         if pagina_tem_conteudo(page_dir):
             nova.show_pdf_page(destino_dir, doc, idx_dir, clip=trim_dir, rotate=rot_dir)
 
-        # 2. Sangria
+        # 2. Sangria (com definição correta de cabe_esq/cabe_dir)
         if sangria_pt > 0:
+            cabe_esq = (destino_esq.x0 >= sangria_pt and destino_esq.x1 <= output_width - sangria_pt)
+            cabe_dir = (destino_dir.x0 >= sangria_pt and destino_dir.x1 <= output_width - sangria_pt)
+
             if cabe_esq and pagina_tem_conteudo(page_esq):
                 aplicar_sangria_espelhada_externa(page_esq, nova, trim_esq, destino_esq, sangria_pt,
-                                                  bordas=['top', 'bottom', 'left'], rotate=rot_esq)
+                                                bordas=['top', 'bottom', 'left'], rotate=rot_esq)
             if cabe_dir and pagina_tem_conteudo(page_dir):
                 aplicar_sangria_espelhada_externa(page_dir, nova, trim_dir, destino_dir, sangria_pt,
-                                                  bordas=['top', 'bottom', 'right'], rotate=rot_dir)
+                                                bordas=['top', 'bottom', 'right'], rotate=rot_dir)
 
             bleed_total = fitz.Rect(
                 destino_esq.x0 - sangria_pt,
@@ -1567,7 +1696,7 @@ def corta_empilha_rotacionado(input_path, output_path, output_width, output_heig
             trim_union = mediabox
         nova.set_trimbox(trim_union)
 
-        # 5. TEXTOS DE IDENTIFICAÇÃO
+        # 5. Textos de identificação
         texto_esq = f"{idx_esq + 1}/{total} {nome_arquivo}"
         texto_dir = f"{idx_dir + 1}/{total} {nome_arquivo}"
         _adicionar_identificacao(nova, texto_esq, texto_dir, destino_esq, destino_dir, rot_esq, rot_dir)
@@ -2111,7 +2240,117 @@ class Application:
         self.setup_ui()
         self.setup_drag_and_drop()
         self.atualizar_log_queue()
-    
+
+        # Pasta temporária para envio LPR
+        self.pasta_envio_curto = os.path.join(tempfile.gettempdir(), "UICLAP_LPR")
+        os.makedirs(self.pasta_envio_curto, exist_ok=True)
+
+        # Caminhos do banco SQLite (mesmo usado pelo Miolo)
+        self.log_db_path = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\UICLAP\LOGS\impressoes.db"
+        self.log_db_local_path = os.path.join(os.path.expanduser("~"), "Desktop", "impressoes_fallback.db")
+
+    # ==================== MÉTODOS DE LOG NO SQLITE ====================
+    def _adquirir_trava(self, lock_file, timeout):
+        inicio = time.time()
+        while time.time() - inicio < timeout:
+            try:
+                with open(lock_file, 'x') as f:
+                    f.write(str(os.getpid()))
+                return True
+            except FileExistsError:
+                time.sleep(0.1)
+        return False
+
+    def _liberar_trava(self, lock_file):
+        try:
+            os.remove(lock_file)
+        except:
+            pass
+
+    def registrar_log_sqlite(self, dados):
+        """Grava um registro na tabela logs do SQLite (mesma estrutura do Miolo)."""
+        caminho_db = self.log_db_path
+        try:
+            diretorio = os.path.dirname(caminho_db)
+            if not os.path.exists(diretorio):
+                raise Exception("Diretório de rede inacessível")
+            teste = os.path.join(diretorio, ".write_test")
+            with open(teste, 'w') as f:
+                f.write("test")
+            os.remove(teste)
+        except:
+            caminho_db = self.log_db_local_path
+            self.adicionar_log(f"⚠️ Usando fallback local para banco: {caminho_db}")
+
+        os.makedirs(os.path.dirname(caminho_db), exist_ok=True)
+        trava = caminho_db + ".lock"
+
+        if not self._adquirir_trava(trava, timeout=5):
+            self.adicionar_log("❌ Não foi possível adquirir trava de escrita no banco")
+            return False
+
+        try:
+            conn = sqlite3.connect(caminho_db, timeout=10)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    data_hora TEXT,
+                    lote TEXT,
+                    pilha TEXT,
+                    arquivo TEXT,
+                    maquina TEXT,
+                    ip TEXT,
+                    formato TEXT,
+                    modo TEXT,
+                    quantidade INTEGER,
+                    status TEXT,
+                    erro TEXT,
+                    copia TEXT,
+                    usuario TEXT,
+                    montagem_ok INTEGER DEFAULT 0,
+                    envio_ok INTEGER DEFAULT 0
+                );
+            """)
+
+            valores = (
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                dados.get('lote', ''),
+                dados.get('pilha', ''),
+                dados.get('arquivo', ''),
+                dados.get('maquina', ''),
+                dados.get('ip', ''),
+                dados.get('formato', ''),
+                dados.get('modo', ''),
+                dados.get('quantidade', 0),
+                dados.get('status', ''),
+                dados.get('erro', ''),
+                dados.get('copia', ''),
+                dados.get('usuario', ''),
+                dados.get('montagem_ok', 0),
+                dados.get('envio_ok', 0)
+            )
+
+            cursor.execute("""
+                INSERT INTO logs 
+                (data_hora, lote, pilha, arquivo, maquina, ip,
+                 formato, modo, quantidade, status, erro, copia, usuario,
+                 montagem_ok, envio_ok)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, valores)
+
+            conn.commit()
+            conn.close()
+            self._liberar_trava(trava)
+            return True
+        except Exception as e:
+            self._liberar_trava(trava)
+            self.adicionar_log(f"❌ Erro ao gravar no banco SQLite: {e}")
+            return False
+
+    # ==================== INTERFACE GRÁFICA ====================
     def setup_ui(self):
         self.root.title("Sistema de Processamento de Arquivos")
         self.root.geometry("900x700")
@@ -2131,15 +2370,23 @@ class Application:
         # Aba Miolo
         self.aba_miolo = MioloTab(self.notebook, self)
         self.notebook.add(self.aba_miolo, text="Miolo")
+
+        # Aba Histórico
+        self.aba_historico = HistoricoTab(self.notebook, self)
+        self.notebook.add(self.aba_historico, text="Histórico")
         
-        # Aba Erros
-        self.aba_erros = ErrosTab(self.notebook, self)
-        self.notebook.add(self.aba_erros, text="Erros")
+        # Aba ENVIO
+        self.aba_hotfolder = HotfolderTab(self.notebook, self)
+        self.notebook.add(self.aba_hotfolder, text="Equipamentos")
+
+        # Aba Refazer
+        self.aba_refazer = RefazerTab(self.notebook, self)
+        self.notebook.add(self.aba_refazer, text="Refazer")
         
         # Aba Configurações
         self.aba_config = ConfigTab(self.notebook, self)
         self.notebook.add(self.aba_config, text="Configurações")
-    
+ 
     def criar_interface_principal(self, parent):
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=1)
@@ -2147,14 +2394,13 @@ class Application:
         main_frame = ttk.Frame(parent, padding=10)
         main_frame.grid(row=0, column=0, sticky="nsew")
         
-        # Pesos: lista (3) maior que log (1), demais fixos
         main_frame.columnconfigure(0, weight=1)
-        main_frame.rowconfigure(0, weight=0)  # config
-        main_frame.rowconfigure(1, weight=0)  # seleção
-        main_frame.rowconfigure(2, weight=3)  # lista arquivos
-        main_frame.rowconfigure(3, weight=1)  # log
-        main_frame.rowconfigure(4, weight=0)  # progresso
-        main_frame.rowconfigure(5, weight=0)  # status
+        main_frame.rowconfigure(0, weight=0)
+        main_frame.rowconfigure(1, weight=0)
+        main_frame.rowconfigure(2, weight=3)
+        main_frame.rowconfigure(3, weight=1)
+        main_frame.rowconfigure(4, weight=0)
+        main_frame.rowconfigure(5, weight=0)
         
         # ================= CONFIGURAÇÕES =================
         config_frame = ttk.LabelFrame(main_frame, text="⚙️ Configurações de Processamento", bootstyle=PRIMARY)
@@ -2180,7 +2426,7 @@ class Application:
         self.file_label = ttk.Label(file_frame, text="Nenhum arquivo selecionado", anchor="w", padding=10, bootstyle="secondary")
         self.file_label.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
         
-        # ================= LISTA DE ARQUIVOS (apenas nomes) =================
+        # ================= LISTA DE ARQUIVOS =================
         lista_frame = ttk.LabelFrame(main_frame, text="📋 Arquivos Carregados", bootstyle=PRIMARY)
         lista_frame.grid(row=2, column=0, sticky="nsew", pady=5)
         lista_frame.columnconfigure(0, weight=1)
@@ -2195,7 +2441,7 @@ class Application:
         self.tree_arquivos.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
         
-        # ================= LOG (menor) =================
+        # ================= LOG =================
         log_frame = ttk.LabelFrame(main_frame, text="📝 Log de Processamento", bootstyle=PRIMARY)
         log_frame.grid(row=3, column=0, sticky="nsew", pady=5)
         log_frame.columnconfigure(0, weight=1)
@@ -2203,13 +2449,13 @@ class Application:
         
         self.log_text = tk.Text(log_frame, wrap='word', state='disabled', font=('Consolas', 9),
                                 bg='#1e1e1e', fg='#dcdcdc', insertbackground='white',
-                                padx=10, pady=10, height=6)  # altura fixa
+                                padx=10, pady=10, height=6)
         log_scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_scroll.set)
         self.log_text.grid(row=0, column=0, sticky="nsew")
         log_scroll.grid(row=0, column=1, sticky="ns")
         
-        # ================= PROGRESSO (barra + % + tempo) =================
+        # ================= PROGRESSO =================
         progress_frame = ttk.LabelFrame(main_frame, text="⏳ Andamento", bootstyle=SUCCESS)
         progress_frame.grid(row=4, column=0, sticky="ew", pady=5)
         progress_frame.columnconfigure(0, weight=3)
@@ -2236,7 +2482,7 @@ class Application:
         self.btn_processar = ttk.Button(status_frame, text="▶ Processar e Enviar", command=self.iniciar_processamento, bootstyle="success", width=22)
         self.btn_processar.grid(row=0, column=1, sticky="e")
 
-    
+    # ==================== MÉTODOS DE LOG NA INTERFACE ====================
     def atualizar_log_queue(self):
         try:
             while True:
@@ -2253,6 +2499,7 @@ class Application:
     def adicionar_log(self, mensagem):
         self.log_queue.put(mensagem)
     
+    # ==================== SELEÇÃO DE ARQUIVOS ====================
     def selecionar_arquivos_manual(self):
         files = filedialog.askopenfilenames(
             title="Selecione os arquivos TXT",
@@ -2277,6 +2524,7 @@ class Application:
         for arquivo in txt_files:
             self.tree_arquivos.insert('', tk.END, values=(os.path.basename(arquivo),))
     
+    # ==================== PROCESSAMENTO ====================
     def iniciar_processamento(self):
         if not verificar_data_limite():
             return
@@ -2325,7 +2573,6 @@ class Application:
         else:
             self.status_label.config(text="❌ Erro no processamento", bootstyle="danger")
     
-    # ================= MÉTODOS DE PROCESSAMENTO (sem alterações) =================
     def processar_arquivos(self):
         pasta_temp = os.path.join(PASTA_TRABALHO, f"temp_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
         os.makedirs(pasta_temp, exist_ok=True)
@@ -2340,10 +2587,24 @@ class Application:
             
             arquivos_processados = 0
             pdfs_para_mesclar = {}
+            # Dicionário para acumular totais de montagens por chave (identific, filacolor)
+            totais_montagem = {}
+            
+            # Prepara usuário uma vez
+            try:
+                usuario = os.getlogin()
+            except:
+                usuario = 'desconhecido'
+            
+            # Constantes para a Capa
+            MAQUINA_CAPA = "RICOH - 192.168.200.84"
+            IP_CAPA = "192.168.200.84"
             
             for arquivo_txt in self.arquivos_selecionados:
                 self.adicionar_log(f"Lendo arquivo: {os.path.basename(arquivo_txt)}")
                 dados = ler_arquivo_txt(arquivo_txt)
+                pilha_txt = os.path.splitext(os.path.basename(arquivo_txt))[0]
+                
                 for linha in dados:
                     try:
                         caminho_origem = os.path.join(linha["CAMINHO"], linha["ARQUIVO"])
@@ -2373,7 +2634,30 @@ class Application:
                                 chave = (identific, filacolor)
                                 if chave not in pdfs_para_mesclar:
                                     pdfs_para_mesclar[chave] = []
+                                    totais_montagem[chave] = 0
                                 pdfs_para_mesclar[chave].extend([pdf_marcado] * quantidade)
+                                totais_montagem[chave] += quantidade
+                                
+                                # ===== REGISTRO DE MONTAGEM (SQLite) =====
+                                # Para cada cópia, um registro individual
+                                for copia_idx in range(quantidade):
+                                    dados_montagem = {
+                                        'lote': os.path.dirname(arquivo_txt),
+                                        'pilha': pilha_txt,
+                                        'arquivo': linha["ARQUIVO"],
+                                        'maquina': MAQUINA_CAPA,
+                                        'ip': IP_CAPA,
+                                        'formato': filacolor,
+                                        'modo': 'capa_marcacao',
+                                        'quantidade': 1,
+                                        'status': 'Montagem OK',
+                                        'erro': '',
+                                        'copia': f"{copia_idx+1}/{quantidade}",
+                                        'usuario': usuario,
+                                        'montagem_ok': 1,
+                                        'envio_ok': 0
+                                    }
+                                    self.registrar_log_sqlite(dados_montagem)
                         
                         arquivos_processados += 1
                         percentual = (arquivos_processados / total_arquivos) * 80
@@ -2388,18 +2672,70 @@ class Application:
             identifics_processados = 0
             pasta_destino = os.path.dirname(self.arquivos_selecionados[0])
             
+            # Junta nomes de todos os TXT para o campo pilha do envio
+            todos_txt = ", ".join(set(os.path.splitext(os.path.basename(t))[0] for t in self.arquivos_selecionados))
+            
             for chave, lista_pdfs in pdfs_para_mesclar.items():
                 identific, filacolor = chave
+                total_montagens = totais_montagem.get(chave, 0)
+                
                 percentual = 80 + ((identifics_processados / total_identifics) * 20)
                 texto = f"Agrupando PDFs... ({identifics_processados + 1}/{total_identifics})"
                 self.root.after(0, lambda p=percentual, t=texto: self.atualizar_progresso_ui(p, t))
-                
+
                 nome_temp = os.path.join(pasta_temp, f"{identific}.pdf")
                 self.mesclar_pdfs(lista_pdfs, nome_temp, filacolor)
                 nome_final = os.path.join(pasta_destino, f"{identific}.pdf")
                 shutil.move(nome_temp, nome_final)
                 self.adicionar_log(f"✅ Arquivo gerado: {nome_final}")
+
+                if self.imprimir_automaticamente.get():
+                    sucesso = self.enviar_para_impressora(
+                        nome_final,
+                        os.path.basename(nome_final),
+                        filacolor
+                    )
+                    
+                    # ===== REGISTRO DO ENVIO (SQLite) – QUANTIDADE = TOTAL DE MONTAGENS =====
+                    status_envio = 'Enviado' if sucesso else 'Falha no envio'
+                    dados_envio = {
+                        'lote': pasta_destino,
+                        'pilha': todos_txt,
+                        'arquivo': identific,
+                        'maquina': MAQUINA_CAPA,
+                        'ip': IP_CAPA,
+                        'formato': filacolor,
+                        'modo': 'envio',
+                        'quantidade': total_montagens,   # <-- TOTAL DE CAPAS MONTADAS
+                        'status': status_envio,
+                        'erro': '' if sucesso else 'Falha no LPR',
+                        'copia': '1/1',
+                        'usuario': usuario,
+                        'montagem_ok': 0,
+                        'envio_ok': 1 if sucesso else 0
+                    }
+                    self.registrar_log_sqlite(dados_envio)
+                else:
+                    dados_nao_enviado = {
+                        'lote': pasta_destino,
+                        'pilha': todos_txt,
+                        'arquivo': identific,
+                        'maquina': MAQUINA_CAPA,
+                        'ip': IP_CAPA,
+                        'formato': filacolor,
+                        'modo': 'envio',
+                        'quantidade': total_montagens,
+                        'status': 'Não enviado (manual)',
+                        'erro': '',
+                        'copia': '1/1',
+                        'usuario': usuario,
+                        'montagem_ok': 0,
+                        'envio_ok': 0
+                    }
+                    self.registrar_log_sqlite(dados_nao_enviado)
+                
                 identifics_processados += 1
+                time.sleep(1)
             
             self.root.after(0, lambda: self.atualizar_progresso_ui(100, "Processamento concluído!"))
             self.adicionar_log("🎉 Todos os arquivos foram processados com sucesso!")
@@ -2418,7 +2754,8 @@ class Application:
                 self.adicionar_log(f"🧹 Pasta temporária removida: {pasta_temp}")
             except Exception as e:
                 self.adicionar_log(f"⚠️ Erro ao limpar pasta temporária: {e}")
-    
+
+    # ==================== MESCLAGEM E IMPRESSÃO ====================
     def mesclar_pdfs(self, lista_pdfs, nome_saida, filacolor):
         try:
             merger = PdfMerger()
@@ -2427,22 +2764,49 @@ class Application:
             merger.write(nome_saida)
             merger.close()
             self.adicionar_log(f"📄 PDF mesclado: {os.path.basename(nome_saida)}")
-            if self.imprimir_automaticamente.get():
-                self.enviar_para_impressora(nome_saida, os.path.basename(nome_saida), filacolor)
         except Exception as e:
             self.adicionar_log(f"❌ Erro ao mesclar PDFs: {e}")
             messagebox.showerror("Erro", f"Falha ao mesclar arquivos: {e}")
     
     def enviar_para_impressora(self, arquivo_pdf, nome_arquivo, filacolor):
+        temp_arquivo = None
         try:
-            comando = f'lpr -S 192.168.200.84 -P "{filacolor}" -J "{nome_arquivo.replace(filacolor, "")}" "{nome_arquivo}" "{arquivo_pdf}"'
-            self.adicionar_log(f"🖨️ Enviando para impressora {filacolor}: {nome_arquivo}")
-            subprocess.run(comando, shell=True, check=True)
-            self.adicionar_log(f"✅ Envio concluído: {nome_arquivo}")
+            nome_simples = f"job_{uuid.uuid4().hex[:8]}.pdf"
+            temp_arquivo = os.path.join(self.pasta_envio_curto, nome_simples)
+            shutil.copy2(arquivo_pdf, temp_arquivo)
+            temp_normalizado = temp_arquivo.replace('\\', '/')
+            
+            titulo = nome_arquivo.replace(filacolor, "").strip()
+            comando = [
+                "lpr", "-S", "192.168.200.84", "-P", filacolor,
+                "-J", titulo,
+                temp_normalizado
+            ]
+            self.adicionar_log(f"🖨️ Enviando: {' '.join(comando)}")
+            resultado = subprocess.run(comando, capture_output=True, text=True, check=False)
+            
+            if resultado.returncode == 0:
+                self.adicionar_log(f"✅ Envio concluído: {nome_arquivo}")
+                return True
+            else:
+                erro_real = resultado.stderr.strip() or resultado.stdout.strip()
+                self.adicionar_log(f"❌ Falha (código {resultado.returncode}): {erro_real}")
+                messagebox.showerror("Erro", f"Falha ao enviar para {filacolor}.\nErro do LPR: {erro_real}")
+                return False
+        except FileNotFoundError:
+            self.adicionar_log("❌ Comando 'lpr' não encontrado.")
+            messagebox.showerror("Erro", "Serviço LPR não instalado.")
+            return False
         except Exception as e:
-            self.adicionar_log(f"❌ Falha no envio para impressora: {e}")
-            messagebox.showerror("Erro", f"Falha ao enviar para impressora: {e}")
-    
+            self.adicionar_log(f"❌ Exceção: {e}")
+            return False
+        finally:
+            if temp_arquivo and os.path.exists(temp_arquivo):
+                try:
+                    os.remove(temp_arquivo)
+                except:
+                    pass
+
     def setup_drag_and_drop(self):
         self.root.drop_target_register(DND_FILES)
         self.root.dnd_bind('<<Drop>>', self.on_files_dropped)
@@ -2465,18 +2829,49 @@ class Application:
     
     def criar_menu_superior(self):
         menubar = tk.Menu(self.root)
+
+        # =========================
+        # MENU TEMAS
+        # =========================
         menu_tema = tk.Menu(menubar, tearoff=0)
-        for tema in TEMAS_DISPONIVEIS:
-            menu_tema.add_radiobutton(
+
+        # Submenu claros
+        menu_claro = tk.Menu(menu_tema, tearoff=0)
+
+        for tema in TEMAS_CLAROS:
+            menu_claro.add_radiobutton(
                 label=tema.capitalize(),
                 variable=self.tema_atual,
                 value=tema,
                 command=self.mudar_tema
             )
+
+        # Submenu escuros
+        menu_escuro = tk.Menu(menu_tema, tearoff=0)
+
+        for tema in TEMAS_ESCUROS:
+            menu_escuro.add_radiobutton(
+                label=tema.capitalize(),
+                variable=self.tema_atual,
+                value=tema,
+                command=self.mudar_tema
+            )
+
+        # Adiciona submenus
+        menu_tema.add_cascade(label="☀ Temas Claros", menu=menu_claro)
+        menu_tema.add_separator()
+        menu_tema.add_cascade(label="🌙 Temas Escuros", menu=menu_escuro)
+
         menubar.add_cascade(label="Temas", menu=menu_tema)
+
+        # =========================
+        # MENU AJUDA
+        # =========================
         menu_ajuda = tk.Menu(menubar, tearoff=0)
         menu_ajuda.add_command(label="Sobre", command=self.mostrar_sobre)
+
         menubar.add_cascade(label="Ajuda", menu=menu_ajuda)
+
         self.root.config(menu=menubar)
     
     def mudar_tema(self):
@@ -2492,23 +2887,56 @@ class Application:
             self.aba_config.atualizar_previews()
     
     def mostrar_sobre(self):
-        about_window = ttk.Toplevel(self.root)
+        import tkinter as tk
+
+        about_window = tk.Toplevel(self.root)
         about_window.title("Sobre o Sistema")
-        about_window.geometry("400x300")
+        about_window.geometry("450x350")
         about_window.resizable(False, False)
+        about_window.configure(bg="#0f172a")
+
+        # Centralizar
         about_window.update_idletasks()
-        x = (about_window.winfo_screenwidth() // 2) - (400 // 2)
-        y = (about_window.winfo_screenheight() // 2) - (300 // 2)
-        about_window.geometry(f"+{x}+{y}")
-        
-        main_frame = ttk.Frame(about_window, padding=25)
-        main_frame.pack(fill=BOTH, expand=True)
-        ttk.Label(main_frame, text="Processador de Arquivos", font=('Segoe UI', 14, 'bold'), bootstyle="primary").pack()
-        ttk.Label(main_frame, text="Versão 3.0", font=('Segoe UI', 10), bootstyle="secondary").pack(pady=(2, 10))
-        ttk.Separator(main_frame).pack(fill='x', pady=10)
-        ttk.Label(main_frame, text="Sistema desenvolvido para automação\nde processamento e envio de arquivos POD.", font=('Segoe UI', 10), justify="center").pack(pady=5)
-        ttk.Label(main_frame, text="© 2026 • Todos os direitos reservados", font=('Segoe UI', 8), bootstyle="secondary").pack(side=BOTTOM, pady=(15, 5))
-        ttk.Button(main_frame, text="Fechar", command=about_window.destroy, bootstyle="primary", width=15).pack(pady=(10, 0))
+        w, h = 450, 350
+        x = (about_window.winfo_screenwidth() // 2) - (w // 2)
+        y = (about_window.winfo_screenheight() // 2) - (h // 2)
+        about_window.geometry(f"{w}x{h}+{x}+{y}")
+
+        main = tk.Frame(about_window, bg="#0f172a", padx=30, pady=20)
+        main.pack(fill="both", expand=True)
+
+        tk.Label(main, text="Processador de Arquivos", font=("Segoe UI", 18, "bold"),
+                bg="#0f172a", fg="#f8fafc").pack(pady=(10, 0))
+
+        versao_badge = tk.Label(main, text="  v3.0  ", font=("Segoe UI", 10, "bold"),
+                                bg="#3b82f6", fg="white", padx=8, pady=2)
+        versao_badge.pack(pady=(4, 12))
+
+        tk.Frame(main, height=1, bg="#334155").pack(fill="x", pady=10)
+
+        tk.Label(main, text="Automação de processamento e envio\nde arquivos para POD com eficiência.",
+                font=("Segoe UI", 10), bg="#0f172a", fg="#cbd5e1", justify="center").pack(pady=5)
+
+        dev_frame = tk.Frame(main, bg="#0f172a")
+        dev_frame.pack(pady=20)
+        tk.Label(dev_frame, text="Desenvolvido por", font=("Segoe UI", 9),
+                bg="#0f172a", fg="#94a3b8").pack()
+        tk.Label(dev_frame, text="Guilherme Neife", font=("Segoe UI", 13, "bold"),
+                bg="#0f172a", fg="#facc15").pack()
+
+        tk.Label(main, text="© 2026 • Todos os direitos reservados", font=("Segoe UI", 7),
+                bg="#0f172a", fg="#64748b").pack(side="bottom", pady=(5, 0))
+
+        btn_fechar = tk.Button(main, text="✕  Fechar", font=("Segoe UI", 10, "bold"),
+                            bg="#1e293b", fg="#f8fafc", activebackground="#334155",
+                            activeforeground="white", relief="flat", bd=0, padx=20, pady=6,
+                            cursor="hand2", command=about_window.destroy)
+        btn_fechar.pack(pady=(10, 5))
+
+        def on_enter(e): btn_fechar.config(bg="#334155")
+        def on_leave(e): btn_fechar.config(bg="#1e293b")
+        btn_fechar.bind("<Enter>", on_enter)
+        btn_fechar.bind("<Leave>", on_leave)
 def carregar_configuracoes():
     try:
         if os.path.exists(CONFIG_FILE):
@@ -2565,6 +2993,7 @@ def ler_arquivo_txt(caminho_txt):
                             "IDENTIFIC": campos[13].strip(),
                             "FILACOLOR": campos[12].strip(),
                             "NOMEFIC": campos[11].strip()
+
                         })
                     except (ValueError, IndexError) as e:
                         logging.warning(f"Linha {idx} mal formatada no arquivo {caminho_txt}: {linha}")
@@ -2632,759 +3061,2016 @@ def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific,filacolor):
         return None
 # --- INICIALIZAÇÃO ---
 CONFIG = carregar_configuracoes()
-class ErrosTab(ttk.Frame):
-    def __init__(self, parent, app=None):
+COMMON_FORMATS_PB = ["A4", "A3", "SRA3", "22X32", "24X32", "24,5X34", "25,2X35,6", "32X45", "32X48"]
+COMMON_PAPERS_PB  = ["OFFSET 63G", "OFFSET 70G", "OFFSET 75G", "OFFSET 90G", "AVENA 70G", "AVENA 80G", "BOLD 90G"]
+COMMON_FORMATS_CL = ["22X32", "24X32", "25X36", "32X45", "32X48"]
+COMMON_PAPERS_CL  = ["COUCHE 90G", "OFFSET 63G", "OFFSET 70G", "OFFSET 75G", "OFFSET 90G", "AVENA 70G", "AVENA 80G", "BOLD 90G"]
+SPECIAL_FORMATS_RICOH = ["CAPADUPLEX", "Capas 28X56", "Capas 32X60"]
+NO_PAPER_FORMATS = SPECIAL_FORMATS_RICOH
+MACHINE_CONFIG = {
+    "OCÉ 1":   {"ip": "192.168.200.80", "group": "PB", "formats": COMMON_FORMATS_PB, "papers": COMMON_PAPERS_PB},
+    "OCÉ 3":   {"ip": "192.168.200.85", "group": "PB", "formats": COMMON_FORMATS_PB, "papers": COMMON_PAPERS_PB},
+    "RICOH":   {"ip": "192.168.200.84", "group": "CL", "formats": COMMON_FORMATS_CL + SPECIAL_FORMATS_RICOH, "papers": COMMON_PAPERS_CL},
+    "BALTORO": {"ip": "192.168.200.73", "group": "CL", "formats": COMMON_FORMATS_CL, "papers": COMMON_PAPERS_CL},
+}
+class HotfolderTab(ttk.Frame):
+    def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
-        self.lotes = []
-        self.pdfs = []
-        self.fila = set()
-        self.fila_chaves = []
+        self.temp_dir = tempfile.mkdtemp(prefix="hotfolders_")
+        self.file_paths = []
+        self.sending = False
+        self.cancel_send = False
+
         self.setup_ui()
-        self.carregar_lotes()
+        self.bind('<Destroy>', self._on_destroy)
 
     def setup_ui(self):
-        # Configura o grid principal
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
-        main = ttk.Frame(self, padding=10)
-        main.grid(row=0, column=0, sticky="nsew")
+        main_frame = ttk.Frame(self, padding=10)
+        main_frame.grid(row=0, column=0, sticky="nsew")
 
-        # Define os pesos das linhas: lote (0), pdfs (1), fila (1), rodapé (0)
-        main.columnconfigure(0, weight=1)
-        main.rowconfigure(0, weight=0)  # Lote
-        main.rowconfigure(1, weight=1)  # Lista de PDFs
-        main.rowconfigure(2, weight=1)  # Fila
-        main.rowconfigure(3, weight=0)  # Rodapé (progresso + botão)
+        main_frame.columnconfigure(0, weight=1)
+        # Apenas o log expande verticalmente (agora na linha 4)
+        main_frame.rowconfigure(4, weight=1)
 
-        # ================= LOTE =================
-        f_lote = ttk.LabelFrame(main, text="📦 Lote (digite ou selecione)", bootstyle=PRIMARY, padding=5)
-        f_lote.grid(row=0, column=0, sticky="ew", pady=5)
-        f_lote.columnconfigure(0, weight=1)
+        # ================= MÁQUINA =================
+        machine_line = ttk.Frame(main_frame)
+        machine_line.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        machine_line.columnconfigure(2, weight=1)
 
-        self.combo_lote = ttk.Combobox(f_lote, width=65, bootstyle=PRIMARY)
-        self.combo_lote.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
-        self.combo_lote.bind("<KeyRelease>", self.filtrar_lotes)
-        self.combo_lote.bind("<<ComboboxSelected>>", self.carregar_pdfs)
+        ttk.Label(machine_line, text="Máquina:", width=10).grid(row=0, column=0, padx=5, pady=5, sticky="w")
 
-        # ================= LISTA DE PDFs =================
-        f_lista = ttk.LabelFrame(main, text="📄 PDFs do lote (seleção múltipla)", bootstyle=PRIMARY, padding=5)
-        f_lista.grid(row=1, column=0, sticky="nsew", pady=5)
-        f_lista.columnconfigure(0, weight=1)
-        f_lista.rowconfigure(1, weight=1)  # Área da lista expande
-
-        # Filtro
-        f_filtro = ttk.Frame(f_lista)
-        f_filtro.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
-        f_filtro.columnconfigure(0, weight=1)
-
-        self.filtro_entry = ttk.Entry(f_filtro, width=40)
-        self.filtro_entry.grid(row=0, column=0, sticky="ew", padx=(0, 5))
-        self.filtro_entry.bind("<KeyRelease>", self.filtrar_pdfs)
-
-        btn_limpar = ttk.Button(f_filtro, text="Limpar filtro", command=self.limpar_filtro, bootstyle=SECONDARY)
-        btn_limpar.grid(row=0, column=1)
-
-        # Listbox com scroll
-        frame_pdf = ttk.Frame(f_lista)
-        frame_pdf.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
-        frame_pdf.columnconfigure(0, weight=1)
-        frame_pdf.rowconfigure(0, weight=1)
-
-        scroll_pdf = ttk.Scrollbar(frame_pdf, orient=tk.VERTICAL)
-        self.lista_pdfs = tk.Listbox(frame_pdf, width=80, height=6,
-                                     selectmode=tk.MULTIPLE,
-                                     yscrollcommand=scroll_pdf.set)
-        scroll_pdf.config(command=self.lista_pdfs.yview)
-        self.lista_pdfs.grid(row=0, column=0, sticky="nsew")
-        scroll_pdf.grid(row=0, column=1, sticky="ns")
-
-        # Botões de adicionar
-        botoes_pdf = ttk.Frame(f_lista)
-        botoes_pdf.grid(row=2, column=0, sticky="ew", padx=5, pady=5)
-
-        btn_add_sel = ttk.Button(botoes_pdf, text="➕ Adicionar selecionado(s)",
-                                 command=self.adicionar_da_lista, bootstyle=SUCCESS)
-        btn_add_sel.pack(side=tk.LEFT, padx=5)
-
-        btn_add_todos = ttk.Button(botoes_pdf, text="📁 Adicionar todos visíveis",
-                                   command=self.adicionar_todos, bootstyle=INFO)
-        btn_add_todos.pack(side=tk.LEFT, padx=5)
-
-        # ================= FILA DE PROCESSAMENTO =================
-        f_fila = ttk.LabelFrame(main, text="⏳ Fila de processamento", bootstyle=PRIMARY, padding=5)
-        f_fila.grid(row=2, column=0, sticky="nsew", pady=5)
-        f_fila.columnconfigure(0, weight=1)
-        f_fila.rowconfigure(1, weight=1)
-
-        self.label_contador_fila = ttk.Label(f_fila, text="0 item(ns) na fila", bootstyle=SECONDARY)
-        self.label_contador_fila.grid(row=0, column=0, sticky="w", padx=5, pady=5)
-
-        frame_fila = ttk.Frame(f_fila)
-        frame_fila.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
-        frame_fila.columnconfigure(0, weight=1)
-        frame_fila.rowconfigure(0, weight=1)
-
-        scroll_fila = ttk.Scrollbar(frame_fila, orient=tk.VERTICAL)
-        self.lista_fila = tk.Listbox(frame_fila, width=80, height=6,
-                                     selectmode=tk.MULTIPLE,
-                                     yscrollcommand=scroll_fila.set)
-        scroll_fila.config(command=self.lista_fila.yview)
-        self.lista_fila.grid(row=0, column=0, sticky="nsew")
-        scroll_fila.grid(row=0, column=1, sticky="ns")
-
-        botoes_fila = ttk.Frame(f_fila)
-        botoes_fila.grid(row=2, column=0, sticky="ew", padx=5, pady=5)
-
-        btn_remover = ttk.Button(botoes_fila, text="❌ Remover selecionado(s)",
-                                 command=self.remover_item, bootstyle=DANGER)
-        btn_remover.pack(side=tk.LEFT, padx=5)
-
-        btn_limpar_fila = ttk.Button(botoes_fila, text="🧹 Limpar fila",
-                                     command=self.limpar_lista, bootstyle=WARNING)
-        btn_limpar_fila.pack(side=tk.LEFT, padx=5)
-
-        # ================= RODAPÉ (PROGRESSO + BOTÃO) =================
-        rodape = ttk.Frame(main, padding=5)
-        rodape.grid(row=3, column=0, sticky="ew", pady=10)
-        rodape.columnconfigure(0, weight=1)
-
-        f_progresso = ttk.LabelFrame(rodape, text="⏳ Andamento", bootstyle=SUCCESS, padding=5)
-        f_progresso.grid(row=0, column=0, sticky="ew")
-        f_progresso.columnconfigure(0, weight=1)
-
-        self.progress = ttk.Progressbar(f_progresso, length=400, mode='determinate', bootstyle="success-striped")
-        self.progress.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
-
-        self.label_status = ttk.Label(f_progresso, text="Pronto", bootstyle=SECONDARY)
-        self.label_status.grid(row=0, column=1, padx=5, pady=5)
-
-        self.btn_processar = ttk.Button(rodape, text="🚀 Processar Tudo",
-                                        command=self.processar_tudo, bootstyle=SUCCESS, width=20)
-        self.btn_processar.grid(row=1, column=0, sticky="e", pady=5)
-
-    # ───── Lógica de negócio (idêntica à classe App original) ─────
-    def carregar_lotes(self):
-        self.lotes = sorted(
-            [p for p in os.listdir(BASE1) if os.path.isdir(os.path.join(BASE1, p))],
-            reverse=True
+        self.machine_var = tk.StringVar()
+        self.machine_combo = ttk.Combobox(
+            machine_line,
+            textvariable=self.machine_var,
+            values=list(MACHINE_CONFIG.keys()),
+            state="readonly",
+            width=18,
+            bootstyle=(PRIMARY)
         )
-        self.combo_lote['values'] = self.lotes
+        self.machine_combo.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+        self.machine_combo.bind("<<ComboboxSelected>>", self.on_machine_change)
 
-    def filtrar_lotes(self, event=None):
-        texto = self.combo_lote.get().lower()
-        if len(texto) < 4:
-            self.combo_lote['values'] = self.lotes
+        self.ip_label = ttk.Label(
+            machine_line,
+            text="IP: ---",
+            font=("Consolas", 10, "bold"),
+            bootstyle=(PRIMARY)
+        )
+        self.ip_label.grid(row=0, column=2, padx=15, pady=5, sticky="w")
+
+        # ================= ARQUIVOS PDF =================
+        files_frame = ttk.LabelFrame(main_frame, text="📄 Arquivos PDF", bootstyle=(PRIMARY))
+        files_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        files_frame.columnconfigure(0, weight=1)
+
+        self.drop_area = tk.Label(
+            files_frame,
+            text="Arraste arquivos PDF para cá",
+            bg="#e8e8e8",
+            height=3,
+            relief=tk.FLAT,
+            font=("Arial", 10)
+        )
+        self.drop_area.grid(row=0, column=0, sticky="ew", pady=5)
+        self.drop_area.drop_target_register(DND_FILES)
+        self.drop_area.dnd_bind('<<Drop>>', self.on_drop)
+
+        list_frame = ttk.Frame(files_frame)
+        list_frame.grid(row=1, column=0, sticky="nsew", pady=5)
+        files_frame.rowconfigure(1, weight=1)
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+
+        self.listbox = tk.Listbox(list_frame, height=6, selectmode=tk.EXTENDED)
+        scroll_list = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=scroll_list.set)
+        self.listbox.grid(row=0, column=0, sticky="nsew")
+        scroll_list.grid(row=0, column=1, sticky="ns")
+        self.listbox.bind("<Double-1>", self.add_files_manually)
+
+        btn_frame = ttk.Frame(files_frame)
+        btn_frame.grid(row=2, column=0, sticky="ew", pady=5)
+        btn_frame.columnconfigure(0, weight=1)
+        btn_frame.columnconfigure(1, weight=1)
+        btn_frame.columnconfigure(2, weight=1)
+        btn_frame.columnconfigure(3, weight=1)
+
+        ttk.Button(
+            btn_frame,
+            text="❌ Remover selecionados",
+            command=self.delete_selected,
+            bootstyle=(DANGER)
+        ).grid(row=0, column=0, padx=2, sticky="ew")
+
+        ttk.Button(
+            btn_frame,
+            text="🧹 Limpar todos",
+            command=self.clear_all,
+            bootstyle=(WARNING)
+        ).grid(row=0, column=1, padx=2, sticky="ew")
+
+        self.send_btn = ttk.Button(
+            btn_frame,
+            text="📤 Enviar",
+            command=self.start_send,
+            bootstyle=(SUCCESS)
+        )
+        self.send_btn.grid(row=0, column=2, padx=2, sticky="ew")
+
+        self.cancel_btn = ttk.Button(
+            btn_frame,
+            text="❌ Cancelar",
+            command=self.cancel,
+            state=tk.DISABLED,
+            bootstyle=(INFO)
+        )
+        self.cancel_btn.grid(row=0, column=3, padx=2, sticky="ew")
+
+        self.counter_label = ttk.Label(files_frame, text="0 arquivo(s)")
+        self.counter_label.grid(row=3, column=0, sticky="w", pady=2)
+
+        # ================= CONFIGURAÇÃO DE IMPRESSÃO =================
+        print_frame = ttk.LabelFrame(
+            main_frame,
+            text="⚙️ Configuração de impressão e identificação",
+            bootstyle=(PRIMARY)
+        )
+        print_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        print_frame.columnconfigure(1, weight=1)
+        print_frame.columnconfigure(3, weight=1)
+        print_frame.columnconfigure(5, weight=1)
+
+        ttk.Label(print_frame, text="Formato:", width=15).grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.format_cb = ttk.Combobox(print_frame, state="readonly", width=25, bootstyle=(PRIMARY))
+        self.format_cb.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+        self.format_cb.bind("<<ComboboxSelected>>", self.on_format_change)
+
+        ttk.Label(print_frame, text="Papel/Gramatura:", width=18).grid(row=0, column=2, padx=5, pady=5, sticky="w")
+        self.paper_cb = ttk.Combobox(print_frame, state="readonly", width=25, bootstyle=(PRIMARY))
+        self.paper_cb.grid(row=0, column=3, padx=5, pady=5, sticky="w")
+
+        ttk.Label(print_frame, text="Identificação (opcional):", width=20).grid(row=0, column=4, padx=5, pady=5, sticky="w")
+        self.id_entry = ttk.Entry(print_frame, width=30, bootstyle=(PRIMARY))
+        self.id_entry.grid(row=0, column=5, padx=5, pady=5, sticky="w")
+        self._setup_placeholder()
+
+        # ================= LOG DE EVENTOS =================
+        log_frame = ttk.LabelFrame(main_frame, text="📋 Log de eventos", bootstyle=(PRIMARY))
+        log_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 10))
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+
+        self.log_text = tk.Text(
+            log_frame,
+            height=8,
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+            font=("Consolas", 9),
+            bg='#1e1e1e',
+            fg='#dcdcdc',
+            insertbackground='white',
+            padx=10,
+            pady=10
+        )
+        scroll_log = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scroll_log.set)
+
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        scroll_log.grid(row=0, column=1, sticky="ns")
+
+        # ================= ANDAMENTO =================
+        progress_frame = ttk.LabelFrame(main_frame, text="⏳ Andamento", bootstyle=(SUCCESS))
+        progress_frame.grid(row=4, column=0, sticky="ew", pady=(0, 5))
+        progress_frame.columnconfigure(0, weight=1)
+
+        self.current_file_label = ttk.Label(progress_frame, text="")
+        self.current_file_label.grid(row=0, column=0, sticky="w", padx=5, pady=(5, 0))
+
+        bar_frame = ttk.Frame(progress_frame)
+        bar_frame.grid(row=1, column=0, sticky="ew", padx=5, pady=(0, 5))
+        bar_frame.columnconfigure(0, weight=1)
+
+        self.progress = ttk.Progressbar(
+            bar_frame,
+            mode='determinate',
+            bootstyle="success-striped"
+        )
+        self.progress.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+
+        self.percent_label = ttk.Label(bar_frame, text="0%")
+        self.percent_label.grid(row=0, column=1)
+
+        # Inicializa
+        if MACHINE_CONFIG:
+            self.machine_combo.current(0)
+            self.on_machine_change()
+        self.reset_progress()
+    
+    def _add_tooltip(self, widget, text):
+        def enter(e):
+            self.tooltip = tk.Toplevel(widget)
+            self.tooltip.wm_overrideredirect(True)
+            self.tooltip.wm_geometry(f"+{widget.winfo_rootx()+10}+{widget.winfo_rooty()+20}")
+            label = tk.Label(self.tooltip, text=text, background="#ffffe0", relief=tk.SOLID, borderwidth=1)
+            label.pack()
+        def leave(e):
+            if hasattr(self, 'tooltip'):
+                self.tooltip.destroy()
+        widget.bind("<Enter>", enter)
+        widget.bind("<Leave>", leave)
+
+    def _setup_placeholder(self):
+        self.placeholder = "ex: cliente_lote"
+        self.id_entry.insert(0, self.placeholder)
+        self.id_entry.configure(foreground="gray")
+        self.id_entry.bind("<FocusIn>", self._on_focus_in)
+        self.id_entry.bind("<FocusOut>", self._on_focus_out)
+
+    def _on_focus_in(self, event):
+        if self.id_entry.get() == self.placeholder:
+            self.id_entry.delete(0, tk.END)
+            self.id_entry.configure(foreground="black")
+
+    def _on_focus_out(self, event):
+        if not self.id_entry.get():
+            self.id_entry.insert(0, self.placeholder)
+            self.id_entry.configure(foreground="gray")
+
+    def _get_optional(self):
+        text = self.id_entry.get().strip()
+        if text == self.placeholder or not text:
+            return ""
+        return text
+
+    def log(self, msg):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.insert(tk.END, f"[{timestamp}] {msg}\n")
+        self.log_text.see(tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
+    def update_counter(self):
+        count = len(self.file_paths)
+        self.counter_label.config(text=f"{count} arquivo(s)" if count != 1 else "1 arquivo")
+        if count == 0:
+            self.reset_progress()
+
+    def reset_progress(self):
+        self.progress['value'] = 0
+        self.progress['maximum'] = 1
+        self.percent_label.config(text="0%")
+        self.current_file_label.config(text="Nenhum envio em andamento")
+
+    def on_machine_change(self, event=None):
+        machine = self.machine_var.get()
+        if not machine:
             return
-        filtrados = [l for l in self.lotes if texto in l.lower()]
-        self.combo_lote['values'] = filtrados
-        if filtrados:
-            self.combo_lote.event_generate('<Down>')
+        config = MACHINE_CONFIG[machine]
+        self.ip_label.config(text=f"IP: {config['ip']}")
+        self.format_cb['values'] = config["formats"]
+        self.paper_cb['values'] = config["papers"]
+        self.format_cb.set("")
+        self.paper_cb.set("")
+        if config["formats"]:
+            self.format_cb.current(0)
+            self.on_format_change()
+        if config["papers"]:
+            self.paper_cb.current(0)
+        self.log(f"Máquina alterada: {machine} ({config['ip']})")
 
-    def carregar_pdfs(self, event=None):
-        lote = self.combo_lote.get()
-        caminho = os.path.join(BASE1, lote)
-        try:
-            self.pdfs = [f for f in os.listdir(caminho) if f.lower().endswith(".pdf")]
-            self.filtro_entry.delete(0, tk.END)
-            self.atualizar_lista(self.pdfs)
-        except:
-            self.pdfs = []
-            self.atualizar_lista([])
-
-    def atualizar_lista(self, lista):
-        self.lista_pdfs.delete(0, tk.END)
-        for item in lista:
-            self.lista_pdfs.insert(tk.END, item)
-
-    def filtrar_pdfs(self, event=None):
-        filtro_texto = self.filtro_entry.get().strip()
-        
-        # Lista de termos obrigatórios (sempre inclui "miolo")
-        termos_obrigatorios = ["miolo"]
-        
-        # Termos opcionais vindos da vírgula (se houver)
-        termos_opcionais = []
-        if filtro_texto:
-            termos_opcionais = [termo.strip().lower() for termo in filtro_texto.split(",") if termo.strip()]
-        
-        # Se o usuário explicitamente digitou "miolo" ou "MIOLO", não duplicar
-        if "miolo" in termos_opcionais:
-            termos_opcionais.remove("miolo")  # evita duplicidade, mas já está nos obrigatórios
-        
-        filtrados = []
-        for nome_pdf in self.pdfs:
-            nome_lower = nome_pdf.lower()
-            
-            # Verifica se contém TODOS os termos obrigatórios (só "miolo" por enquanto)
-            if not all(termo in nome_lower for termo in termos_obrigatorios):
-                continue
-            
-            # Se não houver termos opcionais, aceita qualquer miolo
-            if not termos_opcionais:
-                filtrados.append(nome_pdf)
-                continue
-            
-            # Verifica se contém PELO MENOS UM dos termos opcionais
-            if any(termo in nome_lower for termo in termos_opcionais):
-                filtrados.append(nome_pdf)
-        
-        self.atualizar_lista(filtrados)
-
-    def limpar_filtro(self):
-        self.filtro_entry.delete(0, tk.END)
-        self.atualizar_lista(self.pdfs)
-
-    def _add_fila(self, chave, nome, lote):
-        if chave in self.fila:
-            return False
-        self.fila.add(chave)
-        self.fila_chaves.append(chave)
-        self.lista_fila.insert(tk.END, f"{lote} - {nome}")
-        return True
-
-    def adicionar_da_lista(self):
-        lote = self.combo_lote.get()
-        selecionados = self.lista_pdfs.curselection()
-        if not lote or not selecionados:
+    def on_format_change(self, event=None):
+        machine = self.machine_var.get()
+        if not machine:
             return
-        adicionados = 0
-        ja_estavam = 0
-        for idx in selecionados:
-            nome = self.lista_pdfs.get(idx)
-            chave = f"{lote}|{nome}"
-            if self._add_fila(chave, nome, lote):
-                adicionados += 1
+        selected = self.format_cb.get()
+        if selected in NO_PAPER_FORMATS:
+            self.paper_cb.config(state=tk.DISABLED)
+            self.paper_cb.set("(sem papel)")
+            self.log(f"Formato especial: {selected} (não requer papel)")
+        else:
+            self.paper_cb.config(state="readonly")
+            if not self.paper_cb.get() or self.paper_cb.get() == "(sem papel)":
+                papers = MACHINE_CONFIG[machine]["papers"]
+                if papers:
+                    self.paper_cb.current(0)
+
+    def on_drop(self, event):
+        files = re.findall(r'\{.*?\}|\S+', event.data)
+        added = 0
+        for f in files:
+            f = f.strip('{}')
+            f = os.path.normpath(f)
+            if f.lower().endswith(".pdf") and os.path.exists(f) and f not in self.file_paths:
+                self.file_paths.append(f)
+                self.listbox.insert(tk.END, os.path.basename(f))
+                added += 1
+        if added:
+            self.update_counter()
+            self.log(f"+{added} arquivo(s) via drag & drop")
+
+    def add_files_manually(self, event=None):
+        files = filedialog.askopenfilenames(filetypes=[("PDF", "*.pdf")])
+        added = 0
+        for f in files:
+            f = os.path.normpath(f)
+            if f not in self.file_paths:
+                self.file_paths.append(f)
+                self.listbox.insert(tk.END, os.path.basename(f))
+                added += 1
+        if added:
+            self.update_counter()
+            self.log(f"+{added} arquivo(s) adicionado(s) manualmente")
+
+    def delete_selected(self):
+        selected = self.listbox.curselection()
+        for idx in reversed(selected):
+            self.listbox.delete(idx)
+            del self.file_paths[idx]
+        self.update_counter()
+        self.log(f"{len(selected)} arquivo(s) removido(s)")
+
+    def clear_all(self):
+        self.listbox.delete(0, tk.END)
+        self.file_paths.clear()
+        self.update_counter()
+        self.log("Lista limpa")
+
+    def start_send(self):
+        machine = self.machine_var.get()
+        if not machine:
+            messagebox.showwarning("Aviso", "Selecione uma máquina.")
+            return
+        formato = self.format_cb.get()
+        if not formato:
+            messagebox.showwarning("Aviso", "Selecione um formato.")
+            return
+        if formato not in NO_PAPER_FORMATS:
+            papel = self.paper_cb.get()
+            if not papel or papel == "(sem papel)":
+                messagebox.showwarning("Aviso", "Selecione o papel/gramatura.")
+                return
+        else:
+            papel = None
+
+        if not self.file_paths:
+            messagebox.showwarning("Aviso", "Nenhum arquivo para enviar.")
+            return
+        if self.sending:
+            messagebox.showinfo("Aguarde", "Envio já em andamento.")
+            return
+
+        total = len(self.file_paths)
+        self.progress['maximum'] = total
+        self.progress['value'] = 0
+        self.percent_label.config(text="0%")
+        self.current_file_label.config(text="Preparando envio...")
+
+        self.sending = True
+        self.cancel_send = False
+        self.send_btn.config(state=tk.DISABLED)
+        self.cancel_btn.config(state=tk.NORMAL)
+
+        thread = threading.Thread(target=self._send_thread, args=(machine, formato, papel))
+        thread.daemon = True
+        thread.start()
+
+    def cancel(self):
+        self.cancel_send = True
+        self.log("Cancelamento solicitado...")
+
+    def _send_thread(self, machine, formato, papel):
+        config = MACHINE_CONFIG[machine]
+        ip = config["ip"]
+        group = config["group"]
+        optional = self._get_optional()
+        current_date = datetime.now().strftime("%d-%m-%Y")
+        total = len(self.file_paths)
+        success = 0
+
+        if formato in NO_PAPER_FORMATS:
+            queue_name = formato
+        else:
+            if group == "PB":
+                queue_name = f"{formato} {papel}"
             else:
-                ja_estavam += 1
-        self._atualizar_contador_fila()
-        if adicionados:
-            self.label_status.config(text=f"{adicionados} PDF(s) adicionado(s) à fila")
-        if ja_estavam:
-            messagebox.showinfo("Duplicados ignorados",
-                                f"{ja_estavam} item(ns) já estavam na fila e foram ignorados.")
+                queue_name = f"{formato}_{papel}".replace(" ", "_")
+        self.log(f"Fila gerada: {queue_name} (grupo {group})")
 
-    def adicionar_todos(self):
-        lote = self.combo_lote.get()
-        if not lote:
-            return
-        todos = [self.lista_pdfs.get(i) for i in range(self.lista_pdfs.size())]
-        if not todos:
-            return
-        if not messagebox.askyesno("Confirmar",
-                                   f"Adicionar todos os {len(todos)} PDFs visíveis na fila?"):
-            return
-        adicionados = 0
-        for nome in todos:
-            chave = f"{lote}|{nome}"
-            if self._add_fila(chave, nome, lote):
-                adicionados += 1
-        self._atualizar_contador_fila()
-        self.label_status.config(text=f"{adicionados} PDF(s) adicionado(s) à fila")
-        if adicionados < len(todos):
-            messagebox.showinfo("Aviso", "Alguns itens já estavam na fila e foram ignorados.")
+        for idx, orig_path in enumerate(self.file_paths, 1):
+            if self.cancel_send:
+                break
 
-    def remover_item(self):
-        selecionados = self.lista_fila.curselection()
-        if not selecionados:
-            return
-        for idx in sorted(selecionados, reverse=True):
-            chave = self.fila_chaves[idx]
-            self.fila.remove(chave)
-            del self.fila_chaves[idx]
-            self.lista_fila.delete(idx)
-        self._atualizar_contador_fila()
-        self.label_status.config(text="Item(ns) removido(s) da fila")
+            file_basename = os.path.basename(orig_path)
+            self.after(0, lambda v=idx-1: self.progress.configure(value=v))
+            percent_antes = int((idx-1) / total * 100)
+            self.after(0, lambda p=percent_antes: self.percent_label.config(text=f"{p}%"))
+            self.after(0, lambda i=idx, t=total, nome=file_basename:
+                       self.current_file_label.config(text=f"Enviando ({i}/{t}): {nome}"))
 
-    def limpar_lista(self):
-        if not self.fila:
-            return
-        if messagebox.askyesno("Limpar fila", "Deseja realmente limpar toda a fila?"):
-            self.lista_fila.delete(0, tk.END)
-            self.fila.clear()
-            self.fila_chaves.clear()
-            self._atualizar_contador_fila()
-            self.label_status.config(text="Fila limpa")
-
-    def _atualizar_contador_fila(self):
-        total = len(self.fila_chaves)
-        self.label_contador_fila.config(text=f"{total} item(ns) na fila")
-
-    def processar_tudo(self):
-        if not self.fila_chaves:
-            messagebox.showwarning("Fila vazia", "Adicione PDFs à fila antes de processar.")
-            return
-        total = len(self.fila_chaves)
-        if not messagebox.askyesno("Iniciar processamento",
-                                   f"Processar {total} arquivo(s) da fila?"):
-            return
-
-        self.btn_processar.config(state=tk.DISABLED)
-        self.progress["maximum"] = total
-        self.progress["value"] = 0
-
-        resultados = []
-        count = 0
-
-        for chave in self.fila_chaves:
-            lote, nome = chave.split("|")
-            self.label_status.config(text=f"Processando {count+1}/{total}: {nome}")
-            self.update()  # atualiza a interface do frame
-
-            origem = os.path.join(BASE1, lote, nome)
-            pasta_erros = os.path.join(BASE2, lote, "ERROS")
-            os.makedirs(pasta_erros, exist_ok=True)
-            destino = os.path.join(pasta_erros, nome)
-
+            base_name = file_basename[:40]
+            fictitious = f"{base_name}-{current_date}-{optional}".strip("-")
+            temp_path = os.path.join(self.temp_dir, f"{machine}_{idx}_{os.getpid()}.pdf")
             try:
-                shutil.copy2(origem, destino)
-                time.sleep(0.2)
-
-                reduzido = os.path.join(pasta_erros, nome.replace(".pdf", "_REDUZIDO.pdf"))
-                comprimir_pdf(destino, reduzido)
-
-                nome_upper = nome.upper()
-                if "[BROCHURA]" in nome_upper or "[GRAMPO]" in nome_upper:
-                    tipo = 'brochura' if "[BROCHURA]" in nome_upper else 'grampo'
-                    montado = os.path.join(pasta_erros, nome.replace(".pdf", "_MONTADO.pdf"))
-                    self.label_status.config(text=f"Montando {nome} ({tipo})...")
-                    self.update()
-                    montar_pdf(reduzido, montado, tipo)
-                    resultados.append(f"{lote} - {nome} ✔ OK (montagem {tipo})")
-                else:
-                    resultados.append(f"{lote} - {nome} ✔ OK")
-
+                shutil.copy2(orig_path, temp_path)
             except Exception as e:
-                resultados.append(f"{lote} - {nome} ❌ ERRO ({e})")
+                self.log(f"ERRO cópia: {e}")
+                continue
 
-            count += 1
-            self.progress["value"] = count
-            self.update()
+            cmd = f'lpr -S {ip} -P "{queue_name}" -J "{fictitious}" "{temp_path}"'
+            self.log(f"Enviando: {fictitious} para {ip} (fila: {queue_name})")
+            try:
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=90)
+                if result.returncode == 0:
+                    success += 1
+                    self.log(f"✓ OK: {fictitious}")
+                else:
+                    self.log(f"✗ FALHA: {fictitious} - {result.stderr.strip()}")
+            except subprocess.TimeoutExpired:
+                self.log(f"⏱ TIMEOUT: {fictitious}")
+            except Exception as e:
+                self.log(f"⚠ ERRO: {fictitious} - {e}")
+            finally:
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
 
-        self.label_status.config(text="Processamento finalizado ✔")
-        self.btn_processar.config(state=tk.NORMAL)
+            self.after(0, lambda v=idx: self.progress.configure(value=v))
+            percent_depois = int(idx / total * 100)
+            self.after(0, lambda p=percent_depois: self.percent_label.config(text=f"{p}%"))
 
-        caminho_txt = salvar_relatorio(resultados)
-        messagebox.showinfo("Finalizado",
-                            f"Processamento concluído.\nRelatório salvo em:\n{caminho_txt}")
-#FUNCÕES DA ABA ERROS
-BASE1 = r"\\192.168.200.252\dados_clientes\UICLAP\Shared drives\UICLAP-Docuprint\Producao\Lotes-Novo"
-BASE2 = r"N:\____REPOSITORIO GERAL POD\UICLAP\LOTES"
-RELATORIO = r"N:\____REPOSITORIO GERAL POD\UICLAP\RELATÓRIOS DE ERRO"
+        self.after(0, lambda: self.current_file_label.config(text="Envio finalizado" if success == total else "Envio com falhas"))
+        self.after(0, self.cancel_btn.config, {'state': tk.DISABLED})
+        self.after(0, self.send_btn.config, {'state': tk.NORMAL})
+        self.sending = False
 
-LARGURA_CM = 45
-ALTURA_CM = 32
-CM_TO_PT = 28.3465
-SANGRIA_CM = 0.3
-
-LARGURA_PT = LARGURA_CM * CM_TO_PT
-ALTURA_PT = ALTURA_CM * CM_TO_PT
-SANGRIA_PT = SANGRIA_CM * CM_TO_PT
-
-TAM_MARCA = 5 * CM_TO_PT / 10   # 5 mm
-GAP_MARCA = 2 * CM_TO_PT / 10   # 2 mm
-
-def salvar_relatorio(resultados):
-    # Garante que a pasta exista
-    os.makedirs(RELATORIO, exist_ok=True)
-
-    # Meses em português
-    meses = {
-        1: "JANEIRO",
-        2: "FEVEREIRO",
-        3: "MARÇO",
-        4: "ABRIL",
-        5: "MAIO",
-        6: "JUNHO",
-        7: "JULHO",
-        8: "AGOSTO",
-        9: "SETEMBRO",
-        10: "OUTUBRO",
-        11: "NOVEMBRO",
-        12: "DEZEMBRO"
-    }
-
-    agora_data = datetime.now()
-
-    nome_mes = meses[agora_data.month]
-    ano = agora_data.year
-
-    # Nome do arquivo
-    nome_arquivo = f"RELATORIO PROCESSAMENTO DE ERRO {nome_mes} {ano}.txt"
-
-    # Caminho final
-    caminho = os.path.join(RELATORIO, nome_arquivo)
-
-    # Data/hora do processamento
-    agora = agora_data.strftime("%d/%m/%Y %H:%M:%S")
-
-    # Se já existir conteúdo, adiciona uma linha em branco antes
-    if os.path.exists(caminho) and os.path.getsize(caminho) > 0:
-        with open(caminho, "a", encoding="utf-8") as f:
-            f.write("\n")
-
-    # Escreve no relatório
-    with open(caminho, "a", encoding="utf-8") as f:
-        f.write("=" * 70 + "\n")
-        f.write(f"PROCESSAMENTO REALIZADO EM: {agora}\n")
-        f.write("=" * 70 + "\n")
-
-        for linha in resultados:
-            f.write(linha + "\n")
-
-    return caminho
-def inserir_imagem_na_pagina(page, img, rect, qualidade=95):
-    with io.BytesIO() as output:
-        img.save(output, format='PNG', quality=qualidade, optimize=True)
-        data = output.getvalue()
-    page.insert_image(rect, stream=data, keep_proportion=False)
-def desenhar_marca_central_vertical(page, x, y0, y1, tam=TAM_MARCA, gap=GAP_MARCA):
-    s = page.new_shape()
-    s.draw_line((x, y0 - tam), (x, y0 - gap))
-    s.draw_line((x, y1 + tam), (x, y1 + gap))
-    s.finish(width=0.5)
-    s.commit()
-def aplicar_sangria_espelhada_externa(page, nova, trim_original, destino, sangria_pt, bordas, rotate=0):
-    zoom = 2.0
-    mapa_bordas = {
-        0:   {'top': 'top', 'bottom': 'bottom', 'left': 'left', 'right': 'right'},
-        90:  {'top': 'left', 'bottom': 'right', 'left': 'bottom', 'right': 'top'},
-        180: {'top': 'bottom', 'bottom': 'top', 'left': 'right', 'right': 'left'},
-        270: {'top': 'right', 'bottom': 'left', 'left': 'top', 'right': 'bottom'}
-    }
-    mapa = mapa_bordas.get(rotate % 360, mapa_bordas[0])
-
-    for borda_dest in bordas:
-        borda_orig = mapa[borda_dest]
-        if borda_orig == 'top':
-            rect = fitz.Rect(trim_original.x0, trim_original.y0,
-                             trim_original.x1, trim_original.y0 + sangria_pt)
-            flip_h, flip_v = False, True
-        elif borda_orig == 'bottom':
-            rect = fitz.Rect(trim_original.x0, trim_original.y1 - sangria_pt,
-                             trim_original.x1, trim_original.y1)
-            flip_h, flip_v = False, True
-        elif borda_orig == 'left':
-            rect = fitz.Rect(trim_original.x0, trim_original.y0,
-                             trim_original.x0 + sangria_pt, trim_original.y1)
-            flip_h, flip_v = True, False
-        elif borda_orig == 'right':
-            rect = fitz.Rect(trim_original.x1 - sangria_pt, trim_original.y0,
-                             trim_original.x1, trim_original.y1)
-            flip_h, flip_v = True, False
+        if not self.cancel_send:
+            if success == total:
+                self.log(f"✅ Todos os {total} arquivos enviados com sucesso!")
+                self.after(0, lambda: messagebox.showinfo("Sucesso", f"{total} arquivo(s) enviado(s)"))
+                self.after(0, self.clear_all)
+                self.after(0, self.reset_progress)
+            else:
+                self.log(f"⚠ Enviados {success} de {total} (com falhas).")
+                self.after(0, lambda: messagebox.showerror("Erro parcial", f"{success}/{total} enviados. Veja o log."))
         else:
-            continue
+            self.log("Envio cancelado pelo usuário.")
+            self.after(0, self.reset_progress)
 
-        img = get_border_pixmap(page, rect, zoom)
-        if rotate == 90:
-            img = img.transpose(Image.ROTATE_90)
-        elif rotate == 180:
-            img = img.transpose(Image.ROTATE_180)
-        elif rotate == 270:
-            img = img.transpose(Image.ROTATE_270)
+    def _on_destroy(self, event=None):
+        try:
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+        except:
+            pass
+import os
+import io
+import shutil
+import subprocess
+import tempfile
+import tkinter as tk
+from tkinter import messagebox, ttk
+from datetime import datetime
 
-        img = espelhar_borda(img, flip_horizontal=flip_h, flip_vertical=flip_v)
-        if borda_dest in ('top', 'bottom'):
-            img = img.resize((int(destino.width), int(sangria_pt)), Image.Resampling.LANCZOS)
-        else:
-            img = img.resize((int(sangria_pt), int(destino.height)), Image.Resampling.LANCZOS)
+import fitz  # PyMuPDF
+from PIL import Image, ImageOps
+import openpyxl
+class RefazerTab(ttk.Frame):
+    # ---------- CONFIGURAÇÕES (agora atributos da classe) ----------
+    CAMINHO_CAPAS_POD_AGRUPADAS = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\_CAPAS DE POD AGRUPADAS"
+    CAMINHO_UICLAP_LOTES = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\UICLAP\LOTES"
+    CAMINHO_RELATORIOS_PERDA = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\_CAPAS DE POD AGRUPADAS\Z_RELATÓRIOS\RELATÓRIOS DE PERDA.xlsx"
+    GS_PATH = r"C:\Ghostscript\gswin64c.exe"
 
-        if borda_dest == 'top':
-            dest_rect = fitz.Rect(destino.x0, destino.y0 - sangria_pt, destino.x1, destino.y0)
-        elif borda_dest == 'bottom':
-            dest_rect = fitz.Rect(destino.x0, destino.y1, destino.x1, destino.y1 + sangria_pt)
-        elif borda_dest == 'left':
-            dest_rect = fitz.Rect(destino.x0 - sangria_pt, destino.y0, destino.x0, destino.y1)
-        elif borda_dest == 'right':
-            dest_rect = fitz.Rect(destino.x1, destino.y0, destino.x1 + sangria_pt, destino.y1)
-        else:
-            continue
+    LARGURA_CM = 45
+    ALTURA_CM = 32
+    CM_TO_PT = 28.3465
+    SANGRIA_CM = 0.3
 
-        inserir_imagem_na_pagina(nova, img, dest_rect)
+    LARGURA_PT = LARGURA_CM * CM_TO_PT
+    ALTURA_PT = ALTURA_CM * CM_TO_PT
+    SANGRIA_PT = SANGRIA_CM * CM_TO_PT
 
-    cantos = [('top','left'), ('top','right'), ('bottom','left'), ('bottom','right')]
-    for b1, b2 in cantos:
-        if b1 in bordas and b2 in bordas:
-            borda_orig1 = mapa[b1]
-            borda_orig2 = mapa[b2]
-            if (borda_orig1 == 'top' and borda_orig2 == 'left') or (borda_orig1 == 'left' and borda_orig2 == 'top'):
+    TAM_MARCA = 5 * CM_TO_PT / 10   # 5 mm
+    GAP_MARCA = 2 * CM_TO_PT / 10   # 2 mm
+
+    SETORES_PERDA = [ "PRE-IMPRESSÃO", "PROBLEMA DE FONTE","IMPRESSÃO", "REFILE INICIAL MIOLO","REFILE INICIAL CAPA","SEPARAÇÃO", "ENCADERNAÇÃO", "LAMINAÇÃO","REFILE ORELHA",
+                     "REFILE FINAL", "SHIRINK","EXPEDIÇÃO"]
+    MAQUINAS_REF = ["RICOH", "OCÉ 1", "OCÉ 3", "BALTORO","ATEXCO"]
+    OPERADORES = ["FRAN", "MONALISA", "PALOMA", "PEDRO", "ISMENIO", "CAMILA", "EDUARDO", "DIOGO", "KENNEDY"]
+
+    def __init__(self, parent, app=None):
+        super().__init__(parent)
+        self.parent = parent
+        self.app = app  # pode ser usado para acessar recursos do app principal
+
+        # Variáveis de estado
+        self.lista_completa = []
+        self.pasta_var = tk.StringVar()
+        self.subpasta_var = tk.StringVar()
+        self.operador_var = tk.StringVar()
+        self.filtro_var = tk.StringVar()
+        self.idx_capa = -1
+        self.idx_miolo = -1
+        self.idx_caminho = -1
+
+        self._criar_interface()
+        self.carregar_clientes()
+
+    # ---------- FUNÇÕES AUXILIARES (métodos da classe) ----------
+    @staticmethod
+    def get_border_pixmap(page, rect, zoom=2.0):
+        pix = page.get_pixmap(clip=rect, dpi=int(72 * zoom))
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        return img
+
+    @staticmethod
+    def espelhar_borda(img, flip_horizontal=False, flip_vertical=False):
+        if flip_horizontal:
+            img = ImageOps.mirror(img)
+        if flip_vertical:
+            img = ImageOps.flip(img)
+        return img
+
+    @staticmethod
+    def inserir_imagem_na_pagina(page, img, rect, qualidade=95):
+        with io.BytesIO() as output:
+            img.save(output, format='PNG', quality=qualidade, optimize=True)
+            data = output.getvalue()
+        page.insert_image(rect, stream=data, keep_proportion=False)
+
+    @staticmethod
+    def desenhar_marca_central_vertical(page, x, y0, y1, tam=None, gap=None):
+        if tam is None:
+            tam = RefazerTab.TAM_MARCA
+        if gap is None:
+            gap = RefazerTab.GAP_MARCA
+        s = page.new_shape()
+        s.draw_line((x, y0 - tam), (x, y0 - gap))
+        s.draw_line((x, y1 + tam), (x, y1 + gap))
+        s.finish(width=0.5)
+        s.commit()
+
+    @staticmethod
+    def aplicar_sangria_espelhada_externa(page, nova, trim_original, destino, sangria_pt, bordas, rotate=0):
+        zoom = 2.0
+        mapa_bordas = {
+            0:   {'top': 'top', 'bottom': 'bottom', 'left': 'left', 'right': 'right'},
+            90:  {'top': 'left', 'bottom': 'right', 'left': 'bottom', 'right': 'top'},
+            180: {'top': 'bottom', 'bottom': 'top', 'left': 'right', 'right': 'left'},
+            270: {'top': 'right', 'bottom': 'left', 'left': 'top', 'right': 'bottom'}
+        }
+        mapa = mapa_bordas.get(rotate % 360, mapa_bordas[0])
+
+        for borda_dest in bordas:
+            borda_orig = mapa[borda_dest]
+            if borda_orig == 'top':
                 rect = fitz.Rect(trim_original.x0, trim_original.y0,
-                                 trim_original.x0 + sangria_pt, trim_original.y0 + sangria_pt)
-            elif (borda_orig1 == 'top' and borda_orig2 == 'right') or (borda_orig1 == 'right' and borda_orig2 == 'top'):
-                rect = fitz.Rect(trim_original.x1 - sangria_pt, trim_original.y0,
                                  trim_original.x1, trim_original.y0 + sangria_pt)
-            elif (borda_orig1 == 'bottom' and borda_orig2 == 'left') or (borda_orig1 == 'left' and borda_orig2 == 'bottom'):
+                flip_h, flip_v = False, True
+            elif borda_orig == 'bottom':
                 rect = fitz.Rect(trim_original.x0, trim_original.y1 - sangria_pt,
-                                 trim_original.x0 + sangria_pt, trim_original.y1)
-            elif (borda_orig1 == 'bottom' and borda_orig2 == 'right') or (borda_orig1 == 'right' and borda_orig2 == 'bottom'):
-                rect = fitz.Rect(trim_original.x1 - sangria_pt, trim_original.y1 - sangria_pt,
                                  trim_original.x1, trim_original.y1)
+                flip_h, flip_v = False, True
+            elif borda_orig == 'left':
+                rect = fitz.Rect(trim_original.x0, trim_original.y0,
+                                 trim_original.x0 + sangria_pt, trim_original.y1)
+                flip_h, flip_v = True, False
+            elif borda_orig == 'right':
+                rect = fitz.Rect(trim_original.x1 - sangria_pt, trim_original.y0,
+                                 trim_original.x1, trim_original.y1)
+                flip_h, flip_v = True, False
             else:
                 continue
 
-            img = get_border_pixmap(page, rect, zoom)
+            img = RefazerTab.get_border_pixmap(page, rect, zoom)
             if rotate == 90:
                 img = img.transpose(Image.ROTATE_90)
             elif rotate == 180:
                 img = img.transpose(Image.ROTATE_180)
             elif rotate == 270:
                 img = img.transpose(Image.ROTATE_270)
-            img = espelhar_borda(img, flip_horizontal=True, flip_vertical=True)
-            img = img.resize((int(sangria_pt), int(sangria_pt)), Image.Resampling.LANCZOS)
 
-            if b1 == 'top' and b2 == 'left':
-                dest_rect = fitz.Rect(destino.x0 - sangria_pt, destino.y0 - sangria_pt, destino.x0, destino.y0)
-            elif b1 == 'top' and b2 == 'right':
-                dest_rect = fitz.Rect(destino.x1, destino.y0 - sangria_pt, destino.x1 + sangria_pt, destino.y0)
-            elif b1 == 'bottom' and b2 == 'left':
-                dest_rect = fitz.Rect(destino.x0 - sangria_pt, destino.y1, destino.x0, destino.y1 + sangria_pt)
-            elif b1 == 'bottom' and b2 == 'right':
-                dest_rect = fitz.Rect(destino.x1, destino.y1, destino.x1 + sangria_pt, destino.y1 + sangria_pt)
+            img = RefazerTab.espelhar_borda(img, flip_horizontal=flip_h, flip_vertical=flip_v)
+            if borda_dest in ('top', 'bottom'):
+                img = img.resize((int(destino.width), int(sangria_pt)), Image.Resampling.LANCZOS)
+            else:
+                img = img.resize((int(sangria_pt), int(destino.height)), Image.Resampling.LANCZOS)
+
+            if borda_dest == 'top':
+                dest_rect = fitz.Rect(destino.x0, destino.y0 - sangria_pt, destino.x1, destino.y0)
+            elif borda_dest == 'bottom':
+                dest_rect = fitz.Rect(destino.x0, destino.y1, destino.x1, destino.y1 + sangria_pt)
+            elif borda_dest == 'left':
+                dest_rect = fitz.Rect(destino.x0 - sangria_pt, destino.y0, destino.x0, destino.y1)
+            elif borda_dest == 'right':
+                dest_rect = fitz.Rect(destino.x1, destino.y0, destino.x1 + sangria_pt, destino.y1)
             else:
                 continue
-            inserir_imagem_na_pagina(nova, img, dest_rect)
-def pagina_tem_conteudo(page):
-    if page.get_contents():
-        return True
-    if page.get_text("text").strip():
-        return True
-    if page.get_images():
-        return True
-    return False
-def obter_area_corte_segura(page, w_ref, h_ref):
-    if page.trimbox and page.trimbox.width > 0 and page.trimbox.height > 0:
-        return page.trimbox
-    rect = page.rect
-    if rect.width > 0 and rect.height > 0:
-        return rect
-    return fitz.Rect(0, 0, w_ref, h_ref)
-def calcular_y_com_sangria(altura_pt, h, sangria_pt):
-    if h + 2 * sangria_pt > altura_pt:
-        y_center = (altura_pt - h) / 2
-        return y_center, False
-    else:
-        y_center = (altura_pt - h) / 2
-        y_min = sangria_pt
-        y_max = altura_pt - h - sangria_pt
-        y = max(y_min, min(y_center, y_max))
-        return y, True
-def ajustar_para_media_box(rect, largura, altura):
-    x0 = max(0, min(rect.x0, largura - 1))
-    y0 = max(0, min(rect.y0, altura - 1))
-    x1 = max(x0 + 1, min(rect.x1, largura))
-    y1 = max(y0 + 1, min(rect.y1, altura))
-    return fitz.Rect(x0, y0, x1, y1)
-def montar_pdf(entrada, saida, tipo):
-    doc = fitz.open(entrada)
-    out = fitz.open()
-    if len(doc) > 0:
-        w_ref, h_ref = doc[0].rect.width, doc[0].rect.height
-    else:
-        w_ref, h_ref = 595, 842
 
-    largura_pt = LARGURA_PT
-    altura_pt = ALTURA_PT
-    sangria_pt = SANGRIA_PT
-    espaco_pt = 0
-    paginas_vazias = []
+            RefazerTab.inserir_imagem_na_pagina(nova, img, dest_rect)
 
-    if tipo == 'brochura':
-        total_original = len(doc)
-        if total_original % 4 != 0:
-            faltam = 4 - (total_original % 4)
-            for _ in range(faltam):
-                doc.new_page(width=w_ref, height=h_ref)
-        total = len(doc)
-        metade = total // 2
-        num_faces = total // 2
+        cantos = [('top','left'), ('top','right'), ('bottom','left'), ('bottom','right')]
+        for b1, b2 in cantos:
+            if b1 in bordas and b2 in bordas:
+                borda_orig1 = mapa[b1]
+                borda_orig2 = mapa[b2]
+                if (borda_orig1 == 'top' and borda_orig2 == 'left') or (borda_orig1 == 'left' and borda_orig2 == 'top'):
+                    rect = fitz.Rect(trim_original.x0, trim_original.y0,
+                                     trim_original.x0 + sangria_pt, trim_original.y0 + sangria_pt)
+                elif (borda_orig1 == 'top' and borda_orig2 == 'right') or (borda_orig1 == 'right' and borda_orig2 == 'top'):
+                    rect = fitz.Rect(trim_original.x1 - sangria_pt, trim_original.y0,
+                                     trim_original.x1, trim_original.y0 + sangria_pt)
+                elif (borda_orig1 == 'bottom' and borda_orig2 == 'left') or (borda_orig1 == 'left' and borda_orig2 == 'bottom'):
+                    rect = fitz.Rect(trim_original.x0, trim_original.y1 - sangria_pt,
+                                     trim_original.x0 + sangria_pt, trim_original.y1)
+                elif (borda_orig1 == 'bottom' and borda_orig2 == 'right') or (borda_orig1 == 'right' and borda_orig2 == 'bottom'):
+                    rect = fitz.Rect(trim_original.x1 - sangria_pt, trim_original.y1 - sangria_pt,
+                                     trim_original.x1, trim_original.y1)
+                else:
+                    continue
 
-        for i in range(num_faces):
-            if i % 2 == 0:
-                idx_esq = metade + i
-                idx_dir = i
-            else:
-                idx_esq = i
-                idx_dir = metade + i
-            idx_esq = idx_esq if idx_esq < total else None
-            idx_dir = idx_dir if idx_dir < total else None
+                img = RefazerTab.get_border_pixmap(page, rect, zoom)
+                if rotate == 90:
+                    img = img.transpose(Image.ROTATE_90)
+                elif rotate == 180:
+                    img = img.transpose(Image.ROTATE_180)
+                elif rotate == 270:
+                    img = img.transpose(Image.ROTATE_270)
+                img = RefazerTab.espelhar_borda(img, flip_horizontal=True, flip_vertical=True)
+                img = img.resize((int(sangria_pt), int(sangria_pt)), Image.Resampling.LANCZOS)
 
-            page_esq = doc[idx_esq] if idx_esq is not None else None
-            page_dir = doc[idx_dir] if idx_dir is not None else None
-            rot_esq = (idx_esq is not None and idx_esq >= metade)
-            rot_dir = (idx_dir is not None and idx_dir >= metade)
+                if b1 == 'top' and b2 == 'left':
+                    dest_rect = fitz.Rect(destino.x0 - sangria_pt, destino.y0 - sangria_pt, destino.x0, destino.y0)
+                elif b1 == 'top' and b2 == 'right':
+                    dest_rect = fitz.Rect(destino.x1, destino.y0 - sangria_pt, destino.x1 + sangria_pt, destino.y0)
+                elif b1 == 'bottom' and b2 == 'left':
+                    dest_rect = fitz.Rect(destino.x0 - sangria_pt, destino.y1, destino.x0, destino.y1 + sangria_pt)
+                elif b1 == 'bottom' and b2 == 'right':
+                    dest_rect = fitz.Rect(destino.x1, destino.y1, destino.x1 + sangria_pt, destino.y1 + sangria_pt)
+                else:
+                    continue
+                RefazerTab.inserir_imagem_na_pagina(nova, img, dest_rect)
 
-            if page_esq:
-                trim_esq = obter_area_corte_segura(page_esq, w_ref, h_ref)
-                w_esq, h_esq = trim_esq.width, trim_esq.height
-            else:
-                trim_esq = None
-                w_esq, h_esq = w_ref, h_ref
-            if page_dir:
-                trim_dir = obter_area_corte_segura(page_dir, w_ref, h_ref)
-                w_dir, h_dir = trim_dir.width, trim_dir.height
-            else:
-                trim_dir = None
-                w_dir, h_dir = w_ref, h_ref
+    @staticmethod
+    def pagina_tem_conteudo(page):
+        if page.get_contents():
+            return True
+        if page.get_text("text").strip():
+            return True
+        if page.get_images():
+            return True
+        return False
 
-            nova = out.new_page(width=largura_pt, height=altura_pt)
-            if sangria_pt > 0:
-                y_esq, cabe_esq = calcular_y_com_sangria(altura_pt, h_esq, sangria_pt)
-                y_dir, cabe_dir = calcular_y_com_sangria(altura_pt, h_dir, sangria_pt)
-                sangria_aplicar_esq = cabe_esq and page_esq is not None
-                sangria_aplicar_dir = cabe_dir and page_dir is not None
-            else:
-                y_esq = (altura_pt - h_esq) / 2
-                y_dir = (altura_pt - h_dir) / 2
-                sangria_aplicar_esq = sangria_aplicar_dir = False
+    @staticmethod
+    def obter_area_corte_segura(page, w_ref, h_ref):
+        if page.trimbox and page.trimbox.width > 0 and page.trimbox.height > 0:
+            return page.trimbox
+        rect = page.rect
+        if rect.width > 0 and rect.height > 0:
+            return rect
+        return fitz.Rect(0, 0, w_ref, h_ref)
 
-            largura_total = w_esq + w_dir + espaco_pt + 2 * sangria_pt
-            x_inicio = (largura_pt - largura_total) / 2
-            x1 = x_inicio + sangria_pt
-            destino1 = fitz.Rect(x1, y_esq, x1 + w_esq, y_esq + h_esq)
-            destino1 = ajustar_para_media_box(destino1, largura_pt, altura_pt)
-            x2 = x1 + w_esq + espaco_pt
-            destino2 = fitz.Rect(x2, y_dir, x2 + w_dir, y_dir + h_dir)
-            destino2 = ajustar_para_media_box(destino2, largura_pt, altura_pt)
+    @staticmethod
+    def calcular_y_com_sangria(altura_pt, h, sangria_pt):
+        if h + 2 * sangria_pt > altura_pt:
+            y_center = (altura_pt - h) / 2
+            return y_center, False
+        else:
+            y_center = (altura_pt - h) / 2
+            y_min = sangria_pt
+            y_max = altura_pt - h - sangria_pt
+            y = max(y_min, min(y_center, y_max))
+            return y, True
 
-            if page_esq and pagina_tem_conteudo(page_esq):
-                try:
-                    nova.show_pdf_page(destino1, doc, idx_esq, clip=trim_esq, rotate=180 if rot_esq else 0)
-                except Exception:
+    @staticmethod
+    def ajustar_para_media_box(rect, largura, altura):
+        x0 = max(0, min(rect.x0, largura - 1))
+        y0 = max(0, min(rect.y0, altura - 1))
+        x1 = max(x0 + 1, min(rect.x1, largura))
+        y1 = max(y0 + 1, min(rect.y1, altura))
+        return fitz.Rect(x0, y0, x1, y1)
+
+    @staticmethod
+    def desenhar_marcas(pagina, destino, lado):
+        s = pagina.new_shape()
+        x0, y0, x1, y1 = destino.x0, destino.y0, destino.x1, destino.y1
+        tam = RefazerTab.TAM_MARCA
+        gap = RefazerTab.GAP_MARCA
+
+        # MARCAS VERTICAIS
+        s.draw_line((x0, y0 - tam), (x0, y0 - gap))
+        s.draw_line((x1, y0 - tam), (x1, y0 - gap))
+        s.draw_line((x0, y1 + tam), (x0, y1 + gap))
+        s.draw_line((x1, y1 + tam), (x1, y1 + gap))
+
+        # MARCAS HORIZONTAIS
+        if lado == 'esquerda':
+            s.draw_line((x0 - tam, y0), (x0 - gap, y0))
+            s.draw_line((x0 - tam, y1), (x0 - gap, y1))
+        elif lado == 'direita':
+            s.draw_line((x1 + tam, y0), (x1 + gap, y0))
+            s.draw_line((x1 + tam, y1), (x1 + gap, y1))
+
+        s.finish(width=0.5, color=(0,0,0))
+        s.commit()
+
+    def montar_pdf(self, entrada, saida, tipo):
+        doc = fitz.open(entrada)
+        out = fitz.open()
+        w_ref = h_ref = 595
+        if len(doc) > 0:
+            w_ref, h_ref = doc[0].rect.width, doc[0].rect.height
+
+        largura_pt = self.LARGURA_PT
+        altura_pt = self.ALTURA_PT
+        sangria_pt = self.SANGRIA_PT
+        espaco_pt = 0
+        paginas_vazias = []
+
+        if tipo == 'brochura':
+            total_original = len(doc)
+            if total_original % 4 != 0:
+                faltam = 4 - (total_original % 4)
+                for _ in range(faltam):
+                    doc.new_page(width=w_ref, height=h_ref)
+            total = len(doc)
+            metade = total // 2
+            num_faces = total // 2
+
+            for i in range(num_faces):
+                if i % 2 == 0:
+                    idx_esq = metade + i
+                    idx_dir = i
+                else:
+                    idx_esq = i
+                    idx_dir = metade + i
+                idx_esq = idx_esq if idx_esq < total else None
+                idx_dir = idx_dir if idx_dir < total else None
+
+                page_esq = doc[idx_esq] if idx_esq is not None else None
+                page_dir = doc[idx_dir] if idx_dir is not None else None
+                rot_esq = (idx_esq is not None and idx_esq >= metade)
+                rot_dir = (idx_dir is not None and idx_dir >= metade)
+
+                trim_esq = self.obter_area_corte_segura(page_esq, w_ref, h_ref) if page_esq else None
+                w_esq = trim_esq.width if trim_esq else w_ref
+                h_esq = trim_esq.height if trim_esq else h_ref
+                trim_dir = self.obter_area_corte_segura(page_dir, w_ref, h_ref) if page_dir else None
+                w_dir = trim_dir.width if trim_dir else w_ref
+                h_dir = trim_dir.height if trim_dir else h_ref
+
+                nova = out.new_page(width=largura_pt, height=altura_pt)
+
+                if sangria_pt > 0:
+                    y_esq, cabe_esq = self.calcular_y_com_sangria(altura_pt, h_esq, sangria_pt)
+                    y_dir, cabe_dir = self.calcular_y_com_sangria(altura_pt, h_dir, sangria_pt)
+                    sangria_aplicar_esq = cabe_esq and page_esq is not None
+                    sangria_aplicar_dir = cabe_dir and page_dir is not None
+                else:
+                    y_esq = (altura_pt - h_esq) / 2
+                    y_dir = (altura_pt - h_dir) / 2
+                    sangria_aplicar_esq = sangria_aplicar_dir = False
+
+                largura_total = w_esq + w_dir + espaco_pt + 2 * sangria_pt
+                x_inicio = (largura_pt - largura_total) / 2
+                x1 = x_inicio + sangria_pt
+                destino1 = fitz.Rect(x1, y_esq, x1 + w_esq, y_esq + h_esq)
+                destino1 = self.ajustar_para_media_box(destino1, largura_pt, altura_pt)
+                x2 = x1 + w_esq + espaco_pt
+                destino2 = fitz.Rect(x2, y_dir, x2 + w_dir, y_dir + h_dir)
+                destino2 = self.ajustar_para_media_box(destino2, largura_pt, altura_pt)
+
+                if page_esq and self.pagina_tem_conteudo(page_esq):
+                    try:
+                        nova.show_pdf_page(destino1, doc, idx_esq, clip=trim_esq, rotate=180 if rot_esq else 0)
+                    except Exception:
+                        paginas_vazias.append(str(idx_esq+1))
+                elif page_esq is not None:
                     paginas_vazias.append(str(idx_esq+1))
-            elif page_esq is None:
-                pass
-            else:
-                paginas_vazias.append(str(idx_esq+1))
-            if page_dir and pagina_tem_conteudo(page_dir):
-                try:
-                    nova.show_pdf_page(destino2, doc, idx_dir, clip=trim_dir, rotate=180 if rot_dir else 0)
-                except Exception:
+
+                if page_dir and self.pagina_tem_conteudo(page_dir):
+                    try:
+                        nova.show_pdf_page(destino2, doc, idx_dir, clip=trim_dir, rotate=180 if rot_dir else 0)
+                    except Exception:
+                        paginas_vazias.append(str(idx_dir+1))
+                elif page_dir is not None:
                     paginas_vazias.append(str(idx_dir+1))
-            elif page_dir is None:
-                pass
-            else:
-                paginas_vazias.append(str(idx_dir+1))
 
-            if sangria_pt > 0:
-                if page_esq and pagina_tem_conteudo(page_esq) and sangria_aplicar_esq:
-                    aplicar_sangria_espelhada_externa(page_esq, nova, trim_esq, destino1, sangria_pt,
-                                                      bordas=['top','bottom','left'],
-                                                      rotate=180 if rot_esq else 0)
-                if page_dir and pagina_tem_conteudo(page_dir) and sangria_aplicar_dir:
-                    aplicar_sangria_espelhada_externa(page_dir, nova, trim_dir, destino2, sangria_pt,
-                                                      bordas=['top','bottom','right'],
-                                                      rotate=180 if rot_dir else 0)
-                bleed_total = fitz.Rect(
-                    destino1.x0 - sangria_pt,
-                    min(destino1.y0, destino2.y0) - sangria_pt,
-                    destino2.x1 + sangria_pt,
-                    max(destino1.y1, destino2.y1) + sangria_pt
-                )
-                bleed_total = ajustar_para_media_box(bleed_total, largura_pt, altura_pt)
-                if bleed_total.width > 0 and bleed_total.height > 0:
-                    nova.set_bleedbox(bleed_total)
-            nova.set_trimbox(destino1)
-            if espaco_pt == 0:
-                desenhar_marcas(nova, destino1, lado='esquerda')
-                desenhar_marcas(nova, destino2, lado='direita')
-                x_centro = destino1.x1
-                desenhar_marca_central_vertical(nova, x_centro, destino1.y0, destino1.y1)
+                if sangria_pt > 0:
+                    if page_esq and self.pagina_tem_conteudo(page_esq) and sangria_aplicar_esq:
+                        self.aplicar_sangria_espelhada_externa(page_esq, nova, trim_esq, destino1, sangria_pt,
+                                                               bordas=['top','bottom','left'],
+                                                               rotate=180 if rot_esq else 0)
+                    if page_dir and self.pagina_tem_conteudo(page_dir) and sangria_aplicar_dir:
+                        self.aplicar_sangria_espelhada_externa(page_dir, nova, trim_dir, destino2, sangria_pt,
+                                                               bordas=['top','bottom','right'],
+                                                               rotate=180 if rot_dir else 0)
+                    bleed_total = fitz.Rect(
+                        destino1.x0 - sangria_pt,
+                        min(destino1.y0, destino2.y0) - sangria_pt,
+                        destino2.x1 + sangria_pt,
+                        max(destino1.y1, destino2.y1) + sangria_pt
+                    )
+                    bleed_total = self.ajustar_para_media_box(bleed_total, largura_pt, altura_pt)
+                    if bleed_total.width > 0 and bleed_total.height > 0:
+                        nova.set_bleedbox(bleed_total)
+                nova.set_trimbox(destino1)
+                if espaco_pt == 0:
+                    self.desenhar_marcas(nova, destino1, lado='esquerda')
+                    self.desenhar_marcas(nova, destino2, lado='direita')
+                    x_centro = destino1.x1
+                    self.desenhar_marca_central_vertical(nova, x_centro, destino1.y0, destino1.y1)
 
-    elif tipo == 'grampo':
-        total = len(doc)
-        num_folhas = (total + 1) // 2
-        for i in range(num_folhas):
-            if i % 2 == 0:
-                idx_esq = total - i if total - i >= 1 else None
-                idx_dir = i + 1 if i + 1 <= total else None
-            else:
-                idx_esq = i + 1 if i + 1 <= total else None
-                idx_dir = total - i if total - i >= 1 else None
-            page_esq = doc[idx_esq - 1] if idx_esq is not None else None
-            page_dir = doc[idx_dir - 1] if idx_dir is not None else None
+        elif tipo == 'grampo':
+            total = len(doc)
+            num_folhas = (total + 1) // 2
+            for i in range(num_folhas):
+                if i % 2 == 0:
+                    idx_esq = total - i if total - i >= 1 else None
+                    idx_dir = i + 1 if i + 1 <= total else None
+                else:
+                    idx_esq = i + 1 if i + 1 <= total else None
+                    idx_dir = total - i if total - i >= 1 else None
+                page_esq = doc[idx_esq - 1] if idx_esq is not None else None
+                page_dir = doc[idx_dir - 1] if idx_dir is not None else None
 
-            if page_esq:
-                trim_esq = obter_area_corte_segura(page_esq, w_ref, h_ref)
-                w_esq, h_esq = trim_esq.width, trim_esq.height
-            else:
-                trim_esq = None
-                w_esq, h_esq = w_ref, h_ref
-            if page_dir:
-                trim_dir = obter_area_corte_segura(page_dir, w_ref, h_ref)
-                w_dir, h_dir = trim_dir.width, trim_dir.height
-            else:
-                trim_dir = None
-                w_dir, h_dir = w_ref, h_ref
+                trim_esq = self.obter_area_corte_segura(page_esq, w_ref, h_ref) if page_esq else None
+                w_esq = trim_esq.width if trim_esq else w_ref
+                h_esq = trim_esq.height if trim_esq else h_ref
+                trim_dir = self.obter_area_corte_segura(page_dir, w_ref, h_ref) if page_dir else None
+                w_dir = trim_dir.width if trim_dir else w_ref
+                h_dir = trim_dir.height if trim_dir else h_ref
 
-            nova = out.new_page(width=largura_pt, height=altura_pt)
-            if sangria_pt > 0:
-                y_esq, cabe_esq = calcular_y_com_sangria(altura_pt, h_esq, sangria_pt)
-                y_dir, cabe_dir = calcular_y_com_sangria(altura_pt, h_dir, sangria_pt)
-                sangria_aplicar_esq = cabe_esq and page_esq is not None
-                sangria_aplicar_dir = cabe_dir and page_dir is not None
-            else:
-                y_esq = (altura_pt - h_esq) / 2
-                y_dir = (altura_pt - h_dir) / 2
-                sangria_aplicar_esq = sangria_aplicar_dir = False
+                nova = out.new_page(width=largura_pt, height=altura_pt)
 
-            largura_total = w_esq + w_dir + espaco_pt + 2 * sangria_pt
-            x_inicio = (largura_pt - largura_total) / 2
-            x1 = x_inicio + sangria_pt
-            destino1 = fitz.Rect(x1, y_esq, x1 + w_esq, y_esq + h_esq)
-            destino1 = ajustar_para_media_box(destino1, largura_pt, altura_pt)
-            x2 = x1 + w_esq + espaco_pt
-            destino2 = fitz.Rect(x2, y_dir, x2 + w_dir, y_dir + h_dir)
-            destino2 = ajustar_para_media_box(destino2, largura_pt, altura_pt)
+                if sangria_pt > 0:
+                    y_esq, cabe_esq = self.calcular_y_com_sangria(altura_pt, h_esq, sangria_pt)
+                    y_dir, cabe_dir = self.calcular_y_com_sangria(altura_pt, h_dir, sangria_pt)
+                    sangria_aplicar_esq = cabe_esq and page_esq is not None
+                    sangria_aplicar_dir = cabe_dir and page_dir is not None
+                else:
+                    y_esq = (altura_pt - h_esq) / 2
+                    y_dir = (altura_pt - h_dir) / 2
+                    sangria_aplicar_esq = sangria_aplicar_dir = False
 
-            if page_esq and pagina_tem_conteudo(page_esq):
-                try:
-                    nova.show_pdf_page(destino1, doc, idx_esq - 1, clip=trim_esq)
-                except Exception:
+                largura_total = w_esq + w_dir + espaco_pt + 2 * sangria_pt
+                x_inicio = (largura_pt - largura_total) / 2
+                x1 = x_inicio + sangria_pt
+                destino1 = fitz.Rect(x1, y_esq, x1 + w_esq, y_esq + h_esq)
+                destino1 = self.ajustar_para_media_box(destino1, largura_pt, altura_pt)
+                x2 = x1 + w_esq + espaco_pt
+                destino2 = fitz.Rect(x2, y_dir, x2 + w_dir, y_dir + h_dir)
+                destino2 = self.ajustar_para_media_box(destino2, largura_pt, altura_pt)
+
+                if page_esq and self.pagina_tem_conteudo(page_esq):
+                    try:
+                        nova.show_pdf_page(destino1, doc, idx_esq - 1, clip=trim_esq)
+                    except Exception:
+                        paginas_vazias.append(str(idx_esq))
+                elif page_esq is not None:
                     paginas_vazias.append(str(idx_esq))
-            elif page_esq is None:
-                pass
-            else:
-                paginas_vazias.append(str(idx_esq))
-            if page_dir and pagina_tem_conteudo(page_dir):
-                try:
-                    nova.show_pdf_page(destino2, doc, idx_dir - 1, clip=trim_dir)
-                except Exception:
+
+                if page_dir and self.pagina_tem_conteudo(page_dir):
+                    try:
+                        nova.show_pdf_page(destino2, doc, idx_dir - 1, clip=trim_dir)
+                    except Exception:
+                        paginas_vazias.append(str(idx_dir))
+                elif page_dir is not None:
                     paginas_vazias.append(str(idx_dir))
-            elif page_dir is None:
+
+                if sangria_pt > 0:
+                    if page_esq and self.pagina_tem_conteudo(page_esq) and sangria_aplicar_esq:
+                        self.aplicar_sangria_espelhada_externa(page_esq, nova, trim_esq, destino1, sangria_pt,
+                                                               bordas=['top','bottom','left'])
+                    if page_dir and self.pagina_tem_conteudo(page_dir) and sangria_aplicar_dir:
+                        self.aplicar_sangria_espelhada_externa(page_dir, nova, trim_dir, destino2, sangria_pt,
+                                                               bordas=['top','bottom','right'])
+                    bleed_total = fitz.Rect(
+                        destino1.x0 - sangria_pt,
+                        min(destino1.y0, destino2.y0) - sangria_pt,
+                        destino2.x1 + sangria_pt,
+                        max(destino1.y1, destino2.y1) + sangria_pt
+                    )
+                    bleed_total = self.ajustar_para_media_box(bleed_total, largura_pt, altura_pt)
+                    if bleed_total.width > 0 and bleed_total.height > 0:
+                        nova.set_bleedbox(bleed_total)
+                nova.set_trimbox(destino1)
+                if espaco_pt == 0:
+                    self.desenhar_marcas(nova, destino1, lado='esquerda')
+                    self.desenhar_marcas(nova, destino2, lado='direita')
+                    x_centro = destino1.x1
+                    self.desenhar_marca_central_vertical(nova, x_centro, destino1.y0, destino1.y1)
+
+        elif tipo == '1up':
+            for idx, page in enumerate(doc):
+                trim_original = self.obter_area_corte_segura(page, w_ref, h_ref)
+                w = trim_original.width if trim_original else w_ref
+                h = trim_original.height if trim_original else h_ref
+
+                nova = out.new_page(width=largura_pt, height=altura_pt)
+
+                x = (largura_pt - w) / 2
+                if sangria_pt > 0:
+                    y, cabe = self.calcular_y_com_sangria(altura_pt, h, sangria_pt)
+                    sangria_aplicar = cabe
+                else:
+                    y = (altura_pt - h) / 2
+                    sangria_aplicar = False
+
+                destino = fitz.Rect(x, y, x + w, y + h)
+                destino = self.ajustar_para_media_box(destino, largura_pt, altura_pt)
+
+                if not self.pagina_tem_conteudo(page):
+                    paginas_vazias.append(str(page.number + 1))
+                else:
+                    try:
+                        nova.show_pdf_page(destino, doc, page.number, clip=trim_original)
+                    except Exception:
+                        paginas_vazias.append(str(page.number + 1))
+
+                nova.set_trimbox(destino)
+
+                if sangria_pt > 0 and sangria_aplicar and self.pagina_tem_conteudo(page):
+                    bleed = fitz.Rect(
+                        destino.x0 - sangria_pt,
+                        destino.y0 - sangria_pt,
+                        destino.x1 + sangria_pt,
+                        destino.y1 + sangria_pt
+                    )
+                    bleed = self.ajustar_para_media_box(bleed, largura_pt, altura_pt)
+                    if bleed.width > 0 and bleed.height > 0:
+                        nova.set_bleedbox(bleed)
+                    self.aplicar_sangria_espelhada_externa(
+                        page, nova, trim_original, destino, sangria_pt,
+                        bordas=['top', 'bottom', 'left', 'right']
+                    )
+
+                if espaco_pt == 0:
+                    self.desenhar_marcas(nova, destino, lado='centro')  # adapte se necessário
+        
+
+
+        out.save(saida, garbage=4, deflate=True, clean=True)
+        doc.close()
+        out.close()
+        if paginas_vazias:
+            print(f"Páginas vazias (não incluídas): {', '.join(paginas_vazias)}")
+
+    def adicionar_marca_dagua(self, caminho_pdf, texto, distancia_mm=3, caminho_saida=None):
+        if not caminho_pdf.lower().endswith('.pdf'):
+            return
+        try:
+            doc = fitz.open(caminho_pdf)
+        except Exception as e:
+            print(f"Erro ao abrir PDF {caminho_pdf}: {e}")
+            return
+
+        margem_pt = distancia_mm * 2.83464567
+        fonte_tamanho = 11
+        cor = (1, 0, 0)
+        for pagina in doc:
+            w = pagina.rect.width
+            x0 = 50
+            x1 = w - 50
+            y0 = margem_pt
+            y1 = y0 + 40
+            rect = fitz.Rect(x0, y0, x1, y1)
+            pagina.insert_textbox(rect, texto, fontsize=fonte_tamanho, color=cor, fontname="helv", align=1)
+
+        destino = caminho_saida if caminho_saida else caminho_pdf
+        dir_destino = os.path.dirname(destino)
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=dir_destino, delete=False, suffix='.pdf') as tmp:
+                tmp_path = tmp.name
+            doc.save(tmp_path)
+            doc.close()
+            os.replace(tmp_path, destino)
+        except Exception as e:
+            print(f"Erro ao salvar PDF {destino}: {e}")
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            doc.close()
+
+    def comprimir_pdf(self, entrada, saida):
+        if not os.path.exists(self.GS_PATH):
+            raise FileNotFoundError(f"Ghostscript não encontrado em: {self.GS_PATH}")
+        comando = [
+            self.GS_PATH,
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.4",
+            "-dPDFSETTINGS=/ebook",
+            "-dDownsampleColorImages=true",
+            "-dDownsampleGrayImages=true",
+            "-dDownsampleMonoImages=true",
+            "-dColorImageResolution=150",
+            "-dGrayImageResolution=150",
+            "-dMonoImageResolution=150",
+            "-dNOPAUSE",
+            "-dQUIET",
+            "-dBATCH",
+            f"-sOutputFile={saida}",
+            entrada
+        ]
+        try:
+            subprocess.run(comando, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Erro ao comprimir: {e}")
+            shutil.copy(entrada, saida)
+
+    def converter_em_contornos(self, entrada, saida):
+        if not os.path.exists(self.GS_PATH):
+            raise FileNotFoundError(f"Ghostscript não encontrado em: {self.GS_PATH}")
+        comando = [
+            self.GS_PATH,
+            "-dNOPAUSE",
+            "-dBATCH",
+            "-dQUIET",
+            "-sDEVICE=pdfwrite",
+            "-dNoOutputFonts",
+            f"-sOutputFile={saida}",
+            entrada
+        ]
+        try:
+            subprocess.run(comando, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Erro ao converter em contornos: {e}")
+            if entrada != saida:
+                shutil.copy(entrada, saida)
+
+    def listar_pastas(self, diretorio, reverse=False):
+        try:
+            pastas = [p for p in os.listdir(diretorio) if os.path.isdir(os.path.join(diretorio, p))]
+            pastas.sort(reverse=reverse)
+            return pastas
+        except Exception as e:
+            messagebox.showerror("Erro", str(e), parent=self)
+            return []
+
+    @staticmethod
+    def obter_indice_coluna(ws, nome_coluna):
+        cabecalho = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+        if not cabecalho:
+            return -1
+        for i, valor in enumerate(cabecalho):
+            if valor and str(valor).strip().lower() == nome_coluna.lower():
+                return i
+        return -1
+
+    def obter_lista_arquivos_da_planilha(self, caminho_excel, cliente):
+        wb = openpyxl.load_workbook(caminho_excel, data_only=True)
+        ws = wb.active
+        idx_capa = self.obter_indice_coluna(ws, "ARQUIVO CAPA")
+        idx_miolo = self.obter_indice_coluna(ws, "ARQUIVO MIOLO")
+        idx_caminho = self.obter_indice_coluna(ws, "CAMINHO DO ARQUIVO")
+
+        if cliente == "uiclap":
+            idx_acabamento = self.obter_indice_coluna(ws, "Acabamento")
+            idx_formato_miolo = self.obter_indice_coluna(ws, "FORMATO MIOLO")
+        else:
+            idx_acabamento = self.obter_indice_coluna(ws, "Encadernação")
+            idx_formato_miolo = self.obter_indice_coluna(ws, "FORMATO MIOLO")
+
+        lista = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if idx_capa != -1 and row[idx_capa]:
+                nome = str(row[idx_capa]).strip()
+                caminho_fisico = None
+                if idx_caminho != -1 and row[idx_caminho]:
+                    caminho_fisico = os.path.join(str(row[idx_caminho]).strip(), nome)
+                acabamento = str(row[idx_acabamento]).strip() if idx_acabamento != -1 and row[idx_acabamento] else None
+                formato_miolo = str(row[idx_formato_miolo]).strip() if idx_formato_miolo != -1 and row[idx_formato_miolo] else None
+                lista.append({"nome": nome, "tipo": "CAPA", "linha": row, "caminho_fisico": caminho_fisico,
+                              "acabamento": acabamento, "formato_miolo": formato_miolo})
+            if idx_miolo != -1 and row[idx_miolo]:
+                nome = str(row[idx_miolo]).strip()
+                caminho_fisico = None
+                if idx_caminho != -1 and row[idx_caminho]:
+                    caminho_fisico = os.path.join(str(row[idx_caminho]).strip(), nome)
+                acabamento = str(row[idx_acabamento]).strip() if idx_acabamento != -1 and row[idx_acabamento] else None
+                formato_miolo = str(row[idx_formato_miolo]).strip() if idx_formato_miolo != -1 and row[idx_formato_miolo] else None
+                lista.append({"nome": nome, "tipo": "MIOLO", "linha": row, "caminho_fisico": caminho_fisico,
+                              "acabamento": acabamento, "formato_miolo": formato_miolo})
+        wb.close()
+        return lista
+
+    def copiar_para_refazer(self, origem, cliente, lote, tipo):
+        if not os.path.exists(origem):
+            return None
+        if cliente == "uiclap":
+            destino_dir = os.path.join(self.CAMINHO_UICLAP_LOTES, lote, "REFAZER", tipo)
+        else:
+            destino_dir = os.path.join(self.CAMINHO_CAPAS_POD_AGRUPADAS, cliente, lote, "REFAZER", tipo)
+        os.makedirs(destino_dir, exist_ok=True)
+        destino = os.path.join(destino_dir, os.path.basename(origem))
+        try:
+            shutil.copy2(origem, destino)
+            return destino
+        except Exception as e:
+            print(f"Erro ao copiar {origem}: {e}")
+            return None
+
+    # ---------- TOOLTIP (classe interna) ----------
+    class ToolTip:
+        def __init__(self, widget):
+            self.widget = widget
+            self.tipwindow = None
+            self.id = None
+            self.x = self.y = 0
+            self.text = ''
+            widget.bind('<Enter>', self.enter)
+            widget.bind('<Leave>', self.leave)
+            widget.bind('<Motion>', self.motion)
+
+        def enter(self, event=None):
+            self.schedule()
+
+        def leave(self, event=None):
+            self.unschedule()
+            self.hidetip()
+
+        def motion(self, event=None):
+            self.x, self.y = event.x, event.y
+
+        def schedule(self):
+            self.unschedule()
+            self.id = self.widget.after(500, self.showtip)
+
+        def unschedule(self):
+            id_ = self.id
+            self.id = None
+            if id_:
+                self.widget.after_cancel(id_)
+
+        def showtip(self, event=None):
+            item = self.widget.identify_row(self.y)
+            col = self.widget.identify_column(self.x)
+            if not item or col != '#1':
+                return
+            nome = self.widget.item(item, 'values')[0]
+            self.text = nome
+            x, y, _, _ = self.widget.bbox(item, col)
+            x += self.widget.winfo_rootx() + 25
+            y += self.widget.winfo_rooty() + 25
+            self.tipwindow = tw = tk.Toplevel(self.widget)
+            tw.wm_overrideredirect(True)
+            tw.wm_geometry(f"+{x}+{y}")
+            label = tk.Label(tw, text=self.text, justify='left', background="#ffffe0", relief='solid', borderwidth=1,
+                             font=("Arial", 9))
+            label.pack()
+
+        def hidetip(self):
+            tw = self.tipwindow
+            self.tipwindow = None
+            if tw:
+                tw.destroy()
+
+    # ---------- CONSTRUÇÃO DA INTERFACE ----------
+    def _criar_interface(self):
+        # Configurar grid do frame principal
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        main_frame = ttk.Frame(self)
+        main_frame.grid(row=0, column=0, sticky="nsew")
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(1, weight=1)  # PanedWindow vai expandir
+
+        # ================= TOPO - FILTROS =================
+        top = ttk.LabelFrame(main_frame, text="Filtros", bootstyle=PRIMARY)
+        top.grid(row=0, column=0, sticky="ew", padx=8, pady=5)
+        top.grid_columnconfigure(1, weight=1)
+        top.grid_columnconfigure(3, weight=2)
+
+        ttk.Label(top, text="Cliente").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.cb_cliente = ttk.Combobox(top, textvariable=self.pasta_var)
+        self.cb_cliente.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        self.cb_cliente.bind("<<ComboboxSelected>>", self.on_cliente_change)
+
+        ttk.Label(top, text="Lote").grid(row=0, column=2, padx=5, pady=5, sticky="w")
+        self.cb_lote = ttk.Combobox(top, textvariable=self.subpasta_var)
+        self.cb_lote.grid(row=0, column=3, padx=5, pady=5, sticky="ew")
+        self.cb_lote.bind("<<ComboboxSelected>>", self.on_lote_change)
+
+        ttk.Label(top, text="Operador").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        self.cb_operador = ttk.Combobox(top, values=self.OPERADORES, textvariable=self.operador_var)
+        self.cb_operador.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
+        self.cb_operador.current(0)
+
+        ttk.Label(top, text="Filtro").grid(row=1, column=2, padx=5, pady=5, sticky="w")
+        filtro_entry = ttk.Entry(top, textvariable=self.filtro_var)
+        filtro_entry.grid(row=1, column=3, padx=5, pady=5, sticky="ew")
+        filtro_entry.bind("<Return>", lambda e: self.buscar_arquivos())
+
+        # Botões principais (sem progressbar aqui)
+        botoes_top = ttk.Frame(top)
+        botoes_top.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 5))
+        botoes_top.grid_columnconfigure(0, weight=1)
+        botoes_top.grid_columnconfigure(1, weight=1)
+        botoes_top.grid_columnconfigure(2, weight=1)
+
+        self.btn_buscar = ttk.Button(botoes_top, text="Buscar", command=self.buscar_arquivos,
+                                    bootstyle=PRIMARY)
+        self.btn_buscar.grid(row=0, column=0, padx=5, sticky="ew")
+
+        self.btn_preparar = ttk.Button(botoes_top, text="Preparar Processamento",
+                                    command=self.preparar_processamento, bootstyle=INFO)
+        self.btn_preparar.grid(row=0, column=1, padx=5, sticky="ew")
+
+        self.btn_limpar = ttk.Button(botoes_top, text="Limpar", command=self.limpar,
+                                    bootstyle=DANGER)
+        self.btn_limpar.grid(row=0, column=2, padx=5, sticky="ew")
+
+        paned = tk.PanedWindow(main_frame, orient="vertical", sashrelief="raised", sashwidth=8, bg="#000000")
+        paned.grid(row=1, column=0, sticky="nsew", pady=5,padx=10)
+
+        # --- Lista de arquivos ---
+        frame_lista = ttk.LabelFrame(paned, text="Arquivos", bootstyle=PRIMARY)
+        paned.add(frame_lista, stretch="always")
+
+        tree_container = ttk.Frame(frame_lista)
+        tree_container.pack(fill="both", expand=True, padx=5, pady=5)
+        tree_container.rowconfigure(0, weight=1)
+        tree_container.columnconfigure(0, weight=1)
+
+        self.tree_selecao = ttk.Treeview(tree_container, columns=("Nome",), show="headings", selectmode="extended")
+        self.tree_selecao.heading("Nome", text="Nome")
+        self.tree_selecao.column("Nome", width=120)
+        vsb1 = ttk.Scrollbar(tree_container, orient="vertical", command=self.tree_selecao.yview)
+        hsb1 = ttk.Scrollbar(tree_container, orient="horizontal", command=self.tree_selecao.xview)
+        self.tree_selecao.configure(yscrollcommand=vsb1.set, xscrollcommand=hsb1.set)
+        self.tree_selecao.grid(row=0, column=0, sticky="nsew")
+        vsb1.grid(row=0, column=1, sticky="ns")
+        hsb1.grid(row=1, column=0, sticky="ew")
+        self.ToolTip(self.tree_selecao)
+
+        # --- Edição inteligente ---
+        self.frame_edicao = ttk.LabelFrame(paned, text="Edição Inteligente", bootstyle=PRIMARY)
+        paned.add(self.frame_edicao, stretch="always")
+
+        self.update_idletasks()
+        paned.sash_place(0, 0, 330)
+
+        self.frame_edicao.grid_rowconfigure(1, weight=1)
+        self.frame_edicao.grid_columnconfigure(0, weight=1)
+
+        toolbar = ttk.Frame(self.frame_edicao)
+        toolbar.grid(row=0, column=0, sticky="ew", padx=5, pady=(5, 0))
+        ttk.Label(toolbar, text="💡 Clique ÚNICO nas colunas Quantidade / Setor / Máquina para editar",
+                foreground="#1e5eff", font=("Arial", 10, "bold"), anchor="w").pack(fill="x", padx=5, pady=5)
+
+        edit_container = ttk.Frame(self.frame_edicao)
+        edit_container.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+        edit_container.rowconfigure(0, weight=1)
+        edit_container.columnconfigure(0, weight=1)
+
+        self.tree_edicao = ttk.Treeview(edit_container,
+                                        columns=("Nome", "Código", "Quantidade", "Setor", "Máquina"),
+                                        show="headings")
+        self.tree_edicao.heading("Nome", text="Arquivo")
+        self.tree_edicao.heading("Código", text="Código")
+        self.tree_edicao.heading("Quantidade", text="Quantidade")
+        self.tree_edicao.heading("Setor", text="Setor")
+        self.tree_edicao.heading("Máquina", text="Máquina")
+        self.tree_edicao.column("Nome", width=80, minwidth=250)
+        self.tree_edicao.column("Código", width=20, anchor="center")
+        self.tree_edicao.column("Quantidade", width=20, anchor="center")
+        self.tree_edicao.column("Setor", width=80, anchor="center")
+        self.tree_edicao.column("Máquina", width=60, anchor="center")
+
+        vsb2 = ttk.Scrollbar(edit_container, orient="vertical", command=self.tree_edicao.yview)
+        hsb2 = ttk.Scrollbar(edit_container, orient="horizontal", command=self.tree_edicao.xview)
+        self.tree_edicao.configure(yscrollcommand=vsb2.set, xscrollcommand=hsb2.set)
+        self.tree_edicao.grid(row=0, column=0, sticky="nsew")
+        vsb2.grid(row=0, column=1, sticky="ns")
+        hsb2.grid(row=1, column=0, sticky="ew")
+
+        # --- Painel inferior de edição (sem botão de processar) ---
+        painel_inferior = ttk.Frame(self.frame_edicao)
+        painel_inferior.grid(row=2, column=0, sticky="ew", padx=5, pady=(0, 5))
+
+        controles = ttk.Frame(painel_inferior)
+        controles.pack(side="left", fill="x", expand=True)
+
+        ttk.Label(controles, text="Setor:").pack(side="left", padx=(0, 5))
+        self.cb_setor = ttk.Combobox(controles, values=self.SETORES_PERDA, width=18)
+        self.cb_setor.pack(side="left", padx=5)
+        self.cb_setor.current(0)
+
+        ttk.Label(controles, text="Máquina:").pack(side="left", padx=(10, 5))
+        self.cb_maquina = ttk.Combobox(controles, values=self.MAQUINAS_REF, width=15)
+        self.cb_maquina.pack(side="left", padx=5)
+        self.cb_maquina.current(0)
+
+        self.btn_aplicar_sel = ttk.Button(controles, text="Aplicar nos Selecionados",
+                                        bootstyle=SECONDARY, command=self.aplicar_nos_selecionados)
+        self.btn_aplicar_sel.pack(side="left", padx=10)
+
+        self.btn_aplicar_todos = ttk.Button(controles, text="Aplicar em TODOS",
+                                            bootstyle=PRIMARY, command=self.aplicar_em_todos)
+        self.btn_aplicar_todos.pack(side="left", padx=5)
+
+        # NOTA: O botão "PROCESSAR" que estava aqui foi removido e será criado no status_frame abaixo.
+
+        self.tree_edicao.bind("<Button-1>", self.edicao_inline)
+
+        # ================= ANDAMENTO (PROGRESSBAR) =================
+        progress_frame = ttk.LabelFrame(main_frame, text="⏳ Andamento", bootstyle=SUCCESS)
+        progress_frame.grid(row=2, column=0, sticky="ew", pady=5, padx=10)
+        progress_frame.columnconfigure(0, weight=1)
+
+        self.progress = ttk.Progressbar(
+            progress_frame,
+            mode='determinate',
+            bootstyle="primary-striped"
+        )
+        self.progress.grid(row=0, column=0, sticky="ew", padx=5, pady=(5, 5))
+
+        self.progress_label = ttk.Label(progress_frame, text="0/0")
+        self.progress_label.grid(row=0, column=1, padx=(0, 10), pady=5)
+
+        # ================= STATUS E BOTÃO PROCESSAR =================
+        # Cria a variável de status se não existir
+        if not hasattr(self, 'status_var'):
+            self.status_var = tk.StringVar(value="✅ Pronto para processar")
+
+        status_frame = ttk.Frame(main_frame)
+        status_frame.grid(row=3, column=0, sticky="ew", pady=5, padx=10)
+        status_frame.columnconfigure(0, weight=1)
+
+        self.status_label = ttk.Label(
+            status_frame,
+            textvariable=self.status_var,
+            font=("Segoe UI", 10, "bold"),
+            bootstyle="success"
+        )
+        self.status_label.grid(row=0, column=0, sticky="w")
+
+        self.btn_processar = ttk.Button(
+            status_frame,
+            text="▶ PROCESSAR",
+            command=self.executar,   # comando original do botão removido
+            bootstyle=SUCCESS,        # pode trocar para SUCCESS se preferir
+            width=22
+        )
+        self.btn_processar.grid(row=0, column=1, sticky="e")
+
+    # ---------- HANDLERS E LÓGICA ----------
+    def _limpar_tudo_exceto_cliente_lote(self):
+        for i in self.tree_selecao.get_children():
+            self.tree_selecao.delete(i)
+        for i in self.tree_edicao.get_children():
+            self.tree_edicao.delete(i)
+        self.lista_completa = []
+
+    def on_cliente_change(self, event=None):
+        self._limpar_tudo_exceto_cliente_lote()
+        self.atualizar_subpastas()
+
+    def on_lote_change(self, event=None):
+        lote = self.subpasta_var.get()
+        if not lote:
+            return
+        self._limpar_tudo_exceto_cliente_lote()
+        self.buscar_arquivos()
+
+    def atualizar_subpastas(self, event=None):
+        cliente = self.pasta_var.get()
+        if cliente == "uiclap":
+            base = self.CAMINHO_UICLAP_LOTES
+        else:
+            base = os.path.join(self.CAMINHO_CAPAS_POD_AGRUPADAS, cliente)
+        lotes = self.listar_pastas(base, reverse=True)
+        self.cb_lote["values"] = lotes
+        if lotes:
+            self.cb_lote.current(0)
+        else:
+            self.cb_lote.set("")
+
+    def carregar_clientes(self):
+        clientes = self.listar_pastas(self.CAMINHO_CAPAS_POD_AGRUPADAS)
+        clientes.append("uiclap")
+        self.cb_cliente["values"] = clientes
+        if clientes:
+            self.cb_cliente.current(0)
+            self.atualizar_subpastas()
+
+    def buscar_arquivos(self):
+        cliente = self.pasta_var.get()
+        lote = self.subpasta_var.get()
+        if not cliente or not lote:
+            return
+        if cliente == "uiclap":
+            pasta = os.path.join(self.CAMINHO_UICLAP_LOTES, lote)
+        else:
+            pasta = os.path.join(self.CAMINHO_CAPAS_POD_AGRUPADAS, cliente, lote)
+        arquivos_excel = [f for f in os.listdir(pasta) if f.lower().endswith(".xlsx")]
+        planilha = None
+        for arq in arquivos_excel:
+            caminho = os.path.join(pasta, arq)
+            try:
+                wb = openpyxl.load_workbook(caminho, data_only=True)
+                ws = wb.active
+                if self.obter_indice_coluna(ws, "ARQUIVO CAPA") != -1 or self.obter_indice_coluna(ws, "ARQUIVO MIOLO") != -1:
+                    planilha = caminho
+                    wb.close()
+                    break
+                wb.close()
+            except:
                 pass
-            else:
-                paginas_vazias.append(str(idx_dir))
+        if not planilha:
+            messagebox.showerror("Erro", "Planilha não encontrada.", parent=self)
+            return
 
-            if sangria_pt > 0:
-                if page_esq and pagina_tem_conteudo(page_esq) and sangria_aplicar_esq:
-                    aplicar_sangria_espelhada_externa(page_esq, nova, trim_esq, destino1, sangria_pt,
-                                                      bordas=['top','bottom','left'])
-                if page_dir and pagina_tem_conteudo(page_dir) and sangria_aplicar_dir:
-                    aplicar_sangria_espelhada_externa(page_dir, nova, trim_dir, destino2, sangria_pt,
-                                                      bordas=['top','bottom','right'])
-                bleed_total = fitz.Rect(
-                    destino1.x0 - sangria_pt,
-                    min(destino1.y0, destino2.y0) - sangria_pt,
-                    destino2.x1 + sangria_pt,
-                    max(destino1.y1, destino2.y1) + sangria_pt
-                )
-                bleed_total = ajustar_para_media_box(bleed_total, largura_pt, altura_pt)
-                if bleed_total.width > 0 and bleed_total.height > 0:
-                    nova.set_bleedbox(bleed_total)
-            nova.set_trimbox(destino1)
-            if espaco_pt == 0:
-                desenhar_marcas(nova, destino1, lado='esquerda')
-                desenhar_marcas(nova, destino2, lado='direita')
-                x_centro = destino1.x1
-                desenhar_marca_central_vertical(nova, x_centro, destino1.y0, destino1.y1)
+        wb = openpyxl.load_workbook(planilha, data_only=True)
+        ws = wb.active
+        self.idx_capa = self.obter_indice_coluna(ws, "ARQUIVO CAPA")
+        self.idx_miolo = self.obter_indice_coluna(ws, "ARQUIVO MIOLO")
+        self.idx_caminho = self.obter_indice_coluna(ws, "CAMINHO DO ARQUIVO")
+        wb.close()
 
-    out.save(saida, garbage=4, deflate=True, clean=True)
-    doc.close()
-    out.close()
-    if paginas_vazias:
-        print(f"Páginas vazias (não incluídas): {', '.join(paginas_vazias)}")
+        self.lista_completa = self.obter_lista_arquivos_da_planilha(planilha, cliente)
+        filtro = self.filtro_var.get().strip().lower()
+        if filtro:
+            filtros = [x.strip() for x in filtro.split(",")]
+            self.lista_completa = [item for item in self.lista_completa if any(f in item["nome"].lower() for f in filtros)]
 
+        for i in self.tree_selecao.get_children():
+            self.tree_selecao.delete(i)
+        for item in self.lista_completa:
+            self.tree_selecao.insert("", "end", values=(item["nome"],))
+        self.tree_selecao.column("Nome", width=min(600, self.tree_selecao.winfo_width()))
+
+    def preparar_processamento(self):
+        selecionados = self.tree_selecao.selection()
+        if not selecionados:
+            messagebox.showinfo("Aviso", "Selecione arquivos.", parent=self)
+            return
+        for item in self.tree_edicao.get_children():
+            self.tree_edicao.delete(item)
+        cliente = self.pasta_var.get()
+        coluna_codigo = 8 if cliente == "uiclap" else 3
+        for iid in selecionados:
+            nome = self.tree_selecao.item(iid, "values")[0]
+            item = next((x for x in self.lista_completa if x["nome"] == nome), None)
+            if not item:
+                continue
+            linha = item["linha"]
+            codigo = "N/A"
+            if coluna_codigo < len(linha):
+                codigo = linha[coluna_codigo]
+            self.tree_edicao.insert("", "end", values=(nome, codigo, "1", self.SETORES_PERDA[0], self.MAQUINAS_REF[0]))
+
+    def limpar(self):
+        self._limpar_tudo_exceto_cliente_lote()
+        self.filtro_var.set("")
+        self.operador_var.set(self.OPERADORES[0])
+
+    def aplicar_nos_selecionados(self):
+        itens = self.tree_edicao.selection()
+        if not itens:
+            messagebox.showinfo("Aviso", "Selecione linhas na tabela de edição.", parent=self)
+            return
+        setor = self.cb_setor.get()
+        maquina = self.cb_maquina.get()
+        for item in itens:
+            valores = list(self.tree_edicao.item(item, "values"))
+            valores[3] = setor
+            valores[4] = maquina
+            self.tree_edicao.item(item, values=valores)
+
+    def aplicar_em_todos(self):
+        setor = self.cb_setor.get()
+        maquina = self.cb_maquina.get()
+        for item in self.tree_edicao.get_children():
+            valores = list(self.tree_edicao.item(item, "values"))
+            valores[3] = setor
+            valores[4] = maquina
+            self.tree_edicao.item(item, values=valores)
+
+    def edicao_inline(self, event):
+        region = self.tree_edicao.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+        item = self.tree_edicao.identify_row(event.y)
+        coluna = self.tree_edicao.identify_column(event.x)
+        if not item:
+            return
+        col = int(coluna.replace("#", ""))
+        if col not in [3, 4, 5]:
+            return
+        valores = list(self.tree_edicao.item(item, "values"))
+        bbox = self.tree_edicao.bbox(item, coluna)
+        if not bbox:
+            return
+        x, y, w, h = bbox
+        for child in self.tree_edicao.winfo_children():
+            if isinstance(child, (tk.Entry, ttk.Combobox)):
+                child.destroy()
+        if col == 3:
+            entry = tk.Entry(self.tree_edicao, justify="center", font=("Arial", 10, "bold"))
+            entry.place(x=x, y=y, width=w, height=h)
+            entry.insert(0, valores[2])
+            entry.focus()
+            def salvar(event=None):
+                novo = entry.get().strip()
+                if not novo:
+                    novo = "1"
+                valores[2] = novo
+                self.tree_edicao.item(item, values=valores)
+                entry.destroy()
+            entry.bind("<Return>", salvar)
+            entry.bind("<FocusOut>", salvar)
+        elif col == 4:
+            cb = ttk.Combobox(self.tree_edicao, values=self.SETORES_PERDA, state="readonly")
+            cb.place(x=x, y=y, width=w, height=h)
+            cb.set(valores[3])
+            cb.focus()
+            def salvar(event=None):
+                valores[3] = cb.get()
+                self.tree_edicao.item(item, values=valores)
+                cb.destroy()
+            cb.bind("<<ComboboxSelected>>", salvar)
+            cb.bind("<FocusOut>", salvar)
+        elif col == 5:
+            cb = ttk.Combobox(self.tree_edicao, values=self.MAQUINAS_REF, state="readonly")
+            cb.place(x=x, y=y, width=w, height=h)
+            cb.set(valores[4])
+            cb.focus()
+            def salvar(event=None):
+                valores[4] = cb.get()
+                self.tree_edicao.item(item, values=valores)
+                cb.destroy()
+            cb.bind("<<ComboboxSelected>>", salvar)
+            cb.bind("<FocusOut>", salvar)
+
+    def executar(self):
+        cliente = self.pasta_var.get()
+        lote = self.subpasta_var.get()
+        operador = self.operador_var.get()
+        if not cliente or not lote:
+            return
+        data_hora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        if cliente == "uiclap":
+            pasta_lote = os.path.join(self.CAMINHO_UICLAP_LOTES, lote)
+        else:
+            pasta_lote = os.path.join(self.CAMINHO_CAPAS_POD_AGRUPADAS, cliente, lote)
+
+        try:
+            wb = openpyxl.load_workbook(self.CAMINHO_RELATORIOS_PERDA)
+            aba = "UICLAP" if cliente == "uiclap" else "PODS"
+            ws = wb[aba]
+        except Exception as e:
+            messagebox.showerror("Erro", str(e), parent=self)
+            return
+
+        copias_capas = []
+        miolos_info = []
+        processados = 0
+
+        total_itens = len(self.tree_edicao.get_children())
+        self.progress["maximum"] = total_itens
+        self.progress["value"] = 0
+        self.progress_label.config(text=f"Copiando: 0/{total_itens}")
+        self.update_idletasks()
+
+        for idx, iid in enumerate(self.tree_edicao.get_children(), start=1):
+            valores = self.tree_edicao.item(iid, "values")
+            nome = valores[0]
+            qtd = valores[2]
+            setor = valores[3]
+            maquina = valores[4]
+
+            item_original = next((x for x in self.lista_completa if x["nome"] == nome), None)
+            if not item_original:
+                continue
+
+            tipo_atual = item_original["tipo"]
+            linha = item_original["linha"]
+            caminho_fisico = item_original["caminho_fisico"]
+            if not caminho_fisico or not os.path.exists(caminho_fisico):
+                caminho_fisico = os.path.join(pasta_lote, nome)
+
+            destino = self.copiar_para_refazer(caminho_fisico, cliente, lote, tipo_atual)
+
+            if tipo_atual == "CAPA" and destino and destino.lower().endswith('.pdf'):
+                copias_capas.append((destino, os.path.splitext(nome)[0], setor))
+            elif tipo_atual == "MIOLO" and destino and destino.lower().endswith('.pdf'):
+                miolos_info.append((
+                    destino,
+                    os.path.splitext(nome)[0],
+                    item_original.get("acabamento"),
+                    item_original.get("formato_miolo"),
+                    setor
+                ))
+
+            # Copia o outro tipo (miolo/capa) se existir
+            tipo_outro = "MIOLO" if tipo_atual == "CAPA" else "CAPA"
+            idx_nome_outro = self.idx_miolo if tipo_atual == "CAPA" else self.idx_capa
+            if idx_nome_outro != -1 and idx_nome_outro < len(linha):
+                nome_outro = str(linha[idx_nome_outro]).strip() if linha[idx_nome_outro] else None
+                if nome_outro:
+                    caminho_outro = None
+                    if self.idx_caminho != -1 and self.idx_caminho < len(linha) and linha[self.idx_caminho]:
+                        caminho_outro = os.path.join(str(linha[self.idx_caminho]).strip(), nome_outro)
+                    else:
+                        caminho_outro = os.path.join(pasta_lote, nome_outro)
+                    self.copiar_para_refazer(caminho_outro, cliente, lote, tipo_outro)
+
+            nova_linha = linha + (qtd, setor, maquina, operador, data_hora, tipo_atual)
+            ws.append(nova_linha)
+            processados += 1
+
+            self.progress["value"] = idx
+            self.progress_label.config(text=f"Copiando: {idx}/{total_itens}")
+            self.update_idletasks()
+
+        wb.save(self.CAMINHO_RELATORIOS_PERDA)
+        wb.close()
+
+        # Etapa 2: marca d'água nas capas
+        total_capas = len(copias_capas)
+        if total_capas > 0:
+            self.progress["maximum"] = total_capas
+            self.progress["value"] = 0
+            self.progress_label.config(text=f"Capas: 0/{total_capas}")
+            self.update_idletasks()
+            for idx, (destino, nome_base, setor_capa) in enumerate(copias_capas, start=1):
+                try:
+                    self.adicionar_marca_dagua(destino, nome_base)
+                    if setor_capa == "PROBLEMA DE FONTE":
+                        temp_outlines = destino.replace('.pdf', '_TEMP_OUTLINES.pdf')
+                        self.converter_em_contornos(destino, temp_outlines)
+                        os.replace(temp_outlines, destino)
+                except Exception as e:
+                    print(f"Erro na marca d'água/contornos de {nome_base}: {e}")
+                self.progress["value"] = idx
+                self.progress_label.config(text=f"Capas: {idx}/{total_capas}")
+                self.update_idletasks()
+
+        # Etapa 3: processar miolos
+        total_miolos = len(miolos_info)
+        if total_miolos > 0:
+            self.progress["maximum"] = total_miolos
+            self.progress["value"] = 0
+            self.progress_label.config(text=f"Miolos: 0/{total_miolos}")
+            self.update_idletasks()
+
+            for idx, (copia_dest, nome_base, acab, fmt_miolo, setor_item) in enumerate(miolos_info, start=1):
+                self.progress_label.config(text=f"Miolo {idx}/{total_miolos}: {nome_base}")
+                self.update_idletasks()
+                try:
+                    tipo_montagem = None
+                    acab_upper = acab.upper() if acab else ""
+                    if "BROCHURA" in acab_upper:
+                        tipo_montagem = "brochura"
+
+                    elif "GRAMPO" in acab_upper:
+                        tipo_montagem = "grampo"
+
+                    elif "GRAMPEADO" in acab_upper:
+                        tipo_montagem = "grampo"
+                    
+                    elif "WIREO" in acab_upper:
+                        tipo_montagem = "brochura"
+
+                    elif "CADERNO" in acab_upper:
+                        tipo_montagem = "brochura"    
+
+                    if tipo_montagem:
+                        if setor_item == "PRE-IMPRESSÃO":
+                            nome_final = copia_dest.replace('.pdf', '_MONTADO_REDUZIDO.pdf')
+                            reduzido_temp = copia_dest.replace('.pdf', '_TEMP_RED.pdf')
+                            self.comprimir_pdf(copia_dest, reduzido_temp)
+                            self.montar_pdf(reduzido_temp, nome_final, tipo_montagem)
+                            if os.path.exists(reduzido_temp): os.remove(reduzido_temp)
+                        elif setor_item == "PROBLEMA DE FONTE":
+                            nome_final = copia_dest.replace('.pdf', '_MONTADO_CURVAS.pdf')
+                            montado_temp = copia_dest.replace('.pdf', '_TEMP_MONT.pdf')
+                            self.montar_pdf(copia_dest, montado_temp, tipo_montagem)
+                            self.converter_em_contornos(montado_temp, nome_final)
+                            if os.path.exists(montado_temp): os.remove(montado_temp)
+                        else:
+                            nome_final = copia_dest.replace('.pdf', '_MONTADO.pdf')
+                            self.montar_pdf(copia_dest, nome_final, tipo_montagem)
+
+                        if os.path.exists(copia_dest):
+                            os.remove(copia_dest)
+                    else:
+                        if setor_item == "PROBLEMA DE FONTE":
+                            nome_final = copia_dest.replace('.pdf', '_CURVAS.pdf')
+                            self.converter_em_contornos(copia_dest, nome_final)
+                            if os.path.exists(copia_dest): os.remove(copia_dest)
+                        print(f"Miolo {nome_base}: sem tipo de montagem definido (acabamento: {acab}), mantido como cópia simples.")
+                except Exception as e:
+                    print(f"Erro ao processar miolo {nome_base}: {e}")
+
+                self.progress["value"] = idx
+                self.update_idletasks()
+
+        # Limpeza final da interface
+        for item in self.tree_edicao.get_children():
+            self.tree_edicao.delete(item)
+        for item in self.tree_selecao.get_children():
+            self.tree_selecao.delete(item)
+        self.lista_completa = []
+        self.progress["value"] = 0
+        self.progress_label.config(text="")
+        messagebox.showinfo("Concluído", f"{processados} arquivos processados.", parent=self)
+
+import os
+import csv
+import sqlite3
+from datetime import datetime, timedelta
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+class HistoricoTab(ttk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self.setup_ui()
+        # Carregar dados ao abrir a aba
+        self.after(300, self.buscar)
+
+    def setup_ui(self):
+        main_frame = ttk.Frame(self, padding=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # ===== FILTROS =====
+        filtro_frame = ttk.LabelFrame(main_frame, text="🔍 Filtros", bootstyle="primary")
+        filtro_frame.pack(fill=tk.X, pady=(0, 10))
+
+        # Linha 1: Data
+        row1 = ttk.Frame(filtro_frame)
+        row1.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Label(row1, text="De:").pack(side=tk.LEFT, padx=(0, 2))
+        self.data_inicio = ttk.Entry(row1, width=12)
+        self.data_inicio.pack(side=tk.LEFT, padx=2)
+        self.data_inicio.insert(0, (datetime.now() - timedelta(days=30)).strftime("%d/%m/%Y"))
+        ttk.Label(row1, text="Até:").pack(side=tk.LEFT, padx=(10, 2))
+        self.data_fim = ttk.Entry(row1, width=12)
+        self.data_fim.pack(side=tk.LEFT, padx=2)
+        self.data_fim.insert(0, datetime.now().strftime("%d/%m/%Y"))
+
+        self.usar_data = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row1, text="Filtrar por data", variable=self.usar_data).pack(side=tk.LEFT, padx=20)
+
+        # Linha 2: Lote, Pilha, Arquivo
+        row2 = ttk.Frame(filtro_frame)
+        row2.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Label(row2, text="Lote:").pack(side=tk.LEFT)
+        self.lote_entry = ttk.Entry(row2, width=30)
+        self.lote_entry.pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(row2, text="Pilha:").pack(side=tk.LEFT, padx=(20, 0))
+        self.pilha_entry = ttk.Entry(row2, width=25)
+        self.pilha_entry.pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(row2, text="Arquivo:").pack(side=tk.LEFT, padx=(20, 0))
+        self.arquivo_entry = ttk.Entry(row2, width=25)
+        self.arquivo_entry.pack(side=tk.LEFT, padx=5)
+
+        # Linha 3: Máquina, Usuário, Status
+        row3 = ttk.Frame(filtro_frame)
+        row3.pack(fill=tk.X, padx=5, pady=5)
+
+        ttk.Label(row3, text="Máquina:").pack(side=tk.LEFT)
+        maquinas = [
+            "Todas",
+            "ATEXCO - 192.168.200.121",
+            "BALTORO - 192.168.200.73",
+            "OCÉ 1 - 192.168.200.80",
+            "OCÉ 3 - 192.168.200.85",
+            "RICOH - 192.168.200.84"
+        ]
+        self.maquina_combo = ttk.Combobox(row3, values=maquinas, width=30, state="readonly")
+        self.maquina_combo.pack(side=tk.LEFT, padx=5)
+        self.maquina_combo.current(0)
+
+        ttk.Label(row3, text="Usuário:").pack(side=tk.LEFT, padx=(20, 0))
+        self.usuario_combo = ttk.Combobox(row3, values=[], width=15, state="readonly")
+        self.usuario_combo.pack(side=tk.LEFT, padx=5)
+        # Será preenchido dinamicamente no primeiro acesso
+
+        ttk.Label(row3, text="Status:").pack(side=tk.LEFT, padx=(20, 0))
+        self.status_combo = ttk.Combobox(row3, values=["", "Montagem OK", "Enviado", "Falha no envio", "Não enviado (manual)"],
+                                         width=20, state="readonly")
+        self.status_combo.pack(side=tk.LEFT, padx=5)
+        self.status_combo.current(0)
+
+        # Linha 4: Modo + botões
+        row4 = ttk.Frame(filtro_frame)
+        row4.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Label(row4, text="Modo:").pack(side=tk.LEFT)
+        modos = ["", "mesclagem", "capa_marcacao", "envio", "dois_na_folha", "grampo", "Corta_empilha", "um_na_folha"]
+        self.modo_combo = ttk.Combobox(row4, values=modos, width=20, state="readonly")
+        self.modo_combo.pack(side=tk.LEFT, padx=5)
+        self.modo_combo.current(0)
+
+        # Botões de ação
+        btn_frame = ttk.Frame(filtro_frame)
+        btn_frame.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Button(btn_frame, text="🔎 Buscar", command=self.buscar, bootstyle="primary").pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="🧹 Limpar Filtros", command=self.limpar_filtros, bootstyle="secondary").pack(side=tk.LEFT, padx=5)
+
+        # ===== RESULTADOS (TREEVIEW) =====
+        tree_frame = ttk.Frame(main_frame)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Colunas (sem "Cópia")
+        colunas = ("Data/Hora", "Lote", "Pilha", "Arquivo", "Máquina", "IP", "Formato", "Modo",
+                   "Qtd", "Status", "Erro", "Usuário")
+        self.tree = ttk.Treeview(tree_frame, columns=colunas, show="headings", height=15)
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
+
+        larguras = [130, 150, 120, 180, 160, 120, 80, 100, 50, 130, 150, 100]
+        for col, larg in zip(colunas, larguras):
+            self.tree.heading(col, text=col, command=lambda c=col: self.ordenar_por(c))
+            self.tree.column(col, width=larg, minwidth=50)
+
+        # ===== RODAPÉ COM TOTAIS =====
+        resumo_frame = ttk.Frame(main_frame)
+        resumo_frame.pack(fill=tk.X, pady=(5, 0))
+        self.lbl_total_registros = ttk.Label(resumo_frame, text="Registros: 0", font=("Segoe UI", 9, "bold"))
+        self.lbl_total_registros.pack(side=tk.LEFT, padx=20)
+        self.lbl_soma_qtd = ttk.Label(resumo_frame, text="Quantidade total: 0", font=("Segoe UI", 9, "bold"))
+        self.lbl_soma_qtd.pack(side=tk.LEFT, padx=20)
+
+        self.dados = []        # armazena os registros completos (excluindo cópia)
+        self.ordem_atual = None
+
+    def _carregar_usuarios(self):
+        """Obtém lista de usuários distintos do banco e atualiza o combobox."""
+        usuarios = ["Todos"]
+        try:
+            conn = self.conectar_banco()
+            cursor = conn.cursor()
+            cursor.execute("SELECT DISTINCT usuario FROM logs WHERE usuario != '' ORDER BY usuario")
+            for row in cursor.fetchall():
+                usuarios.append(row[0])
+            conn.close()
+        except Exception:
+            pass
+        self.usuario_combo['values'] = usuarios
+        self.usuario_combo.current(0)
+
+    def conectar_banco(self):
+        caminho = self.app.log_db_path
+        try:
+            if not os.path.exists(os.path.dirname(caminho)):
+                raise Exception("Rede inacessível")
+            teste = os.path.join(os.path.dirname(caminho), ".write_test")
+            with open(teste, 'w') as f:
+                f.write("test")
+            os.remove(teste)
+        except:
+            caminho = self.app.log_db_local_path
+        return sqlite3.connect(caminho)
+
+    def buscar(self):
+        # Garantir que a lista de usuários esteja carregada
+        if not self.usuario_combo['values']:
+            self._carregar_usuarios()
+
+        self.tree.delete(*self.tree.get_children())
+        self.dados = []
+        conn = None
+        try:
+            conn = self.conectar_banco()
+            cursor = conn.cursor()
+
+            # Query sem a coluna 'copia'
+            query = ("SELECT data_hora, lote, pilha, arquivo, maquina, ip, formato, modo, "
+                     "quantidade, status, erro, usuario FROM logs WHERE 1=1")
+            params = []
+
+            # Filtro de data
+            if self.usar_data.get():
+                try:
+                    di = datetime.strptime(self.data_inicio.get().strip(), "%d/%m/%Y")
+                    df = datetime.strptime(self.data_fim.get().strip(), "%d/%m/%Y") + timedelta(days=1)
+                    query += " AND data_hora BETWEEN ? AND ?"
+                    params.extend([di.strftime("%Y-%m-%d"), df.strftime("%Y-%m-%d")])
+                except ValueError:
+                    messagebox.showerror("Erro", "Formato de data inválido. Use dd/mm/aaaa.")
+                    return
+
+            # Lote (aproximação)
+            lote = self.lote_entry.get().strip()
+            if lote:
+                query += " AND lote LIKE ?"
+                params.append(f"%{lote}%")
+
+            # Pilha
+            pilha = self.pilha_entry.get().strip()
+            if pilha:
+                query += " AND pilha LIKE ?"
+                params.append(f"%{pilha}%")
+
+            # Arquivo
+            arquivo = self.arquivo_entry.get().strip()
+            if arquivo:
+                query += " AND arquivo LIKE ?"
+                params.append(f"%{arquivo}%")
+
+            # Máquina
+            maquina = self.maquina_combo.get()
+            if maquina and maquina != "Todas":
+                query += " AND maquina = ?"
+                params.append(maquina)
+
+            # Status
+            status = self.status_combo.get().strip()
+            if status:
+                query += " AND status = ?"
+                params.append(status)
+
+            # Usuário
+            usuario = self.usuario_combo.get()
+            if usuario and usuario != "Todos":
+                query += " AND usuario = ?"
+                params.append(usuario)
+
+            # Modo
+            modo = self.modo_combo.get().strip()
+            if modo:
+                query += " AND modo = ?"
+                params.append(modo)
+
+            query += " ORDER BY data_hora DESC LIMIT 5000"
+
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+
+            soma_qtd = 0
+            for row in rows:
+                self.dados.append(row)
+                self.tree.insert("", tk.END, values=row)
+                soma_qtd += row[8]  # índice da quantidade (0‑based: 8)
+
+            # Atualizar rodapé
+            self.lbl_total_registros.config(text=f"Registros: {len(rows)}")
+            self.lbl_soma_qtd.config(text=f"Quantidade total: {soma_qtd}")
+
+        except Exception as e:
+            messagebox.showerror("Erro", f"Falha ao consultar banco: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+
+
+    def limpar_filtros(self):
+        self.data_inicio.delete(0, tk.END)
+        self.data_inicio.insert(0, (datetime.now() - timedelta(days=30)).strftime("%d/%m/%Y"))
+        self.data_fim.delete(0, tk.END)
+        self.data_fim.insert(0, datetime.now().strftime("%d/%m/%Y"))
+        self.usar_data.set(True)
+        self.lote_entry.delete(0, tk.END)
+        self.pilha_entry.delete(0, tk.END)
+        self.arquivo_entry.delete(0, tk.END)
+        self.maquina_combo.set("Todas")
+        self.status_combo.set("")
+        if self.usuario_combo['values']:
+            self.usuario_combo.current(0)  # "Todos"
+        self.modo_combo.set("")
+        self.tree.delete(*self.tree.get_children())
+        self.dados = []
+        self.lbl_total_registros.config(text="Registros: 0")
+        self.lbl_soma_qtd.config(text="Quantidade total: 0")
+
+    def ordenar_por(self, coluna):
+        if not self.dados:
+            return
+        # Mapeamento das colunas visíveis para índice nos dados (0‑based)
+        idx_map = {
+            "Data/Hora": 0, "Lote": 1, "Pilha": 2, "Arquivo": 3,
+            "Máquina": 4, "IP": 5, "Formato": 6, "Modo": 7,
+            "Qtd": 8, "Status": 9, "Erro": 10, "Usuário": 11
+        }
+        idx = idx_map[coluna]
+        reverse = False
+        if self.ordem_atual == coluna:
+            reverse = True
+        self.ordem_atual = coluna
+        self.dados.sort(key=lambda x: x[idx] if x[idx] is not None else "", reverse=reverse)
+        self.tree.delete(*self.tree.get_children())
+        for row in self.dados:
+            self.tree.insert("", tk.END, values=row)
 if __name__ == "__main__":
     logging.basicConfig(
         filename='processamento_capas.log',
