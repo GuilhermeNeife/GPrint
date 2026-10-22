@@ -31,7 +31,7 @@ import io
 import math
 
 # --- CONSTANTES ---
-DATA_LIMITE = "31/01/2027"
+DATA_LIMITE = "31/07/2027"
 PASTA_BASE = r"N:\____REPOSITORIO GERAL POD\UICLAP\LOTES"
 PASTA_TRABALHO = os.path.join(os.environ.get('TEMP', os.path.expanduser("~")), "UICLAP_TEMP")
 CONFIG_FILE = os.path.expanduser("~/uiclap_config.json")
@@ -48,7 +48,7 @@ DEFAULT_CONFIG = {
     'fonte': 'helv',
     'tamanho_fonte': 11,
     'deslocamento_padrao': -30,
-    'deslocamento_capa_28x56': 82,
+    'deslocamento_capa_28x56': 92,
     'deslocamento_x': 70 * 2.83465,
     'tema': 'darkly',
     'formatos_pdf': [
@@ -117,6 +117,7 @@ def ler_arquivo_txt(caminho_txt):
                             "FORMATO CAPA": campos[12].strip(),
                             "CODIGOACAB": campos[9].strip(),
                             "IDENTIFIC": campos[13].strip(),
+                            "FILACOLOR": campos[12].strip(),
                             "NOMEFIC": campos[11].strip()
                         })
                     except (ValueError, IndexError) as e:
@@ -127,7 +128,7 @@ def ler_arquivo_txt(caminho_txt):
         messagebox.showerror("Erro", f"Não foi possível ler o arquivo {os.path.basename(caminho_txt)}")
         return []
 
-def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific):
+def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific,filacolor):
     try:
         doc = fitz.open(pdf_path)
         nome_arquivo = os.path.splitext(os.path.basename(pdf_path))[0]
@@ -135,12 +136,11 @@ def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific):
         cor_marca = CONFIG['cor_fosco'] if laminacao.upper() == "FOSCO" else CONFIG['cor_brilho']
 
         if codigoacab == "3":
-            deslocamento_y = CONFIG['deslocamento_padrao']
+            deslocamento_y = CONFIG['deslocamento_padrao']+8
         elif codigoacab == "2":
             deslocamento_y = CONFIG['deslocamento_padrao'] + 12
         else:
             deslocamento_y = CONFIG['deslocamento_capa_28x56']
-
 
         for pagina in doc:
             largura, altura = pagina.rect.width, pagina.rect.height
@@ -160,6 +160,21 @@ def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific):
                 fontname=CONFIG['fonte'],
                 align=1
             )
+            if filacolor == "Capas_28X56":                
+                # CORTAR 4CM DA PARTE DE CIMA DO PDF
+                corte_cm = 4
+                corte_pontos = corte_cm * 28.3465  # Converter cm para pontos (1 cm = 28.3465 pontos)
+                
+                # Definir nova área da página (cortar a parte superior)
+                novo_retangulo = fitz.Rect(
+                    0,                      # x0 (esquerda)
+                    corte_pontos,           # y0 (topo - cortando 4cm)
+                    largura,                # x1 (direita)
+                    altura                  # y1 (base)
+                )
+                
+                # Aplicar o corte definindo o cropbox
+                pagina.set_cropbox(novo_retangulo)
 
         novo_caminho = pdf_path.replace(".pdf", "_marcado.pdf")
         doc.save(novo_caminho)
@@ -913,7 +928,6 @@ class MioloTab(ttk.Frame):
 
                     
                     comando = f'lpr -S {ip} -P "{formato}" "{output_path}"'
-
 
                     print(f"Comando: {comando}")
                     print(f"ip: {ip}")
@@ -1704,14 +1718,6 @@ class Application:
         )
         self.listbox_arquivos.pack(fill=BOTH, expand=True, padx=5, pady=(0, 10))
         
-        scrollbar = ttk.Scrollbar(
-            selection_frame,
-            orient=VERTICAL,
-            command=self.listbox_arquivos.yview,
-            bootstyle=PRIMARY
-        )
-        scrollbar.pack(side=RIGHT, fill=Y)
-        self.listbox_arquivos.config(yscrollcommand=scrollbar.set)
         
         self.checkbox_imprimir = ttk.Checkbutton(
             selection_frame, 
@@ -1800,6 +1806,7 @@ class Application:
                         quantidade = linha["QTD"]
                         identific = linha["IDENTIFIC"]
                         nomefic = linha["NOMEFIC"]
+                        filacolor = linha["FILACOLOR"]
 
                         nome_arquivo, extensao = os.path.splitext(linha["ARQUIVO"])
                         temp_file = os.path.join(pasta_temp, f"{nomefic}_temp{extensao}")
@@ -1811,13 +1818,16 @@ class Application:
                                 temp_file,
                                 linha["LAMINAÇÃO"], 
                                 linha["CODIGOACAB"], 
-                                identific
+                                identific,
+                                linha["FILACOLOR"]
                             )
 
                             if pdf_marcado:
-                                if identific not in pdfs_para_mesclar:
-                                    pdfs_para_mesclar[identific] = []
-                                pdfs_para_mesclar[identific].extend([pdf_marcado] * quantidade)
+                                # CORREÇÃO: Usar a tupla (identific, filacolor) como chave
+                                chave = (identific, filacolor)
+                                if chave not in pdfs_para_mesclar:
+                                    pdfs_para_mesclar[chave] = []
+                                pdfs_para_mesclar[chave].extend([pdf_marcado] * quantidade)
 
                         arquivos_processados += 1
                         progress_text = f"Processando {linha['ARQUIVO']}... ({arquivos_processados}/{total_arquivos})"
@@ -1830,13 +1840,16 @@ class Application:
             total_identifics = len(pdfs_para_mesclar)
             identifics_processados = 0
 
-            for identific, lista_pdfs in pdfs_para_mesclar.items():
+            # CORREÇÃO: Iterar sobre as chaves (identific, filacolor)
+            for chave, lista_pdfs in pdfs_para_mesclar.items():
+                identific, filacolor = chave  # Desempacotar a chave
                 progress_text = f"Agrupando PDFs ({identifics_processados + 1}/{total_identifics})..."
                 progress.update_progress(80 + ((identifics_processados / total_identifics) * 20), progress_text)
 
                 pasta_destino = os.path.dirname(self.arquivos_selecionados[0])
+                # Incluir filacolor no nome do arquivo de saída se desejar
                 nome_saida = os.path.join(pasta_destino, f"{identific}.pdf")
-                self.mesclar_pdfs(lista_pdfs, nome_saida)
+                self.mesclar_pdfs(lista_pdfs, nome_saida, filacolor)
                 identifics_processados += 1
 
             progress.update_progress(100, "Processamento concluído!")
@@ -1855,7 +1868,7 @@ class Application:
             except Exception as e:
                 logging.error(f"Erro ao limpar pasta temporária: {e}")
 
-    def mesclar_pdfs(self, lista_pdfs, nome_saida):
+    def mesclar_pdfs(self, lista_pdfs, nome_saida,filacolor):
         try:
             merger = PdfMerger()
             for pdf in lista_pdfs:
@@ -1866,16 +1879,16 @@ class Application:
             logging.info(f"Arquivo mesclado salvo: {nome_saida}")
             
             if self.imprimir_automaticamente.get():
-                self.enviar_para_impressora(nome_saida, os.path.basename(nome_saida))
+                self.enviar_para_impressora(nome_saida, os.path.basename(nome_saida),filacolor)
             
         except Exception as e:
             logging.error(f"Erro ao mesclar PDFs: {e}")
             messagebox.showerror("Erro", f"Falha ao mesclar arquivos: {e}")
 
-    def enviar_para_impressora(self, arquivo_pdf, nome_arquivo):
+    def enviar_para_impressora(self, arquivo_pdf, nome_arquivo,filacolor):
         try:
-            comando = f'lpr -S 192.168.200.84 -P "Capas_32x60" -J "{nome_arquivo}" "{arquivo_pdf}"'
-            
+            comando = f'lpr -S 192.168.200.84 -P "{filacolor}" -J "{nome_arquivo.replace(filacolor, "")}" "{nome_arquivo}" "{arquivo_pdf}"'
+            print(f"Enviando para impressora: lpr -S 192.168.200.84 -P {filacolor} -J {nome_arquivo} {arquivo_pdf}")
             subprocess.run(comando, shell=True, check=True)
             logging.info(f"Arquivo {nome_arquivo} enviado para impressora")
         except Exception as e:
