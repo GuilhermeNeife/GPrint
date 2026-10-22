@@ -902,7 +902,7 @@ class MioloTab(ttk.Frame):
                 self.log(f"🔧 Modo: {p['MODO']}", "INFO")
                 self.log(f"📊 QTD para envio: {p['QTD']}, QTD Total: {p['QTD_total']}", "INFO")
                 
-                origem = os.path.join(p["CAMINHO"], p["ARQUIVO"])
+                origem = os.path.normpath(os.path.join(p["CAMINHO"], p["ARQUIVO"]))
                 if not os.path.exists(origem):
                     self.log(f"Arquivo não encontrado: {origem}", "ERRO")
                     error_count += 1
@@ -1135,7 +1135,7 @@ class MioloTab(ttk.Frame):
                 self.tree.delete(item)
 
             lines = None
-            encodings = ['utf-8', 'cp1252', 'latin-1']
+            encodings = ['utf-8-sig', 'utf-8', 'cp1252', 'latin-1']
 
             for enc in encodings:
                 try:
@@ -1177,7 +1177,7 @@ class MioloTab(ttk.Frame):
 
                 processo = {
                     "LINHA": idx + 1,
-                    "CAMINHO": campos[0].strip(),
+                    "CAMINHO": os.path.normpath(campos[0].strip().replace('\ufeff', '').replace('/', '\\')),
                     "ARQUIVO": campos[1].strip(),
                     "QTD": qtd,
                     "CODIGOACAB": cod_acab,
@@ -1807,13 +1807,55 @@ def dois_na_folha_rotacionado(input_path, output_path, output_width, output_heig
     doc.close()
     out.close()
     return True
-def um_na_folha(input_path, output_path, output_width, output_height, sangria_mm=3, add_marcas=True):
-    doc = fitz.open(input_path)
+def um_na_folha(input_path, output_path, output_width, output_height,
+                sangria_mm=3, add_marcas=True,
+                add_identificacao=True,
+                texto_offset_mm=0.5,
+                comprimir_entrada=False):
+
+    # Compressão opcional
+    tmp_input = None
+    if comprimir_entrada:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp_input = tmp.name
+        comprimir_pdf(input_path, tmp_input)
+        doc = fitz.open(tmp_input)
+    else:
+        doc = fitz.open(input_path)
+
+    if len(doc) == 0:
+        print("Erro: O documento PDF está vazio.")
+        doc.close()
+        return False
+
     out = fitz.open()
     sangria_pt = sangria_mm * MM
+    offset_pt = texto_offset_mm * MM
+    total = len(doc)
+    nome_arquivo = os.path.basename(input_path)
+
     ref_page = doc[0]
     trim_ref = obter_area_corte_segura(ref_page, 210*MM, 297*MM)
     w_ref, h_ref = trim_ref.width, trim_ref.height
+
+    # ---------- Identificação local (só rot=0) ----------
+    def _identificar(nova_page, texto, destino):
+        if not texto:
+            return
+        font_size = 5
+        altura_texto = 4 * MM
+        margem_min = 0.5 * MM
+
+        y1 = destino.y0 - offset_pt
+        y0 = y1 - altura_texto
+        if y0 < margem_min:
+            y0 = margem_min
+            y1 = y0 + altura_texto
+
+        rect = fitz.Rect(destino.x0, y0, destino.x1, y1)
+        nova_page.insert_textbox(rect, texto, fontsize=font_size, fontname="helv",
+                                 align=fitz.TEXT_ALIGN_CENTER, rotate=0)
+    # ---------------------------------------------------
 
     for page in doc:
         trim_original = obter_area_corte_segura(page, w_ref, h_ref)
@@ -1832,12 +1874,14 @@ def um_na_folha(input_path, output_path, output_width, output_height, sangria_mm
         destino = fitz.Rect(x, y, x + w, y + h)
         destino = ajustar_para_media_box(destino, output_width, output_height)
 
-        if pagina_tem_conteudo(page):
+        tem_conteudo = pagina_tem_conteudo(page)
+
+        if tem_conteudo:
             nova.show_pdf_page(destino, doc, page.number, clip=trim_original)
 
         nova.set_trimbox(destino)
 
-        if sangria_pt > 0 and sangria_aplicar and pagina_tem_conteudo(page):
+        if sangria_pt > 0 and sangria_aplicar and tem_conteudo:
             bleed = fitz.Rect(
                 destino.x0 - sangria_pt,
                 destino.y0 - sangria_pt,
@@ -1847,15 +1891,27 @@ def um_na_folha(input_path, output_path, output_width, output_height, sangria_mm
             bleed = ajustar_para_media_box(bleed, output_width, output_height)
             if bleed.width > 0 and bleed.height > 0:
                 nova.set_bleedbox(bleed)
-            aplicar_sangria_espelhada_externa(page, nova, trim_original, destino, sangria_pt,
+            aplicar_sangria_espelhada_externa(page, nova, trim_original, destino,
+                                              sangria_pt,
                                               bordas=['top', 'bottom', 'left', 'right'])
 
         if add_marcas:
             desenhar_marcas(nova, destino, tam=5*MM, gap=2*MM)
 
+        if add_identificacao and tem_conteudo:
+            texto = f"{page.number + 1}/{total} {nome_arquivo}"
+            _identificar(nova, texto, destino)
+
     out.save(output_path)
     doc.close()
     out.close()
+
+    if comprimir_entrada and tmp_input:
+        try:
+            os.unlink(tmp_input)
+        except Exception:
+            pass
+
     return True
 def dois_na_folha(input_path, output_path, output_width, output_height, espacamento_mm=0, sangria_mm=3, add_marcas=True):
     doc = fitz.open(input_path)
@@ -1959,13 +2015,18 @@ def comprimir_pdf(entrada, saida):
         import shutil
         shutil.copy(entrada, saida)
 def Corta_empilha(input_path, output_path, output_width, output_height,
-                  sangria_mm=3, add_marcas=True, comprimir_entrada=True):
+                  sangria_mm=3, add_marcas=True,
+                  add_identificacao=True,
+                  texto_offset_normal_mm=0.5,
+                  texto_offset_180_mm=0.5,
+                  comprimir_entrada=True):
     """
     Montagem corta-empilha com caderno único.
     Se comprimir_entrada=True, o PDF original é comprimido antes da imposição.
     """
 
     # Se solicitado, comprime o PDF de entrada num arquivo temporário
+    tmp_input = None
     if comprimir_entrada:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp_input = tmp.name
@@ -1973,6 +2034,8 @@ def Corta_empilha(input_path, output_path, output_width, output_height,
         doc = fitz.open(tmp_input)
     else:
         doc = fitz.open(input_path)
+
+    nome_arquivo = os.path.basename(input_path)
 
     # ---------- AJUSTE PARA MÚLTIPLO DE 4 ----------
     total_original = len(doc)
@@ -1994,10 +2057,42 @@ def Corta_empilha(input_path, output_path, output_width, output_height,
 
     out = fitz.open()
     sangria_pt = sangria_mm * MM
+    offset_normal_pt = texto_offset_normal_mm * MM
+    offset_180_pt = texto_offset_180_mm * MM
 
     ref_page = doc[0]
     trim_ref = obter_area_corte_segura(ref_page, 210 * MM, 297 * MM)
     w_ref, h_ref = trim_ref.width, trim_ref.height
+
+    # ---------- IDENTIFICAÇÃO LOCAL ----------
+    def _identificar(nova_page, texto, destino, rot):
+        if not texto:
+            return
+        font_size = 5
+        altura_texto = 4 * MM
+        margem_min = 0.5 * MM
+
+        if rot == 180:
+            y0 = destino.y1 + offset_180_pt
+            y1 = y0 + altura_texto
+            if y1 > nova_page.rect.height - margem_min:
+                y1 = nova_page.rect.height - margem_min
+                y0 = y1 - altura_texto
+            rect = fitz.Rect(destino.x0, y0, destino.x1, y1)
+            nova_page.insert_textbox(rect, texto, fontsize=font_size,
+                                     fontname="helv",
+                                     align=fitz.TEXT_ALIGN_CENTER, rotate=180)
+        else:
+            y1 = destino.y0 - offset_normal_pt
+            y0 = y1 - altura_texto
+            if y0 < margem_min:
+                y0 = margem_min
+                y1 = y0 + altura_texto
+            rect = fitz.Rect(destino.x0, y0, destino.x1, y1)
+            nova_page.insert_textbox(rect, texto, fontsize=font_size,
+                                     fontname="helv",
+                                     align=fitz.TEXT_ALIGN_CENTER, rotate=0)
+    # ----------------------------------------
 
     # ---------- FUNÇÃO AUXILIAR (uma face da folha) ----------
     def _criar_pagina(idx_esq, idx_dir, rot_esq, rot_dir, esq_superior):
@@ -2056,10 +2151,13 @@ def Corta_empilha(input_path, output_path, output_width, output_height,
         destino2 = fitz.Rect(x2, y_dir, x2 + w_dir, y_dir + h_dir)
         destino2 = ajustar_para_media_box(destino2, output_width, output_height)
 
+        tem_esq = page_esq is not None and pagina_tem_conteudo(page_esq)
+        tem_dir = page_dir is not None and pagina_tem_conteudo(page_dir)
+
         # Inserir páginas com rotação
-        if page_esq and pagina_tem_conteudo(page_esq):
+        if tem_esq:
             nova.show_pdf_page(destino1, doc, idx_esq, clip=trim_esq, rotate=rot_esq)
-        if page_dir and pagina_tem_conteudo(page_dir):
+        if tem_dir:
             nova.show_pdf_page(destino2, doc, idx_dir, clip=trim_dir, rotate=rot_dir)
 
         # Trimbox
@@ -2068,15 +2166,18 @@ def Corta_empilha(input_path, output_path, output_width, output_height,
         trim_union = ajustar_para_media_box(trim_union, output_width, output_height)
         nova.set_trimbox(trim_union)
 
-        # Sangria (COM CORREÇÕES)
+        # Sangria
         if sangria_pt > 0:
-            # CORREÇÃO 1: passar o ângulo de rotação para a sangria espelhada
-            if page_esq and pagina_tem_conteudo(page_esq) and sangria_aplicar_esq:
-                aplicar_sangria_espelhada_externa(page_esq, nova, trim_esq, destino1, sangria_pt,
-                                                  bordas=['top', 'bottom', 'left'], rotate=rot_esq)
-            if page_dir and pagina_tem_conteudo(page_dir) and sangria_aplicar_dir:
-                aplicar_sangria_espelhada_externa(page_dir, nova, trim_dir, destino2, sangria_pt,
-                                                  bordas=['top', 'bottom', 'right'], rotate=rot_dir)
+            if tem_esq and sangria_aplicar_esq:
+                aplicar_sangria_espelhada_externa(page_esq, nova, trim_esq, destino1,
+                                                  sangria_pt,
+                                                  bordas=['top', 'bottom', 'left'],
+                                                  rotate=rot_esq)
+            if tem_dir and sangria_aplicar_dir:
+                aplicar_sangria_espelhada_externa(page_dir, nova, trim_dir, destino2,
+                                                  sangria_pt,
+                                                  bordas=['top', 'bottom', 'right'],
+                                                  rotate=rot_dir)
 
             bleed_total = fitz.Rect(
                 destino1.x0 - sangria_pt,
@@ -2087,7 +2188,6 @@ def Corta_empilha(input_path, output_path, output_width, output_height,
             media_box = fitz.Rect(0, 0, output_width, output_height)
             bleed_total = bleed_total.intersect(media_box)
 
-            # CORREÇÃO 2: verificação simples da área (como no corta_empilha_rotacionado)
             if not bleed_total.is_empty and bleed_total.get_area() > 0:
                 nova.set_bleedbox(bleed_total)
 
@@ -2096,8 +2196,18 @@ def Corta_empilha(input_path, output_path, output_width, output_height,
             desenhar_marcas(nova, destino1, tam=5 * MM, gap=2 * MM, lado='esquerda')
             desenhar_marcas(nova, destino2, tam=5 * MM, gap=2 * MM, lado='direita')
             x_centro = destino1.x1
-            desenhar_marca_central_vertical(nova, x_centro, destino1.y0, destino1.y1,
+            desenhar_marca_central_vertical(nova, x_centro,
+                                            destino1.y0, destino1.y1,
                                             tam=5 * MM, gap=2 * MM)
+
+        # Identificação (só onde há conteúdo)
+        if add_identificacao:
+            if tem_esq:
+                _identificar(nova, f"{idx_esq + 1}/{total} {nome_arquivo}",
+                             destino1, rot_esq)
+            if tem_dir:
+                _identificar(nova, f"{idx_dir + 1}/{total} {nome_arquivo}",
+                             destino2, rot_dir)
     # ------------------------------------------------------------
 
     # MONTAGEM DAS FOLHAS
@@ -2119,7 +2229,7 @@ def Corta_empilha(input_path, output_path, output_width, output_height,
     out.close()
 
     # Remove o temporário da compressão, se criado
-    if comprimir_entrada:
+    if comprimir_entrada and tmp_input:
         try:
             os.unlink(tmp_input)
         except:
@@ -2128,15 +2238,56 @@ def Corta_empilha(input_path, output_path, output_width, output_height,
 
     print("Montagem concluída.")
     return True
-def grampo(input_path, output_path, output_width, output_height, sangria_mm=3, add_marcas=True):
-    doc = fitz.open(input_path)
+def grampo(input_path, output_path, output_width, output_height,
+           sangria_mm=3, add_marcas=True,
+           add_identificacao=True,
+           texto_offset_mm=0.5,
+           comprimir_entrada=False):
+
+    # Compressão opcional
+    tmp_input = None
+    if comprimir_entrada:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp_input = tmp.name
+        comprimir_pdf(input_path, tmp_input)
+        doc = fitz.open(tmp_input)
+    else:
+        doc = fitz.open(input_path)
+
+    if len(doc) == 0:
+        print("Erro: O documento PDF está vazio.")
+        doc.close()
+        return False
+
     out = fitz.open()
     sangria_pt = sangria_mm * MM
+    offset_pt = texto_offset_mm * MM
     total = len(doc)
     num_folhas = (total + 1) // 2
+    nome_arquivo = os.path.basename(input_path)
+
     ref_page = doc[0]
     trim_ref = obter_area_corte_segura(ref_page, 210*MM, 297*MM)
     w_ref, h_ref = trim_ref.width, trim_ref.height
+
+    # ---------- Identificação local (só rot=0, acima do trim) ----------
+    def _identificar(nova_page, texto, destino):
+        if not texto:
+            return
+        font_size = 5
+        altura_texto = 4 * MM
+        margem_min = 0.5 * MM
+
+        y1 = destino.y0 - offset_pt
+        y0 = y1 - altura_texto
+        if y0 < margem_min:
+            y0 = margem_min
+            y1 = y0 + altura_texto
+
+        rect = fitz.Rect(destino.x0, y0, destino.x1, y1)
+        nova_page.insert_textbox(rect, texto, fontsize=font_size, fontname="helv",
+                                 align=fitz.TEXT_ALIGN_CENTER, rotate=0)
+    # -------------------------------------------------------------------
 
     for i in range(num_folhas):
         if i % 2 == 0:
@@ -2146,8 +2297,8 @@ def grampo(input_path, output_path, output_width, output_height, sangria_mm=3, a
             idx_esq_base1 = i + 1
             idx_dir_base1 = total - i
 
-        idx_esq = idx_esq_base1 - 1 if idx_esq_base1 >= 1 and idx_esq_base1 <= total else None
-        idx_dir = idx_dir_base1 - 1 if idx_dir_base1 >= 1 and idx_dir_base1 <= total else None
+        idx_esq = idx_esq_base1 - 1 if 1 <= idx_esq_base1 <= total else None
+        idx_dir = idx_dir_base1 - 1 if 1 <= idx_dir_base1 <= total else None
 
         page_esq = doc[idx_esq] if idx_esq is not None else None
         page_dir = doc[idx_dir] if idx_dir is not None else None
@@ -2189,19 +2340,24 @@ def grampo(input_path, output_path, output_width, output_height, sangria_mm=3, a
         destino2 = fitz.Rect(x2, y_dir, x2 + w_dir, y_dir + h_dir)
         destino2 = ajustar_para_media_box(destino2, output_width, output_height)
 
-        if page_esq and pagina_tem_conteudo(page_esq):
+        tem_esq = page_esq is not None and pagina_tem_conteudo(page_esq)
+        tem_dir = page_dir is not None and pagina_tem_conteudo(page_dir)
+
+        if tem_esq:
             nova.show_pdf_page(destino1, doc, idx_esq, clip=trim_esq)
-        if page_dir and pagina_tem_conteudo(page_dir):
+        if tem_dir:
             nova.show_pdf_page(destino2, doc, idx_dir, clip=trim_dir)
 
         nova.set_trimbox(destino1)
 
         if sangria_pt > 0:
-            if page_esq and pagina_tem_conteudo(page_esq) and sangria_aplicar_esq:
-                aplicar_sangria_espelhada_externa(page_esq, nova, trim_esq, destino1, sangria_pt,
+            if tem_esq and sangria_aplicar_esq:
+                aplicar_sangria_espelhada_externa(page_esq, nova, trim_esq, destino1,
+                                                  sangria_pt,
                                                   bordas=['top', 'bottom', 'left'])
-            if page_dir and pagina_tem_conteudo(page_dir) and sangria_aplicar_dir:
-                aplicar_sangria_espelhada_externa(page_dir, nova, trim_dir, destino2, sangria_pt,
+            if tem_dir and sangria_aplicar_dir:
+                aplicar_sangria_espelhada_externa(page_dir, nova, trim_dir, destino2,
+                                                  sangria_pt,
                                                   bordas=['top', 'bottom', 'right'])
 
             bleed_total = fitz.Rect(
@@ -2218,11 +2374,27 @@ def grampo(input_path, output_path, output_width, output_height, sangria_mm=3, a
             desenhar_marcas(nova, destino1, tam=5*MM, gap=2*MM, lado='esquerda')
             desenhar_marcas(nova, destino2, tam=5*MM, gap=2*MM, lado='direita')
             x_centro = destino1.x1
-            desenhar_marca_central_vertical(nova, x_centro, destino1.y0, destino1.y1, tam=5*MM, gap=2*MM)
+            desenhar_marca_central_vertical(nova, x_centro,
+                                            destino1.y0, destino1.y1,
+                                            tam=5*MM, gap=2*MM)
+
+        # Identificação — só onde há conteúdo
+        if add_identificacao:
+            if tem_esq:
+                _identificar(nova, f"{idx_esq + 1}/{total} {nome_arquivo}", destino1)
+            if tem_dir:
+                _identificar(nova, f"{idx_dir + 1}/{total} {nome_arquivo}", destino2)
 
     out.save(output_path)
     doc.close()
     out.close()
+
+    if comprimir_entrada and tmp_input:
+        try:
+            os.unlink(tmp_input)
+        except Exception:
+            pass
+
     return True
 class Application:
     def __init__(self, root):
@@ -2231,6 +2403,15 @@ class Application:
         self.imprimir_automaticamente = tk.BooleanVar(value=True)
         self.tema_atual = tk.StringVar(value=CONFIG.get('tema', 'darkly'))
         self.style = Style(theme=self.tema_atual.get())
+        # Ícone do aplicativo
+        # "Q:\___LISTA DE PRIORIDADES\GUILHERME\GPrint.ico"
+        # Caminhos dos arquivos visuais
+        self.icon_path = r"Q:\___LISTA DE PRIORIDADES\GUILHERME\GPrint.ico"
+        self.logo_path = r"Q:\___LISTA DE PRIORIDADES\GUILHERME\GPrint.png"
+
+        # Ícone da janela
+        self.root.iconbitmap(self.icon_path)
+
         
         # Controle de progresso
         self.processamento_em_andamento = False
@@ -2352,7 +2533,7 @@ class Application:
 
     # ==================== INTERFACE GRÁFICA ====================
     def setup_ui(self):
-        self.root.title("Sistema de Processamento de Arquivos")
+        self.root.title("GPrint")
         self.root.geometry("900x700")
         self.root.state('zoomed')
         self.center_window()
@@ -2890,7 +3071,7 @@ class Application:
         import tkinter as tk
 
         about_window = tk.Toplevel(self.root)
-        about_window.title("Sobre o Sistema")
+        about_window.title("Sobre o GPrint")
         about_window.geometry("450x350")
         about_window.resizable(False, False)
         about_window.configure(bg="#0f172a")
@@ -2905,10 +3086,10 @@ class Application:
         main = tk.Frame(about_window, bg="#0f172a", padx=30, pady=20)
         main.pack(fill="both", expand=True)
 
-        tk.Label(main, text="Processador de Arquivos", font=("Segoe UI", 18, "bold"),
+        tk.Label(main, text="GPrint", font=("Segoe UI", 18, "bold"),
                 bg="#0f172a", fg="#f8fafc").pack(pady=(10, 0))
 
-        versao_badge = tk.Label(main, text="  v3.0  ", font=("Segoe UI", 10, "bold"),
+        versao_badge = tk.Label(main, text="  v5.0  ", font=("Segoe UI", 10, "bold"),
                                 bg="#3b82f6", fg="white", padx=8, pady=2)
         versao_badge.pack(pady=(4, 12))
 
@@ -2978,13 +3159,24 @@ def verificar_data_limite():
 def ler_arquivo_txt(caminho_txt):
     dados = []
     try:
-        with open(caminho_txt, "r", encoding="utf-8") as arquivo:
+        # utf-8-sig remove BOM automaticamente
+        with open(caminho_txt, "r", encoding="utf-8-sig") as arquivo:
             for idx, linha in enumerate(arquivo, 1):
                 campos = linha.strip().split("|")
                 if len(campos) >= 14:
                     try:
+                        # --- Normalização do CAMINHO ---
+                        caminho_bruto = campos[0].strip()
+                        # Remove qualquer BOM residual
+                        caminho_bruto = caminho_bruto.replace('\ufeff', '').strip()
+                        # Substitui todas as barras normais por invertidas (padrão Windows)
+                        caminho_bruto = caminho_bruto.replace('/', '\\')
+                        # Normaliza (remove duplicidades, resolve .. etc)
+                        caminho = os.path.normpath(caminho_bruto)
+                        # --- Fim da normalização ---
+
                         dados.append({
-                            "CAMINHO": campos[0].strip(),
+                            "CAMINHO": caminho,          # agora normalizado
                             "ARQUIVO": campos[1].strip(),
                             "QTD": int(campos[2].strip()) if campos[2].strip().isdigit() else 1,
                             "LAMINAÇÃO": campos[4].strip(),
@@ -2993,7 +3185,6 @@ def ler_arquivo_txt(caminho_txt):
                             "IDENTIFIC": campos[13].strip(),
                             "FILACOLOR": campos[12].strip(),
                             "NOMEFIC": campos[11].strip()
-
                         })
                     except (ValueError, IndexError) as e:
                         logging.warning(f"Linha {idx} mal formatada no arquivo {caminho_txt}: {linha}")
@@ -3002,56 +3193,128 @@ def ler_arquivo_txt(caminho_txt):
         logging.error(f"Erro ao ler arquivo {caminho_txt}: {e}")
         messagebox.showerror("Erro", f"Não foi possível ler o arquivo {os.path.basename(caminho_txt)}")
         return []
-def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific,filacolor):
+def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific, filacolor):
     try:
         doc = fitz.open(pdf_path)
         nome_arquivo = os.path.splitext(os.path.basename(pdf_path))[0]
 
         cor_marca = CONFIG['cor_fosco'] if laminacao.upper() == "FOSCO" else CONFIG['cor_brilho']
 
-        if codigoacab == "3":
-            deslocamento_y = CONFIG['deslocamento_padrao']+8
-        elif codigoacab == "2":
-            deslocamento_y = CONFIG['deslocamento_padrao'] + 12
-        else:
-            deslocamento_y = CONFIG['deslocamento_capa_28x56']
+        # ===== RECUOS PADRÃO POR FORMATO (em cm) =====
+        recuos_cm = {
+            "Capas_28X56": 0.5,   # 5 mm
+            "Capas_32X60": 0.4,   # 4 mm
+            "Capas_32X66": 0.4,   # 4 mm
+            "Capas_32X48": 0.4    # 4 mm
+        }
+
+        # Obtém o recuo para o formato desejado (fallback 0.4 se não mapeado)
+        recuo_topo_cm = recuos_cm.get(filacolor, 0.4)
+        recuo_topo_pt = recuo_topo_cm * 28.3465
+
+        # Altura estimada da caixa de texto da marca
+        altura_caixa_texto = 40
+
+        # ===== MAPEAMENTO DOS FORMATOS (largura_cm, altura_cm) =====
+        formatos_cm = {
+            "Capas_28X56": (56, 28),
+            "Capas_32X60": (60, 32),
+            "Capas_32X66": (66, 32),
+            "Capas_32X48": (48, 32)
+        }
+
+        # Tolerância para considerar formato já pronto (em cm)
+        tolerancia_cm = 0.5
+
+        novo_doc = fitz.open()
 
         for pagina in doc:
-            largura, altura = pagina.rect.width, pagina.rect.height
+            largura_pt = pagina.rect.width
+            altura_pt = pagina.rect.height
+            largura_cm = largura_pt / 28.3465
+            altura_cm = altura_pt / 28.3465
 
-            posicao_topo = fitz.Rect(
-                50 + CONFIG['deslocamento_x'], 
-                30 + deslocamento_y,  
-                largura - 50 + CONFIG['deslocamento_x'], 
-                70 + deslocamento_y
-            )
+            # ===== VERIFICA SE A PÁGINA JÁ ESTÁ EM UM FORMATO CONHECIDO =====
+            formato_atual = None
+            for nome, (larg_ref, alt_ref) in formatos_cm.items():
+                if (abs(largura_cm - larg_ref) <= tolerancia_cm and
+                    abs(altura_cm - alt_ref) <= tolerancia_cm):
+                    formato_atual = nome
+                    break
 
-            texto_marca = f"{nome_arquivo} - {identific}"
-            pagina.insert_textbox(
-                posicao_topo, texto_marca,
-                fontsize=CONFIG['tamanho_fonte'],
-                color=cor_marca,
-                fontname=CONFIG['fonte'],
-                align=1
-            )
-            if filacolor == "Capas_28X56":                
-                # CORTAR 4CM DA PARTE DE CIMA DO PDF
-                corte_cm = 4
-                corte_pontos = corte_cm * 28.3465  # Converter cm para pontos (1 cm = 28.3465 pontos)
-                
-                # Definir nova área da página (cortar a parte superior)
-                novo_retangulo = fitz.Rect(
-                    0,                      # x0 (esquerda)
-                    corte_pontos,           # y0 (topo - cortando 4cm)
-                    largura,                # x1 (direita)
-                    altura                  # y1 (base)
+            if formato_atual is not None:
+                # ========== CASO 1: PDF JÁ EM FORMATO FINAL ==========
+                nova_pagina = novo_doc.new_page(width=largura_pt, height=altura_pt)
+                nova_pagina.show_pdf_page(fitz.Rect(0, 0, largura_pt, altura_pt),
+                                          doc, pagina.number)
+
+                # Se for Capas_28X56 e a página não estiver já em 56x28, cortar para 56x28
+                if filacolor == "Capas_28X56" and formato_atual != "Capas_28X56":
+                    corte_lateral_cm = 2
+                    corte_topo_cm = 4
+                    corte_lateral_pt = corte_lateral_cm * 28.3465
+                    corte_topo_pt = corte_topo_cm * 28.3465
+                    crop_rect = fitz.Rect(corte_lateral_pt, corte_topo_pt,
+                                          largura_pt - corte_lateral_pt, altura_pt)
+                    nova_pagina.set_cropbox(crop_rect)
+
+                # Área visível após o corte (ou página inteira)
+                visivel = nova_pagina.rect
+
+                # Posição da marca: recuo padrão do topo da área visível
+                x_marca = visivel.x0 + 50 + CONFIG.get('deslocamento_x', 0)
+                largura_marca = visivel.width - 100
+                y0_marca = visivel.y0 + recuo_topo_pt
+                y1_marca = y0_marca + altura_caixa_texto
+
+                posicao_marca = fitz.Rect(x_marca, y0_marca, x_marca + largura_marca, y1_marca)
+                nova_pagina.insert_textbox(
+                    posicao_marca,
+                    f"{nome_arquivo} - {identific}",
+                    fontsize=CONFIG['tamanho_fonte'],
+                    color=cor_marca,
+                    fontname=CONFIG['fonte'],
+                    align=1
                 )
-                
-                # Aplicar o corte definindo o cropbox
-                pagina.set_cropbox(novo_retangulo)
 
+            else:
+                # ========== CASO 2: PDF EM FORMATO ORIGINAL ==========
+                if filacolor in formatos_cm:
+                    largura_dest_cm, altura_dest_cm = formatos_cm[filacolor]
+                else:
+                    largura_dest_cm, altura_dest_cm = 60, 32  # fallback
+
+                largura_dest_pt = largura_dest_cm * 28.3465
+                altura_dest_pt = altura_dest_cm * 28.3465
+
+                nova_pagina = novo_doc.new_page(width=largura_dest_pt, height=altura_dest_pt)
+
+                # Conteúdo original centralizado na parte inferior
+                x0 = (largura_dest_pt - largura_pt) / 2
+                y0 = altura_dest_pt - altura_pt
+                ret_arte = fitz.Rect(x0, y0, x0 + largura_pt, y0 + altura_pt)
+                nova_pagina.show_pdf_page(ret_arte, doc, pagina.number)
+
+                # Marca d'água no topo da nova página, usando o mesmo recuo padrão
+                x_marca = 50 + CONFIG.get('deslocamento_x', 0)
+                largura_marca = largura_dest_pt - 100
+                y0_marca = recuo_topo_pt
+                y1_marca = y0_marca + altura_caixa_texto
+
+                posicao_marca = fitz.Rect(x_marca, y0_marca, x_marca + largura_marca, y1_marca)
+                nova_pagina.insert_textbox(
+                    posicao_marca,
+                    f"{nome_arquivo} - {identific}",
+                    fontsize=CONFIG['tamanho_fonte'],
+                    color=cor_marca,
+                    fontname=CONFIG['fonte'],
+                    align=1
+                )
+
+        # Salva o documento final
         novo_caminho = pdf_path.replace(".pdf", "_marcado.pdf")
-        doc.save(novo_caminho)
+        novo_doc.save(novo_caminho)
+        novo_doc.close()
         doc.close()
         return novo_caminho
 
@@ -5072,6 +5335,7 @@ class HistoricoTab(ttk.Frame):
         for row in self.dados:
             self.tree.insert("", tk.END, values=row)
 if __name__ == "__main__":
+    
     logging.basicConfig(
         filename='processamento_capas.log',
         level=logging.INFO,
