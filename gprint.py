@@ -1562,6 +1562,7 @@ class Application:
     def setup_ui(self):
         self.root.title("Sistema de Processamento de Arquivos")
         self.root.geometry("900x700")
+        self.root.state('zoomed')
         self.center_window()
         
         self.criar_menu_superior()
