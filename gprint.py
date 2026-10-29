@@ -32,7 +32,235 @@ from openpyxl import Workbook, load_workbook
 import uuid
 from openpyxl.utils import get_column_letter
 import random
-import ast
+
+
+# ============================================================================
+# GPRINT - COORDENACAO DO HISTORICO (SEM ALTERAR MONTAGEM OU ENVIO LPR)
+# ============================================================================
+import socket
+from contextlib import contextmanager
+
+# Na rede, as estacoes utilizam o mesmo arquivo .lock que o GPrint original.
+# Uma estacao aguarda a outra concluir. NUNCA removemos automaticamente uma
+# trava que pareca antiga: outra estacao pode estar ativa ou desconectada.
+GPRINT_ESPERA_TRAVA_SEGUNDOS = 5
+GPRINT_AVISO_INTERVALO_SEGUNDOS = 120
+_GPRINT_ULTIMOS_AVISOS = {}
+_GPRINT_AVISOS_MUTEX = threading.Lock()
+
+
+class GPrintBancoIndisponivel(Exception):
+    """O compartilhamento de producao ou o arquivo central esta inacessivel."""
+
+
+class GPrintBancoOcupado(Exception):
+    """O lock do banco continua ocupado apos a espera configurada."""
+
+
+def gprint_checar_banco_central(caminho):
+    """Nao cria nem altera o arquivo central caso ele tenha desaparecido."""
+    pasta = os.path.dirname(caminho)
+    if not os.path.isdir(pasta):
+        raise GPrintBancoIndisponivel("Diretório de produção/LOGS inacessível")
+    if not os.path.isfile(caminho):
+        raise GPrintBancoIndisponivel("Arquivo impressoes.db não encontrado")
+
+
+def gprint_avisar_operador(root, tipo, detalhe=""):
+    """MessageBox agendada na thread Tk, com limitacao de repeticoes."""
+    agora = time.monotonic()
+    with _GPRINT_AVISOS_MUTEX:
+        anterior = _GPRINT_ULTIMOS_AVISOS.get(tipo, -1e10)
+        if agora - anterior < GPRINT_AVISO_INTERVALO_SEGUNDOS:
+            return
+        _GPRINT_ULTIMOS_AVISOS[tipo] = agora
+
+    if tipo == "rede":
+        titulo = "GPrint - BANCO DE DADOS NÃO ENCONTRADO"
+        mensagem = (
+            "O banco de dados central não foi encontrado ou a rede está indisponível.\n\n"
+            "Verifique se o diretório 'produção' está online e acessível.\n"
+            "INFORME O GUILHERME sobre o ocorrido.\n\n"
+            "Os registros serão salvos localmente, se possível, e NÃO aparecerão "
+            "no histórico central até serem conciliados."
+        )
+    elif tipo == "trava":
+        titulo = "GPrint - BANCO DE DADOS OCUPADO"
+        mensagem = (
+            "Outra estação pode estar gravando no banco, ou o arquivo .lock "
+            "pode ter ficado preso.\n\n"
+            "INFORME O GUILHERME. Não apague o .lock sem confirmar que "
+            "nenhuma estação esteja usando o banco.\n\n"
+            "O registro será tentado no banco local de emergência."
+        )
+    elif tipo == "local":
+        titulo = "GPrint - REGISTRO NAO SALVO"
+        mensagem = (
+            "Não foi possível salvar o registro nem na rede nem neste computador.\n"
+            "INFORME O GUILHERME IMEDIATAMENTE."
+        )
+    else:
+        titulo = "GPrint - FALHA NO HISTORICO"
+        mensagem = (
+            "Falha ao acessar o banco central. Verifique o diretório 'produção' "
+            "e INFORME O GUILHERME.\n\n"
+            "O registro será tentado no banco local de emergência."
+        )
+    if detalhe:
+        mensagem += "\n\nDetalhe técnico: " + str(detalhe)[:260]
+
+    def mostrar():
+        try:
+            messagebox.showwarning(titulo, mensagem, parent=root)
+        except Exception:
+            logging.exception("Erro ao exibir aviso de banco de dados")
+
+    # Chamada vem frequentemente de uma thread de processamento; never
+    # chamar showwarning diretamente nela.
+    try:
+        if root is not None:
+            root.after(0, mostrar)
+        else:
+            logging.error("%s: %s", titulo, mensagem)
+    except Exception:
+        logging.exception("Falha ao agendar aviso de banco de dados")
+
+
+@contextmanager
+def gprint_lock_banco(caminho_lock, timeout=GPRINT_ESPERA_TRAVA_SEGUNDOS):
+    """Exclusao mutua entre estacoes com verificacao de propriedade do lock."""
+    identidade = f"{socket.gethostname()}|{os.getpid()}|{uuid.uuid4().hex}"
+    inicio = time.monotonic()
+    while True:
+        try:
+            fd = os.open(caminho_lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(identidade)
+                    f.flush()
+            except Exception:
+                # Criou arquivo mas nao conseguiu escrever; tenta desfazer.
+                try:
+                    os.remove(caminho_lock)
+                except OSError:
+                    pass
+                raise
+            break
+        except FileExistsError:
+            if time.monotonic() - inicio >= timeout:
+                raise GPrintBancoOcupado(
+                    f"Tempo esgotado ({timeout}s) aguardando: {caminho_lock}"
+                )
+            time.sleep(random.uniform(0.12, 0.32))
+
+    try:
+        yield
+    finally:
+        # Evita remover um lock de outro processo caso a rede tenha oscilado.
+        try:
+            with open(caminho_lock, "r", encoding="utf-8") as f:
+                atual = f.read()
+            if atual == identidade:
+                os.remove(caminho_lock)
+            else:
+                logging.error("Nao removi lock de outro proprietario: %s", caminho_lock)
+        except FileNotFoundError:
+            logging.warning("Lock desapareceu durante a gravacao: %s", caminho_lock)
+        except OSError as e:
+            logging.error("Nao consegui liberar lock %s: %s", caminho_lock, e)
+
+
+def gprint_gravar_evento_em_sqlite(caminho_db, dados, criar_banco=False):
+    """Mesma tabela/campos/quantidades do GPrint original; escrita serializada."""
+    if not criar_banco:
+        gprint_checar_banco_central(caminho_db)
+    else:
+        os.makedirs(os.path.dirname(caminho_db), exist_ok=True)
+
+    with gprint_lock_banco(caminho_db + ".lock"):
+        conn = None
+        try:
+            # timeout adicional para locks internos do SQLite.
+            conn = sqlite3.connect(caminho_db, timeout=10)
+            conn.execute("PRAGMA busy_timeout=10000")
+            # IMPORTANTE: nao ativar WAL no banco de rede. Se o banco antigo
+            # ja estiver em WAL, sua migracao exige manutencao supervisionada.
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    data_hora TEXT, lote TEXT, pilha TEXT, arquivo TEXT,
+                    maquina TEXT, ip TEXT, formato TEXT, modo TEXT,
+                    quantidade INTEGER, status TEXT, erro TEXT, copia TEXT,
+                    usuario TEXT, montagem_ok INTEGER DEFAULT 0,
+                    envio_ok INTEGER DEFAULT 0
+                )
+            """)
+            valores = (
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                dados.get("lote", ""), dados.get("pilha", ""),
+                dados.get("arquivo", ""), dados.get("maquina", ""),
+                dados.get("ip", ""), dados.get("formato", ""),
+                dados.get("modo", ""), dados.get("quantidade", 0),
+                dados.get("status", ""), dados.get("erro", ""),
+                dados.get("copia", ""), dados.get("usuario", ""),
+                dados.get("montagem_ok", 0), dados.get("envio_ok", 0),
+            )
+            conn.execute("""
+                INSERT INTO logs
+                (data_hora, lote, pilha, arquivo, maquina, ip, formato, modo,
+                 quantidade, status, erro, copia, usuario, montagem_ok, envio_ok)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, valores)
+            conn.commit()
+            return True
+        except Exception:
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+            raise
+        finally:
+            if conn is not None:
+                conn.close()
+
+
+def gprint_registrar_log_seguro(dados, central, local, root, emitir_log):
+    """Grava na rede; se falhar, salva localmente e avisa o operador."""
+    try:
+        gprint_gravar_evento_em_sqlite(central, dados, criar_banco=False)
+        return True
+    except GPrintBancoIndisponivel as e:
+        tipo, erro_central = "rede", str(e)
+    except GPrintBancoOcupado as e:
+        tipo, erro_central = "trava", str(e)
+    except Exception as e:
+        tipo, erro_central = "erro", str(e)
+
+    emitir_log(f"ATENCAO: historico central indisponivel: {erro_central}")
+    gprint_avisar_operador(root, tipo, erro_central)
+    try:
+        gprint_gravar_evento_em_sqlite(local, dados, criar_banco=True)
+        emitir_log(
+            "ATENCAO: registro salvo SOMENTE no banco local. "
+            "Informar Guilherme para conciliacao manual."
+        )
+        return True
+    except Exception as erro_local:
+        emitir_log(f"ERRO CRITICO: registro nao salvo em nenhum banco: {erro_local}")
+        gprint_avisar_operador(root, "local", str(erro_local))
+        return False
+
+
+def gprint_verificar_banco_no_inicio(caminho, root):
+    """Checagem inicial em thread, sem bloquear a abertura da interface."""
+    try:
+        gprint_checar_banco_central(caminho)
+    except (OSError, GPrintBancoIndisponivel) as e:
+        gprint_avisar_operador(root, "rede", str(e))
+
+# ============================================================================
 
 DATA_LIMITE = "29/07/2027"
 PASTA_BASE = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\UICLAP\LOTES"
@@ -84,114 +312,22 @@ DEFAULT_CONFIG = {
         # NOVO
     "sangria_padrao_miolo": 3
 }
+def obter_sangria_padrao_miolo():
+    """Retorna o ajuste atual de sangria, em milímetros, para uma execução de miolo.
 
-# ============================================================================
-# REGISTROS DE PRODUÇÃO — CAMADA COMPARTILHADA (REVISÃO SEGURA)
-# Mantém a tabela existente e NÃO altera o modo de journal do banco produtivo.
-# Uma futura migração para API + PostgreSQL deverá ser feita separadamente.
-# ============================================================================
-class RegistroLogsSQLite:
-    COLUNAS = (
-        "data_hora", "lote", "pilha", "arquivo", "maquina", "ip", "formato",
-        "modo", "quantidade", "status", "erro", "copia", "usuario",
-        "montagem_ok", "envio_ok"
-    )
+    O valor é capturado uma vez no começo do lote. Os algoritmos de imposição
+    permanecem inalterados, inclusive com o valor original de 3 mm por padrão.
+    """
+    valor = CONFIG.get("sangria_padrao_miolo", DEFAULT_CONFIG["sangria_padrao_miolo"])
+    try:
+        valor = float(str(valor).replace(",", "."))
+        if not math.isfinite(valor) or not (0 <= valor <= 20):
+            raise ValueError("Sangria fora da faixa de 0 a 20 mm")
+        return valor
+    except (ValueError, TypeError):
+        logging.warning("Sangria inválida nas configurações (%r). Usando 3 mm.", valor)
+        return float(DEFAULT_CONFIG["sangria_padrao_miolo"])
 
-    @staticmethod
-    def _adquirir_trava(caminho, timeout=5):
-        inicio = time.monotonic()
-        while time.monotonic() - inicio < timeout:
-            try:
-                fd = os.open(caminho, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                with os.fdopen(fd, "w", encoding="ascii") as arquivo:
-                    arquivo.write(str(os.getpid()))
-                return True
-            except FileExistsError:
-                time.sleep(random.uniform(0.1, 0.25))
-            except OSError:
-                return False
-        return False
-
-    @classmethod
-    def _gravar(cls, caminho_db, dados):
-        pasta = os.path.dirname(caminho_db)
-        if pasta and not os.path.isdir(pasta):
-            # Evitar criar acidentalmente pastas na rede ao perder conexão.
-            if caminho_db.startswith("\\\\"):
-                raise OSError("Diretório do banco de rede indisponível")
-            os.makedirs(pasta, exist_ok=True)
-        lock_file = caminho_db + ".lock"
-        if not cls._adquirir_trava(lock_file):
-            raise TimeoutError("Tempo esgotado aguardando trava de escrita")
-        try:
-            # Context manager + finally para SEMPRE fechar conexão e liberar a trava.
-            conexao = sqlite3.connect(caminho_db, timeout=10)
-            try:
-                # Não configurar WAL por aqui: um WAL já existente requer migração
-                # coordenada quando o banco está hospedado em compartilhamento SMB.
-                conexao.execute("PRAGMA busy_timeout=10000")
-                conexao.execute("""
-                    CREATE TABLE IF NOT EXISTS logs (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        data_hora TEXT, lote TEXT, pilha TEXT, arquivo TEXT,
-                        maquina TEXT, ip TEXT, formato TEXT, modo TEXT,
-                        quantidade INTEGER, status TEXT, erro TEXT, copia TEXT,
-                        usuario TEXT, montagem_ok INTEGER DEFAULT 0,
-                        envio_ok INTEGER DEFAULT 0
-                    )
-                """)
-                colunas_sql = ", ".join(cls.COLUNAS)
-                placeholders = ", ".join("?" for _ in cls.COLUNAS)
-                valores = tuple(
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S") if c == "data_hora"
-                    else dados.get(c, 0 if c in ("quantidade", "montagem_ok", "envio_ok") else "")
-                    for c in cls.COLUNAS
-                )
-                conexao.execute(
-                    f"INSERT INTO logs ({colunas_sql}) VALUES ({placeholders})", valores
-                )
-                conexao.commit()
-                return True
-            except Exception:
-                conexao.rollback()
-                raise
-            finally:
-                conexao.close()
-        finally:
-            try:
-                os.remove(lock_file)
-            except OSError:
-                logging.exception("Não foi possível remover a trava %s", lock_file)
-
-    @classmethod
-    def registrar(cls, caminho_rede, caminho_local, dados, avisar):
-        try:
-            return cls._gravar(caminho_rede, dados)
-        except Exception as erro_rede:
-            avisar(f"⚠️ Histórico central indisponível: {erro_rede}")
-        try:
-            cls._gravar(caminho_local, dados)
-            avisar("⚠️ Registro salvo SOMENTE no banco local. Requer conciliação manual.")
-            return True
-        except Exception as erro_local:
-            avisar(f"❌ FALHA DE AUDITORIA: registro não salvo nem na rede nem localmente: {erro_local}")
-            logging.exception("Falha de persistência do histórico")
-            return False
-
-
-def interpretar_cor_configuracao(valor, padrao):
-    """Aceita lista JSON ou tupla legada em string, sem executar código."""
-    if isinstance(valor, str):
-        try:
-            valor = ast.literal_eval(valor)
-        except (ValueError, SyntaxError, MemoryError, RecursionError):
-            return padrao
-    if not isinstance(valor, (tuple, list)) or len(valor) != 3:
-        return padrao
-    if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
-               and math.isfinite(v) and 0 <= v <= 1 for v in valor):
-        return padrao
-    return tuple(float(v) for v in valor)
 
 class ConfigTab(ttk.Frame):
     def __init__(self, parent, app):
@@ -238,10 +374,10 @@ class ConfigTab(ttk.Frame):
         miolo_frame.columnconfigure(1, weight=1)
 
         ttk.Label(miolo_frame, text="Sangria Padrão (mm):", width=25).grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        self.sangria_padrao_var = tk.IntVar(value=3)
+        self.sangria_padrao_var = tk.DoubleVar(value=3.0)
         self.sangria_padrao_spin = ttk.Spinbox(
             miolo_frame,
-            from_=0, to=20, increment=1,
+            from_=0, to=20, increment=0.5,
             width=10,
             textvariable=self.sangria_padrao_var,
             bootstyle=PRIMARY
@@ -427,10 +563,13 @@ class ConfigTab(ttk.Frame):
             CONFIG['deslocamento_capa_28x56'] = int(self.deslocamento_capa_spin.get())
             CONFIG['deslocamento_x'] = float(self.deslocamento_x_spin.get())
 
-            # NOVO
-            CONFIG['sangria_padrao_miolo'] = float(self.sangria_padrao_spin.get())
+            # Sangria de miolo: salva em milímetros, inclusive valores decimais.
+            sangria_texto = self.sangria_padrao_spin.get().strip().replace(",", ".")
+            nova_sangria = float(sangria_texto)
+            if not math.isfinite(nova_sangria) or not (0 <= nova_sangria <= 20):
+                raise ValueError("Sangria deve estar entre 0 e 20 mm")
+            CONFIG['sangria_padrao_miolo'] = nova_sangria
 
-            
             if salvar_configuracoes(CONFIG):
                 messagebox.showinfo("Sucesso", "Configurações salvas com sucesso!")
             else:
@@ -468,11 +607,36 @@ class MioloTab(ttk.Frame):
         self.atualizar_log_queue()
         logging.info("Sistema iniciado")
 
+    # ------------------------------------------------------------
+    # Mecanismo de trava para escrita concorrente no SQLite
+    # ------------------------------------------------------------
+    def _adquirir_trava(self, caminho_trava, timeout=5):
+        inicio = time.time()
+        while True:
+            try:
+                fd = os.open(caminho_trava, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                os.close(fd)
+                return True
+            except FileExistsError:
+                if time.time() - inicio > timeout:
+                    return False
+                time.sleep(random.uniform(0.1, 0.4))
+            except Exception:
+                return False
+
+    def _liberar_trava(self, caminho_trava):
+        try:
+            os.remove(caminho_trava)
+        except:
+            pass
+
+    # ------------------------------------------------------------
+    # REGISTRO DE LOG NO BANCO SQLite (sem total_paginas)
+    # ------------------------------------------------------------
     def registrar_log_sqlite(self, dados):
-        """Registra na base central; usa fallback local com aviso se necessário."""
-        return RegistroLogsSQLite.registrar(
-            self.log_db_path, self.log_db_local_path, dados,
-            lambda mensagem: self.log(mensagem, "ERRO" if mensagem.startswith("❌") else "INFO")
+        return gprint_registrar_log_seguro(
+            dados, self.log_db_path, self.log_db_local_path,
+            self.app.root, lambda msg: self.log(msg, "ERRO" if "CRITICO" in msg else "INFO")
         )
 
     # ------------------------------------------------------------
@@ -838,15 +1002,24 @@ class MioloTab(ttk.Frame):
         desktop = os.path.join(os.path.expanduser("~"), "Desktop")
         output_dir = os.path.join(desktop, "PDFs_PROCESSADOS")
         os.makedirs(output_dir, exist_ok=True)
-        
+        # Cada execução fica em uma pasta independente (evita sobrescrever
+        # PDFs de outra pilha/execução e mantém a raiz organizada).
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pasta_lote = os.path.join(output_dir, f"MIOLO_{timestamp}_{uuid.uuid4().hex[:6]}")
+        os.makedirs(pasta_lote, exist_ok=False)
+        # Congela o parâmetro no começo do lote: mudar a configuração durante
+        # a execução não produz PDFs com sangrias diferentes na mesma pilha.
+        sangria_mm = obter_sangria_padrao_miolo()
+        self.log(f"📐 Sangria padrão de miolo nesta execução: {sangria_mm:g} mm", "INFO")
+
         success_count = 0
         error_count = 0
         envio_count = 0
         envio_erro_count = 0
         salvos_count = 0
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        sessao_temp = os.path.join(PASTA_TRABALHO, f"sessao_{timestamp}")
-        os.makedirs(sessao_temp, exist_ok=True)
+        # Arquivos de entrada ficam no TEMP do usuário, jamais na pasta dos
+        # PDFs finalizados. O nome exclusivo também evita colisão de sessões.
+        sessao_temp = tempfile.mkdtemp(prefix="sessao_miolo_", dir=PASTA_TRABALHO)
 
         impressora_selecionada = self.impressora_var.get()
         ip_extraido = impressora_selecionada.split(' - ')[1].strip() if ' - ' in impressora_selecionada else impressora_selecionada
@@ -872,7 +1045,7 @@ class MioloTab(ttk.Frame):
         self.log(f"📄 Pilha (arquivo TXT): {pilha}", "INFO")
         self.log(f"📠 Impressora: {impressora_selecionada}", "INFO")
         self.log(f"📠 IP: {ip_extraido}", "INFO")
-        self.log(f"📁 Pasta de saída: {output_dir}", "INFO")
+        self.log(f"📁 Pasta de saída: {pasta_lote}", "INFO")
         self.log(f"{'='*50}", "INFO")
 
         # Pasta para salvamento (envio desligado)
@@ -891,164 +1064,84 @@ class MioloTab(ttk.Frame):
                 nome_pasta_salvos = f"PDFs_SALVOS_{timestamp}"
         
         nome_pasta_salvos = re.sub(r'[<>:"/\\|?*]', '_', nome_pasta_salvos)
-        pasta_salvos = os.path.join(output_dir, nome_pasta_salvos)
-        os.makedirs(pasta_salvos, exist_ok=True)
-        self.log(f"📁 Pasta para salvamento (envio desligado): {pasta_salvos}", "INFO")
+        # A pasta COPIAS_SALVAS só é criada se houver salvamento manual.
+        # No modo de envio automático não cria diretórios vazios.
+        pasta_salvos = os.path.join(pasta_lote, "COPIAS_SALVAS")
+        self.log(f"📁 PDFs finalizados desta pilha ({nome_pasta_salvos}): {pasta_lote}", "INFO")
 
-        for i, p in enumerate(self.processos):
-            if not self.processando:
-                self.log("⚠️ Processamento cancelado pelo usuário", "INFO")
-                break
+        try:
+            for i, p in enumerate(self.processos):
+                if not self.processando:
+                    self.log("⚠️ Processamento cancelado pelo usuário", "INFO")
+                    break
                 
-            try:
-                self.after(0, lambda atual=i, total=len(self.processos): (
-                    self.progress.configure(value=atual),
-                    self.progress_label.config(text=f"{atual+1}/{total}")
-                ))
+                try:
+                    self.progress['value'] = i
+                    self.progress_label.config(text=f"{i+1}/{len(self.processos)}")
                 
-                self.log(f"\n--- Processando L{p['LINHA']}: {p['ARQUIVO']} ---", "INFO")
-                self.log(f"📄 Formato: {p['FORMATO']}", "INFO")
-                self.log(f"🔧 Modo: {p['MODO']}", "INFO")
-                self.log(f"📊 QTD para envio: {p['QTD']}, QTD Total: {p['QTD_total']}", "INFO")
+                    self.log(f"\n--- Processando L{p['LINHA']}: {p['ARQUIVO']} ---", "INFO")
+                    self.log(f"📄 Formato: {p['FORMATO']}", "INFO")
+                    self.log(f"🔧 Modo: {p['MODO']}", "INFO")
+                    self.log(f"📊 QTD para envio: {p['QTD']}, QTD Total: {p['QTD_total']}", "INFO")
                 
-                origem = os.path.normpath(os.path.join(p["CAMINHO"], p["ARQUIVO"]))
-                if not os.path.exists(origem):
-                    self.log(f"Arquivo não encontrado: {origem}", "ERRO")
-                    error_count += 1
-                    continue
+                    origem = os.path.normpath(os.path.join(p["CAMINHO"], p["ARQUIVO"]))
+                    if not os.path.exists(origem):
+                        self.log(f"Arquivo não encontrado: {origem}", "ERRO")
+                        error_count += 1
+                        continue
                 
-                local = os.path.join(sessao_temp, f"L{p['LINHA']}_{p['ARQUIVO']}")
-                shutil.copy2(origem, local)
-                self.log(f"📋 Arquivo copiado para temporário", "INFO")
+                    local = os.path.join(sessao_temp, f"L{p['LINHA']}_{p['ARQUIVO']}")
+                    shutil.copy2(origem, local)
+                    self.log(f"📋 Arquivo copiado para temporário", "INFO")
                 
-                output_path = os.path.join(output_dir, f"{p['NOMEFIC']}.pdf")
-                w_pt, h_pt = p["LARGURA_MM"] * MM, p["ALTURA_MM"] * MM
+                    output_path = os.path.join(pasta_lote, f"{p['NOMEFIC']}.pdf")
+                    w_pt, h_pt = p["LARGURA_MM"] * MM, p["ALTURA_MM"] * MM
                 
-                self.log(f"⚙️ Gerando PDF montado...", "INFO")
+                    self.log(f"⚙️ Gerando PDF montado...", "INFO")
                 
-                if p["MODO"] == "dois_na_folha":
-                    dois_na_folha(local, output_path, w_pt, h_pt, espacamento_mm=p["ESPACAMENTO"])
-                elif p["MODO"] == "grampo":
-                    grampo(local, output_path, w_pt, h_pt)
-                elif p["MODO"] == "Corta_empilha":
-                    Corta_empilha(local, output_path, w_pt, h_pt, comprimir_entrada=self.comprimir_pdf_var.get())
-                elif p["MODO"] == "corta_empilha_rotacionado":
-                    corta_empilha_rotacionado(local, output_path, w_pt, h_pt, comprimir_entrada=self.comprimir_pdf_var.get())
-                elif p["MODO"] == "dois_na_folha_rotacionado":
-                    dois_na_folha_rotacionado(local, output_path, w_pt, h_pt, espacamento_mm=p["ESPACAMENTO"])
-                elif p["MODO"] == "um_na_folha_atexco":
-                    um_na_folha_atexco(local, output_path, w_pt, h_pt,comprimir_entrada=self.comprimir_pdf_var.get())
-                else:
-                    um_na_folha(local, output_path, w_pt, h_pt)
+                    if p["MODO"] == "dois_na_folha":
+                        dois_na_folha(local, output_path, w_pt, h_pt, espacamento_mm=p["ESPACAMENTO"], sangria_mm=sangria_mm)
+                    elif p["MODO"] == "grampo":
+                        grampo(local, output_path, w_pt, h_pt, sangria_mm=sangria_mm)
+                    elif p["MODO"] == "Corta_empilha":
+                        Corta_empilha(local, output_path, w_pt, h_pt, sangria_mm=sangria_mm, comprimir_entrada=self.comprimir_pdf_var.get())
+                    elif p["MODO"] == "corta_empilha_rotacionado":
+                        corta_empilha_rotacionado(local, output_path, w_pt, h_pt, sangria_mm=sangria_mm, comprimir_entrada=self.comprimir_pdf_var.get())
+                    elif p["MODO"] == "dois_na_folha_rotacionado":
+                        dois_na_folha_rotacionado(local, output_path, w_pt, h_pt, espacamento_mm=p["ESPACAMENTO"], sangria_mm=sangria_mm)
+                    elif p["MODO"] == "um_na_folha_atexco":
+                        um_na_folha_atexco(local, output_path, w_pt, h_pt, sangria_mm=sangria_mm, comprimir_entrada=self.comprimir_pdf_var.get())
+                    else:
+                        um_na_folha(local, output_path, w_pt, h_pt, sangria_mm=sangria_mm)
                 
-                self.log(f"✅ PDF gerado: {os.path.basename(output_path)}", "SUCESSO")
+                    self.log(f"✅ PDF gerado: {os.path.basename(output_path)}", "SUCESSO")
                 
-                # Quantidade de envios conforme o modo de montagem
-                if p["MODO"] == "dois_na_folha" or p["MODO"] == "um_na_folha_atexco" and p["QTD"] >= 10:
-                    qtd_envios = 1
-                    self.log(f"🔢 Modo 1 envio/: {p['QTD']} exemplares -> 1 envio", "INFO")
-                else:
-                    qtd_envios = p["QTD"]
-                    self.log(f"🔢 Modo {p['MODO']}: {p['QTD']} exemplares -> {qtd_envios} envios", "INFO")
+                    # Quantidade de envios conforme o modo de montagem
+                    if p["MODO"] == "dois_na_folha" or p["MODO"] == "um_na_folha_atexco" and p["QTD"] >= 10:
+                        qtd_envios = 1
+                        self.log(f"🔢 Modo 1 envio/: {p['QTD']} exemplares -> 1 envio", "INFO")
+                    else:
+                        qtd_envios = p["QTD"]
+                        self.log(f"🔢 Modo {p['MODO']}: {p['QTD']} exemplares -> {qtd_envios} envios", "INFO")
 
-                # Forçar apenas uma cópia caso a opção esteja marcada
-                if self.enviar_uma_copia_var.get():
-                    self.log("📌 Opção 'Enviar apenas uma cópia' ativada. Enviando 1 cópia.", "INFO")
-                    qtd_envios = 1
+                    # Forçar apenas uma cópia caso a opção esteja marcada
+                    if self.enviar_uma_copia_var.get():
+                        self.log("📌 Opção 'Enviar apenas uma cópia' ativada. Enviando 1 cópia.", "INFO")
+                        qtd_envios = 1
                     
-                formato_base = p["FORMATO"]
+                    formato_base = p["FORMATO"]
                
 
-                if "RICOH" in impressora_selecionada:
-                    job_name = f"{p['IDENTIFIC']}_{p['NOMEFIC']}"
-                elif "BALTORO" in impressora_selecionada:
-                    job_name = f"{p['NOMEFIC']}_{p['IDENTIFIC']}"
-                else:
-                    job_name = p["NOMEFIC"]
-                
-
-                # ===== REGISTRO DE MONTAGEM COM SUCESSO =====
-                dados_montagem = {
-                    'lote': lote,
-                    'pilha': pilha,
-                    'arquivo': p['NOMEFIC'],
-                    'maquina': impressora_selecionada,
-                    'ip': ip_extraido,
-                    'formato': p['FORMATO'],
-                    'modo': p['MODO'],
-                    'quantidade': qtd_envios,
-                    'status': 'Montagem OK',
-                    'erro': '',
-                    'copia': '0/0',
-                    'usuario': usuario,
-                    'montagem_ok': 1,
-                    'envio_ok': 0
-                }
-                self.registrar_log_sqlite(dados_montagem)
-                
-                # Loop de envios (ou salvamentos)
-                for envio_idx in range(qtd_envios):
-                    if not self.processando:
-                        self.log("⚠️ Cancelando envios...", "INFO")
-                        break
-
-                    copia_num = envio_idx + 1
-
-                    # Aguarda arquivo liberar
-                    timeout_arquivo = 10
-                    inicio = time.time()
-                    while True:
-                        try:
-                            with open(output_path, "rb") as f:
-                                f.read(1)
-                            break
-                        except Exception:
-                            if time.time() - inicio > timeout_arquivo:
-                                raise Exception("Arquivo não liberou para leitura")
-                            time.sleep(0.5)
-
-                    if self.impressao_auto_var.get():
-                        self.log("🖨️ Impressão automática ativada", "INFO")
-                        sucesso = self.enviar_por_lpr(
-                            output_path,
-                            ip_extraido,
-                            formato_base,
-                            job_name,
-                            copia_num,
-                            qtd_envios
-                        )
-                        if sucesso:
-                            envio_count += 1
-                            status = "Enviado"
-                            erro = ""
-                            envio_ok_val = 1
-                        else:
-                            envio_erro_count += 1
-                            status = "Falha no envio"
-                            erro = "Falha no envio via LPR"
-                            envio_ok_val = 0
+                    if "RICOH" in impressora_selecionada:
+                        job_name = f"{p['IDENTIFIC']}_{p['NOMEFIC']}"
+                    elif "BALTORO" in impressora_selecionada:
+                        job_name = f"{p['NOMEFIC']}_{p['IDENTIFIC']}"
                     else:
-                        # MODO DESLIGADO: SALVA O PDF
-                        self.log(f"💾 Envio desligado. Salvando cópia {copia_num}/{qtd_envios} em {pasta_salvos}", "INFO")
-                        nome_base_pdf = os.path.splitext(os.path.basename(output_path))[0]
-                        nome_copia = f"{nome_base_pdf}_c{copia_num}.pdf"
-                        destino = os.path.join(pasta_salvos, nome_copia)
-                        try:
-                            shutil.copy2(output_path, destino)
-                            self.log(f"✅ PDF salvo: {destino}", "SUCESSO")
-                            salvos_count += 1
-                            sucesso = True
-                            status = "Salvo"
-                            erro = ""
-                        except Exception as e:
-                            self.log(f"❌ Erro ao salvar: {e}", "ERRO")
-                            sucesso = False
-                            status = "Falha ao salvar"
-                            erro = str(e)
-                        envio_ok_val = 0   # salvar não conta como envio real
+                        job_name = p["NOMEFIC"]
+                
 
-                    # ===== REGISTRO DE ENVIO/SALVAMENTO =====
-                    dados_log = {
+                    # ===== REGISTRO DE MONTAGEM COM SUCESSO =====
+                    dados_montagem = {
                         'lote': lote,
                         'pilha': pilha,
                         'arquivo': p['NOMEFIC'],
@@ -1057,44 +1150,132 @@ class MioloTab(ttk.Frame):
                         'formato': p['FORMATO'],
                         'modo': p['MODO'],
                         'quantidade': qtd_envios,
-                        'status': status,
-                        'erro': erro,
-                        'copia': f"{copia_num}/{qtd_envios}",
+                        'status': 'Montagem OK',
+                        'erro': '',
+                        'copia': '0/0',
+                        'usuario': usuario,
+                        'montagem_ok': 1,
+                        'envio_ok': 0
+                    }
+                    self.registrar_log_sqlite(dados_montagem)
+                
+                    # Loop de envios (ou salvamentos)
+                    for envio_idx in range(qtd_envios):
+                        if not self.processando:
+                            self.log("⚠️ Cancelando envios...", "INFO")
+                            break
+
+                        copia_num = envio_idx + 1
+
+                        # Aguarda arquivo liberar
+                        timeout_arquivo = 10
+                        inicio = time.time()
+                        while True:
+                            try:
+                                with open(output_path, "rb") as f:
+                                    f.read(1)
+                                break
+                            except Exception:
+                                if time.time() - inicio > timeout_arquivo:
+                                    raise Exception("Arquivo não liberou para leitura")
+                                time.sleep(0.5)
+
+                        if self.impressao_auto_var.get():
+                            self.log("🖨️ Impressão automática ativada", "INFO")
+                            sucesso = self.enviar_por_lpr(
+                                output_path,
+                                ip_extraido,
+                                formato_base,
+                                job_name,
+                                copia_num,
+                                qtd_envios
+                            )
+                            if sucesso:
+                                envio_count += 1
+                                status = "Enviado"
+                                erro = ""
+                                envio_ok_val = 1
+                            else:
+                                envio_erro_count += 1
+                                status = "Falha no envio"
+                                erro = "Falha no envio via LPR"
+                                envio_ok_val = 0
+                        else:
+                            # MODO DESLIGADO: SALVA O PDF
+                            self.log(f"💾 Envio desligado. Salvando cópia {copia_num}/{qtd_envios} em {pasta_salvos}", "INFO")
+                            os.makedirs(pasta_salvos, exist_ok=True)
+                            nome_base_pdf = os.path.splitext(os.path.basename(output_path))[0]
+                            nome_copia = f"{nome_base_pdf}_c{copia_num}.pdf"
+                            destino = os.path.join(pasta_salvos, nome_copia)
+                            try:
+                                shutil.copy2(output_path, destino)
+                                self.log(f"✅ PDF salvo: {destino}", "SUCESSO")
+                                salvos_count += 1
+                                sucesso = True
+                                status = "Salvo"
+                                erro = ""
+                            except Exception as e:
+                                self.log(f"❌ Erro ao salvar: {e}", "ERRO")
+                                sucesso = False
+                                status = "Falha ao salvar"
+                                erro = str(e)
+                            envio_ok_val = 0   # salvar não conta como envio real
+
+                        # ===== REGISTRO DE ENVIO/SALVAMENTO =====
+                        dados_log = {
+                            'lote': lote,
+                            'pilha': pilha,
+                            'arquivo': p['NOMEFIC'],
+                            'maquina': impressora_selecionada,
+                            'ip': ip_extraido,
+                            'formato': p['FORMATO'],
+                            'modo': p['MODO'],
+                            'quantidade': qtd_envios,
+                            'status': status,
+                            'erro': erro,
+                            'copia': f"{copia_num}/{qtd_envios}",
+                            'usuario': usuario,
+                            'montagem_ok': 0,
+                            'envio_ok': envio_ok_val
+                        }
+                        self.registrar_log_sqlite(dados_log)
+
+                        time.sleep(1.5)
+                
+                    success_count += 1
+               
+                except Exception as e:
+                    self.log(f"❌ Erro: {str(e)}", "ERRO")
+                    error_count += 1
+                    logging.error(f"Erro detalhado: {e}", exc_info=True)
+                
+                    # ===== REGISTRO DE FALHA NA MONTAGEM =====
+                    dados_erro_montagem = {
+                        'lote': lote,
+                        'pilha': pilha,
+                        'arquivo': p.get('NOMEFIC', 'desconhecido'),
+                        'maquina': impressora_selecionada,
+                        'ip': ip_extraido,
+                        'formato': p.get('FORMATO', ''),
+                        'modo': p.get('MODO', ''),
+                        'quantidade': 0,
+                        'status': 'Montagem Erro',
+                        'erro': str(e),
+                        'copia': '0/0',
                         'usuario': usuario,
                         'montagem_ok': 0,
-                        'envio_ok': envio_ok_val
+                        'envio_ok': 0
                     }
-                    self.registrar_log_sqlite(dados_log)
+                    self.registrar_log_sqlite(dados_erro_montagem)
 
-                    time.sleep(1.5)
-                
-                success_count += 1
-               
-            except Exception as e:
-                self.log(f"❌ Erro: {str(e)}", "ERRO")
-                error_count += 1
-                logging.error(f"Erro detalhado: {e}", exc_info=True)
-                
-                # ===== REGISTRO DE FALHA NA MONTAGEM =====
-                dados_erro_montagem = {
-                    'lote': lote,
-                    'pilha': pilha,
-                    'arquivo': p.get('NOMEFIC', 'desconhecido'),
-                    'maquina': impressora_selecionada,
-                    'ip': ip_extraido,
-                    'formato': p.get('FORMATO', ''),
-                    'modo': p.get('MODO', ''),
-                    'quantidade': 0,
-                    'status': 'Montagem Erro',
-                    'erro': str(e),
-                    'copia': '0/0',
-                    'usuario': usuario,
-                    'montagem_ok': 0,
-                    'envio_ok': 0
-                }
-                self.registrar_log_sqlite(dados_erro_montagem)
+        finally:
+            # Só remove os insumos temporários desta execução; preserva os PDFs gerados.
+            try:
+                shutil.rmtree(sessao_temp)
+                self.log("🧹 Temporários do miolo removidos", "INFO")
+            except OSError as erro_limpeza:
+                self.log(f"⚠️ Não foi possível remover temporários: {erro_limpeza}", "INFO")
 
-        shutil.rmtree(sessao_temp, ignore_errors=True)
         
         self.log(f"\n{'='*50}", "INFO")
         self.log(f"📊 RESUMO FINAL", "INFO")
@@ -1106,13 +1287,12 @@ class MioloTab(ttk.Frame):
         self.log(f"💾 PDFs salvos (envio desligado): {salvos_count}", "INFO")
         self.log(f"{'='*50}", "INFO")
         
+        self.status_var.set(f"Concluído: {success_count} OK, {error_count} Erros | Enviados: {envio_count} | Salvos: {salvos_count}")
+        
         self.processando = False
-        self.after(0, lambda: self.status_var.set(
-            f"Concluído: {success_count} OK, {error_count} Erros | Enviados: {envio_count} | Salvos: {salvos_count}"
-        ))
-        self.after(0, lambda: self.btn_processar.config(state='normal', text='▶ Processar e Enviar'))
-        self.after(0, lambda: self.progress.configure(value=0))
-        self.after(0, lambda: self.progress_label.config(text="0/0"))
+        self.btn_processar.config(state='normal', text='▶ Processar e Enviar')
+        self.progress['value'] = 0
+        self.progress_label.config(text="0/0")
         
         for child in self.winfo_children():
             if isinstance(child, ttk.Frame):
@@ -1122,16 +1302,14 @@ class MioloTab(ttk.Frame):
                             if isinstance(btn, ttk.Button) and btn['text'] == '🔄 Cancelar':
                                 btn.config(state='disabled')
         
-        mensagem_final = (
-            f"Processamento Finalizado!\n\n"
-            f"✅ Montagens: {success_count}\n"
-            f"❌ Erros: {error_count}\n"
-            f"🚀 Envios: {envio_count}\n"
-            f"💾 PDFs salvos: {salvos_count}\n"
-            f"📁 Pasta: {output_dir}\n"
-            f"📂 Salvos em: {pasta_salvos}"
-        )
-        self.after(0, lambda: messagebox.showinfo("Concluído", mensagem_final))
+        messagebox.showinfo("Concluído", 
+                        f"Processamento Finalizado!\n\n"
+                        f"✅ Montagens: {success_count}\n"
+                        f"❌ Erros: {error_count}\n"
+                        f"🚀 Envios: {envio_count}\n"
+                        f"💾 PDFs salvos: {salvos_count}\n"
+                        f"📁 Pasta: {pasta_lote}\n"
+                        f"📂 Salvos em: {pasta_salvos if salvos_count else 'Nenhuma cópia manual'}")
 
 
     def selecionar_txt(self):
@@ -2564,6 +2742,34 @@ def grampo(input_path, output_path, output_width, output_height,
             pass
 
     return True
+def gprint_reservar_destino_capa(pasta_destino, identific, arquivo_txt):
+    """Reserva um nome para o PDF final sem sobrescrever arquivos existentes.
+
+    Mantem o nome original IDENTIFIC.pdf, acrescentando _1, _2, _3...
+    somente quando ja houver um PDF com o mesmo nome na pasta.
+    A reserva O_EXCL evita que duas estacoes escolham o mesmo destino.
+    O arquivo_txt permanece na assinatura para compatibilidade com o fluxo.
+    """
+    nome_base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', str(identific)).strip(' .') or 'sem_nome'
+
+    # Guarda margem para extensao e sufixo, considerando caminhos do Windows.
+    limite = min(190, max(32, 240 - len(os.path.abspath(pasta_destino))))
+    nome_base = nome_base[:limite]
+
+    for numero in range(0, 10001):
+        sufixo = '' if numero == 0 else f'_{numero}'
+        nome = f"{nome_base[:limite-len(sufixo)]}{sufixo}.pdf"
+        caminho = os.path.join(pasta_destino, nome)
+        try:
+            descritor = os.open(caminho, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        except FileExistsError:
+            continue
+        else:
+            os.close(descritor)
+            return caminho
+    raise RuntimeError('Nao foi possivel reservar um nome livre para a capa mesclada')
+
+
 class Application:
     def __init__(self, root):
         self.root = root
@@ -2578,7 +2784,10 @@ class Application:
         self.logo_path = r"Q:\___LISTA DE PRIORIDADES\GUILHERME\GPrint.png"
 
         # Ícone da janela
-        self.root.iconbitmap(self.icon_path)
+        try:
+            self.root.iconbitmap(self.icon_path)
+        except (OSError, tk.TclError) as e:
+            logging.warning("Icone da rede indisponivel: %s", e)
 
         
         # Controle de progresso
@@ -2598,12 +2807,34 @@ class Application:
         self.log_db_path = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\UICLAP\LOGS\impressoes.db"
         self.log_db_local_path = os.path.join(os.path.expanduser("~"), "Desktop", "impressoes_fallback.db")
 
+        # Alertar ao abrir, sem travar a interface quando a rede estiver lenta.
+        self.root.after(900, lambda: threading.Thread(
+            target=gprint_verificar_banco_no_inicio,
+            args=(self.log_db_path, self.root), daemon=True
+        ).start())
+
     # ==================== MÉTODOS DE LOG NO SQLITE ====================
+    def _adquirir_trava(self, lock_file, timeout):
+        inicio = time.time()
+        while time.time() - inicio < timeout:
+            try:
+                with open(lock_file, 'x') as f:
+                    f.write(str(os.getpid()))
+                return True
+            except FileExistsError:
+                time.sleep(0.1)
+        return False
+
+    def _liberar_trava(self, lock_file):
+        try:
+            os.remove(lock_file)
+        except:
+            pass
+
     def registrar_log_sqlite(self, dados):
-        """Mesmo serviço de histórico utilizado pela aba de miolo."""
-        return RegistroLogsSQLite.registrar(
-            self.log_db_path, self.log_db_local_path, dados,
-            self.adicionar_log
+        return gprint_registrar_log_seguro(
+            dados, self.log_db_path, self.log_db_local_path,
+            self.root, self.adicionar_log
         )
 
     # ==================== INTERFACE GRÁFICA ====================
@@ -2830,8 +3061,8 @@ class Application:
             self.status_label.config(text="❌ Erro no processamento", bootstyle="danger")
     
     def processar_arquivos(self):
-        pasta_temp = os.path.join(PASTA_TRABALHO, f"temp_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        os.makedirs(pasta_temp, exist_ok=True)
+        # Uma pasta unica por execucao, isolada de outras estacoes/processamentos.
+        pasta_temp = tempfile.mkdtemp(prefix="capa_", dir=PASTA_TRABALHO)
         
         try:
             self.adicionar_log("Iniciando processamento...")
@@ -2843,7 +3074,7 @@ class Application:
             
             arquivos_processados = 0
             pdfs_para_mesclar = {}
-            # Dicionário para acumular totais de montagens por chave (identific, filacolor)
+            # Cada TXT deve gerar sua propria mesclagem, mesmo com IDENTIFIC igual.
             totais_montagem = {}
             
             # Prepara usuário uma vez
@@ -2874,7 +3105,10 @@ class Application:
                         filacolor = linha["FILACOLOR"]
                         
                         nome_arquivo, extensao = os.path.splitext(linha["ARQUIVO"])
-                        temp_file = os.path.join(pasta_temp, f"{nomefic}_temp{extensao}")
+                        # Subpasta exclusiva por item evita substituir PDFs de entrada
+                        # e mantém o nome interno esperado pela marcacao original.
+                        pasta_item = tempfile.mkdtemp(prefix="item_", dir=pasta_temp)
+                        temp_file = os.path.join(pasta_item, f"{nomefic}_temp{extensao}")
                         shutil.copy(caminho_origem, temp_file)
                         
                         if temp_file.lower().endswith(".pdf"):
@@ -2887,7 +3121,7 @@ class Application:
                                 linha["FILACOLOR"]
                             )
                             if pdf_marcado:
-                                chave = (identific, filacolor)
+                                chave = (os.path.abspath(arquivo_txt), identific, filacolor)
                                 if chave not in pdfs_para_mesclar:
                                     pdfs_para_mesclar[chave] = []
                                     totais_montagem[chave] = 0
@@ -2926,29 +3160,39 @@ class Application:
             
             total_identifics = len(pdfs_para_mesclar)
             identifics_processados = 0
-            pasta_destino = os.path.dirname(self.arquivos_selecionados[0])
-            
-            # Junta nomes de todos os TXT para o campo pilha do envio
-            todos_txt = ", ".join(set(os.path.splitext(os.path.basename(t))[0] for t in self.arquivos_selecionados))
-            
             for chave, lista_pdfs in pdfs_para_mesclar.items():
-                identific, filacolor = chave
+                arquivo_txt, identific, filacolor = chave
+                pasta_destino = os.path.dirname(arquivo_txt)
+                pilha_txt = os.path.splitext(os.path.basename(arquivo_txt))[0]
                 total_montagens = totais_montagem.get(chave, 0)
                 
                 percentual = 80 + ((identifics_processados / total_identifics) * 20)
                 texto = f"Agrupando PDFs... ({identifics_processados + 1}/{total_identifics})"
                 self.root.after(0, lambda p=percentual, t=texto: self.atualizar_progresso_ui(p, t))
 
-                nome_temp = os.path.join(pasta_temp, f"{identific}.pdf")
+                # O arquivo intermediario permanece em TEMP; somente o PDF final
+                # e salvo junto ao TXT de origem, com nome exclusivo.
+                nome_temp = os.path.join(pasta_temp, f"mescla_{uuid.uuid4().hex}.pdf")
                 self.mesclar_pdfs(lista_pdfs, nome_temp, filacolor)
-                nome_final = os.path.join(pasta_destino, f"{identific}.pdf")
-                shutil.move(nome_temp, nome_final)
-                self.adicionar_log(f"✅ Arquivo gerado: {nome_final}")
+                if not os.path.isfile(nome_temp) or os.path.getsize(nome_temp) == 0:
+                    raise RuntimeError(f"Mesclagem nao gerou PDF valido para {pilha_txt}: {identific}")
+
+                nome_final = gprint_reservar_destino_capa(pasta_destino, identific, arquivo_txt)
+                try:
+                    shutil.move(nome_temp, nome_final)
+                except Exception:
+                    # Remove apenas a reserva desta tentativa; nunca outros PDFs.
+                    try:
+                        os.remove(nome_final)
+                    except OSError:
+                        pass
+                    raise
+                self.adicionar_log(f"✅ Arquivo gerado para TXT {pilha_txt}: {nome_final}")
 
                 if self.imprimir_automaticamente.get():
                     sucesso = self.enviar_para_impressora(
                         nome_final,
-                        os.path.basename(nome_final),
+                        f"{identific}.pdf",  # Mantem o titulo do trabalho LPR original.
                         filacolor
                     )
                     
@@ -2956,7 +3200,7 @@ class Application:
                     status_envio = 'Enviado' if sucesso else 'Falha no envio'
                     dados_envio = {
                         'lote': pasta_destino,
-                        'pilha': todos_txt,
+                        'pilha': pilha_txt,
                         'arquivo': identific,
                         'maquina': MAQUINA_CAPA,
                         'ip': IP_CAPA,
@@ -2974,7 +3218,7 @@ class Application:
                 else:
                     dados_nao_enviado = {
                         'lote': pasta_destino,
-                        'pilha': todos_txt,
+                        'pilha': pilha_txt,
                         'arquivo': identific,
                         'maquina': MAQUINA_CAPA,
                         'ip': IP_CAPA,
@@ -3005,11 +3249,20 @@ class Application:
             self.root.after(0, lambda: self.finalizar_processamento(False))
             self.root.after(0, lambda: messagebox.showerror("Erro", f"Ocorreu um erro durante o processamento: {e}"))
         finally:
-            try:
-                shutil.rmtree(pasta_temp, ignore_errors=True)
-                self.adicionar_log(f"🧹 Pasta temporária removida: {pasta_temp}")
-            except Exception as e:
-                self.adicionar_log(f"⚠️ Erro ao limpar pasta temporária: {e}")
+            # Limpa apenas a pasta desta execucao, inclusive subpastas de itens.
+            # Repetir a tentativa atende a bloqueios de arquivo momentaneos no Windows.
+            for tentativa in range(3):
+                try:
+                    shutil.rmtree(pasta_temp)
+                    self.adicionar_log(f"🧹 Temporarios da capa removidos: {pasta_temp}")
+                    break
+                except FileNotFoundError:
+                    break
+                except OSError as erro_limpeza:
+                    if tentativa == 2:
+                        self.adicionar_log(f"⚠️ Temporarios nao removidos: {pasta_temp} ({erro_limpeza})")
+                    else:
+                        time.sleep(0.5)
 
     # ==================== MESCLAGEM E IMPRESSÃO ====================
     def mesclar_pdfs(self, lista_pdfs, nome_saida, filacolor):
@@ -3198,14 +3451,11 @@ def carregar_configuracoes():
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
                 config = json.load(f)
-                # Compatível com o formato legado, sem usar eval().
-                if not isinstance(config, dict):
-                    raise ValueError("Formato de configuração inválido")
-                config = {**DEFAULT_CONFIG, **config}
-                for chave in ('cor_fosco', 'cor_brilho'):
-                    config[chave] = interpretar_cor_configuracao(
-                        config[chave], DEFAULT_CONFIG[chave]
-                    )
+                # Converter cores de string para tupla
+                if isinstance(config.get('cor_fosco'), str):
+                    config['cor_fosco'] = eval(config['cor_fosco'])
+                if isinstance(config.get('cor_brilho'), str):
+                    config['cor_brilho'] = eval(config['cor_brilho'])
                 return config
     except Exception as e:
         logging.error(f"Erro ao carregar configurações: {e}")
@@ -3214,8 +3464,8 @@ def carregar_configuracoes():
 def salvar_configuracoes(config):
     try:
         config_to_save = config.copy()
-        config_to_save['cor_fosco'] = list(config['cor_fosco'])
-        config_to_save['cor_brilho'] = list(config['cor_brilho'])
+        config_to_save['cor_fosco'] = str(config['cor_fosco'])
+        config_to_save['cor_brilho'] = str(config['cor_brilho'])
         
         with open(CONFIG_FILE, 'w') as f:
             json.dump(config_to_save, f, indent=4)
@@ -5200,7 +5450,7 @@ class HistoricoTab(ttk.Frame):
         # Será preenchido dinamicamente no primeiro acesso
 
         ttk.Label(row3, text="Status:").pack(side=tk.LEFT, padx=(20, 0))
-        self.status_combo = ttk.Combobox(row3, values=["", "Montagem OK", "Montagem Erro", "Enviado", "Falha no envio", "Não enviado (manual)", "Salvo", "Falha ao salvar"],
+        self.status_combo = ttk.Combobox(row3, values=["", "Montagem OK", "Enviado", "Falha no envio", "Não enviado (manual)"],
                                          width=20, state="readonly")
         self.status_combo.pack(side=tk.LEFT, padx=5)
         self.status_combo.current(0)
@@ -5248,7 +5498,7 @@ class HistoricoTab(ttk.Frame):
         resumo_frame.pack(fill=tk.X, pady=(5, 0))
         self.lbl_total_registros = ttk.Label(resumo_frame, text="Registros: 0", font=("Segoe UI", 9, "bold"))
         self.lbl_total_registros.pack(side=tk.LEFT, padx=20)
-        self.lbl_soma_qtd = ttk.Label(resumo_frame, text="Montadas: 0 | Enviadas: 0", font=("Segoe UI", 9, "bold"))
+        self.lbl_soma_qtd = ttk.Label(resumo_frame, text="Quantidade total: 0", font=("Segoe UI", 9, "bold"))
         self.lbl_soma_qtd.pack(side=tk.LEFT, padx=20)
 
         self.dados = []        # armazena os registros completos (excluindo cópia)
@@ -5271,17 +5521,15 @@ class HistoricoTab(ttk.Frame):
 
     def conectar_banco(self):
         caminho = self.app.log_db_path
-        if not os.path.isfile(caminho):
-            # O fallback local contém eventos ainda não conciliados; mostrar aviso.
+        try:
+            gprint_checar_banco_central(caminho)
+        except (GPrintBancoIndisponivel, OSError) as e:
+            gprint_avisar_operador(self.app.root, "rede", str(e))
             caminho = self.app.log_db_local_path
+            # Nao criar banco vazio no Historico quando a rede cair.
             if not os.path.isfile(caminho):
-                raise FileNotFoundError("Histórico central inacessível e nenhum histórico local disponível")
-            logging.warning("Histórico exibido é LOCAL, não contempla todas as estações")
-        # Abre o banco existente e bloqueia escritas nesta conexão.
-        # Evita problemas de URI do SQLite com caminhos UNC no Windows.
-        conexao = sqlite3.connect(caminho, timeout=10)
-        conexao.execute("PRAGMA query_only=ON")
-        return conexao
+                raise FileNotFoundError("Banco central indisponivel e nao existe historico local") from e
+        return sqlite3.connect(caminho, timeout=15)
 
     def buscar(self):
         # Garantir que a lista de usuários esteja carregada
@@ -5358,25 +5606,19 @@ class HistoricoTab(ttk.Frame):
             cursor.execute(query, params)
             rows = cursor.fetchall()
 
-            montadas = 0
-            enviadas = 0
+            soma_qtd = 0
             for row in rows:
                 self.dados.append(row)
                 self.tree.insert("", tk.END, values=row)
-                quantidade = row[8] or 0
-                status = row[9]
-                modo = row[7]
-                if status == "Montagem OK":
-                    montadas += quantidade
-                elif status == "Enviado":
-                    # Capa: um registro por lote agrupado, com quantidade real.
-                    # Miolo: um registro por cópia, cada envio equivale a 1.
-                    enviadas += quantidade if modo == "envio" else 1
+                soma_qtd += row[8]  # índice da quantidade (0‑based: 8)
 
-            # Os totais são relativos aos registros exibidos (LIMIT 5000).
-            self.lbl_total_registros.config(text=f"Registros: {len(rows)} (máx. 5000)")
-            self.lbl_soma_qtd.config(text=f"Montadas: {montadas} | Enviadas: {enviadas}")
+            # Atualizar rodapé
+            self.lbl_total_registros.config(text=f"Registros: {len(rows)}")
+            self.lbl_soma_qtd.config(text=f"Quantidade total: {soma_qtd}")
 
+        except FileNotFoundError:
+            # Ja foi exibido aviso "producao offline / informar Guilherme".
+            pass
         except Exception as e:
             messagebox.showerror("Erro", f"Falha ao consultar banco: {e}")
         finally:
@@ -5402,7 +5644,7 @@ class HistoricoTab(ttk.Frame):
         self.tree.delete(*self.tree.get_children())
         self.dados = []
         self.lbl_total_registros.config(text="Registros: 0")
-        self.lbl_soma_qtd.config(text="Montadas: 0 | Enviadas: 0")
+        self.lbl_soma_qtd.config(text="Quantidade total: 0")
 
     def ordenar_por(self, coluna):
         if not self.dados:
