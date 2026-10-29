@@ -1,1 +1,14 @@
 /dist/
+
+# Arquivos gerados pelo PyInstaller
+/build/
+/dist/
+/GPrint.spec
+
+# Biblioteca local
+/tkinterdnd2/
+
+# Cache do Python
+__pycache__/
+*.pyc
+

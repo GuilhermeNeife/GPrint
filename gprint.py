@@ -32,6 +32,7 @@ from openpyxl import Workbook, load_workbook
 import uuid
 from openpyxl.utils import get_column_letter
 import random
+import ctypes
 
 
 # ============================================================================
@@ -427,6 +428,163 @@ def obter_sangria_padrao_miolo():
     except (ValueError, TypeError):
         logging.warning("Sangria inválida nas configurações (%r). Usando 3 mm.", valor)
         return float(DEFAULT_CONFIG["sangria_padrao_miolo"])
+
+
+# ============================================================================
+# GPRINT - MONITOR VISUAL LEVE (CAPA E MIOLO)
+# Apenas interface: nao interfere na montagem, nos PDFs nem no envio LPR.
+# A leitura de RAM usa API nativa do Windows, sem dependencia adicional.
+# ============================================================================
+GPRINT_RAM_INTERVALO_MS = 2000   # Consultar a cada 2 segundos (baixo custo)
+GPRINT_RAM_AMARELO_ACIMA = 70.0 # Amarelo acima de 70% ate 85%
+GPRINT_RAM_VERMELHO_ACIMA = 85.0 # Vermelho SOMENTE acima de 85%
+
+
+class _GPrintMemoryStatusEx(ctypes.Structure):
+    """Estrutura WinAPI para obter o percentual de uso da RAM fisica total."""
+    _fields_ = [
+        ('dwLength', ctypes.c_ulong),
+        ('dwMemoryLoad', ctypes.c_ulong),
+        ('ullTotalPhys', ctypes.c_ulonglong),
+        ('ullAvailPhys', ctypes.c_ulonglong),
+        ('ullTotalPageFile', ctypes.c_ulonglong),
+        ('ullAvailPageFile', ctypes.c_ulonglong),
+        ('ullTotalVirtual', ctypes.c_ulonglong),
+        ('ullAvailVirtual', ctypes.c_ulonglong),
+        ('ullAvailExtendedVirtual', ctypes.c_ulonglong),
+    ]
+
+
+def gprint_percentual_ram_pc():
+    """Uso percentual de RAM total no Windows; None se indisponivel.
+
+    Nao inclui leituras por processo; e somente a RAM fisica do computador.
+    No Windows, evita instalar psutil no executavel PyInstaller.
+    """
+    try:
+        if os.name == 'nt':
+            status = _GPrintMemoryStatusEx()
+            status.dwLength = ctypes.sizeof(_GPrintMemoryStatusEx)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return None
+            # Usar totais fisicos para permitir precisao decimal.
+            if status.ullTotalPhys <= 0:
+                return None
+            em_uso = status.ullTotalPhys - status.ullAvailPhys
+            return max(0.0, min(100.0, em_uso * 100.0 / status.ullTotalPhys))
+        # Compatibilidade opcional de testes fora do Windows.
+        import psutil
+        return float(psutil.virtual_memory().percent)
+    except (OSError, ImportError, AttributeError, ValueError):
+        return None
+
+
+def gprint_cor_ram(percentual):
+    """Semaforo: verde ate 70%, amarelo acima de 70%, vermelho acima de 85%."""
+    if percentual is None:
+        return 'secondary'
+    if percentual > GPRINT_RAM_VERMELHO_ACIMA:
+        return 'danger'
+    if percentual > GPRINT_RAM_AMARELO_ACIMA:
+        return 'warning'
+    return 'success'
+
+
+def gprint_tempo_minutos(segundos):
+    """Tempo decorrido em minutos e segundos, inclusive para mais de uma hora."""
+    total = max(0, int(segundos))
+    minutos, segundos_restantes = divmod(total, 60)
+    return f'{minutos:02d}min {segundos_restantes:02d}s'
+
+
+class GPrintIndicadoresAndamento:
+    """Indicadores comuns nas abas Capa/Miolo, com timers do Tkinter.
+
+    Nao cria threads, nao consulta a rede e nao altera a rotina de processamento.
+    A RAM continua visivel em repouso; o cronometro roda apenas durante o trabalho.
+    """
+    def __init__(self, quadro, linha_ram=1):
+        self.quadro = quadro
+        self.inicio = None
+        self._ram_after = None
+        self._tempo_after = None
+        self._cor_atual = None
+
+        ttk.Label(quadro, text='RAM do computador:').grid(
+            row=linha_ram, column=0, padx=5, pady=4, sticky='w')
+        self.barra_ram = ttk.Progressbar(
+            quadro, mode='determinate', maximum=100, bootstyle='success')
+        self.barra_ram.grid(
+            row=linha_ram, column=1, sticky='ew', padx=5, pady=4)
+        self.valor_ram = ttk.Label(quadro, text='--%  |  aguardando leitura', anchor='e')
+        self.valor_ram.grid(row=linha_ram, column=2, padx=5, pady=4, sticky='e')
+
+        ttk.Label(quadro, text='Tempo decorrido:').grid(
+            row=linha_ram + 1, column=0, padx=5, pady=4, sticky='w')
+        self.valor_tempo = ttk.Label(quadro, text='00min 00s', anchor='e')
+        self.valor_tempo.grid(
+            row=linha_ram + 1, column=2, padx=5, pady=4, sticky='e')
+
+        quadro.bind('<Destroy>', self._ao_destruir, add='+')
+        # Nao bloquear a abertura consultando RAM durante a construcao da tela.
+        self._ram_after = quadro.after(600, self._atualizar_ram)
+
+    def _atualizar_ram(self):
+        self._ram_after = None
+        if not self.quadro.winfo_exists():
+            return
+        percentual = gprint_percentual_ram_pc()
+        cor = gprint_cor_ram(percentual)
+        if percentual is None:
+            self.barra_ram.configure(value=0)
+            self.valor_ram.configure(text='RAM indisponivel')
+        else:
+            self.barra_ram.configure(value=percentual)
+            estado = ('ALTA' if cor == 'danger' else
+                      'ATENCAO' if cor == 'warning' else 'NORMAL')
+            self.valor_ram.configure(text=f'{percentual:.1f}%  |  {estado}')
+        # Aplicar cor apenas ao mudar de faixa: evita reconfiguracoes desnecessarias.
+        if cor != self._cor_atual:
+            self.barra_ram.configure(bootstyle=cor)
+            self.valor_ram.configure(bootstyle=cor)
+            self._cor_atual = cor
+        self._ram_after = self.quadro.after(GPRINT_RAM_INTERVALO_MS, self._atualizar_ram)
+
+    def iniciar(self):
+        self.inicio = time.monotonic()
+        if self._tempo_after is not None:
+            self.quadro.after_cancel(self._tempo_after)
+            self._tempo_after = None
+        self._atualizar_tempo()
+
+    def _atualizar_tempo(self):
+        self._tempo_after = None
+        if self.inicio is None or not self.quadro.winfo_exists():
+            return
+        self.valor_tempo.configure(
+            text=gprint_tempo_minutos(time.monotonic() - self.inicio))
+        self._tempo_after = self.quadro.after(1000, self._atualizar_tempo)
+
+    def finalizar(self):
+        if self.inicio is not None:
+            self.valor_tempo.configure(
+                text=gprint_tempo_minutos(time.monotonic() - self.inicio))
+        self.inicio = None
+        if self._tempo_after is not None:
+            self.quadro.after_cancel(self._tempo_after)
+            self._tempo_after = None
+
+    def _ao_destruir(self, evento):
+        if evento.widget is not self.quadro:
+            return
+        for nome in ('_ram_after', '_tempo_after'):
+            identificador = getattr(self, nome)
+            if identificador is not None:
+                try:
+                    self.quadro.after_cancel(identificador)
+                except tk.TclError:
+                    pass
+                setattr(self, nome, None)
 
 
 class ConfigTab(ttk.Frame):
@@ -942,17 +1100,22 @@ class MioloTab(ttk.Frame):
         # ================= ANDAMENTO =================
         progress_frame = ttk.LabelFrame(main_frame, text="⏳ Andamento", bootstyle=(SUCCESS))
         progress_frame.grid(row=4, column=0, sticky="ew", pady=5)
-        progress_frame.columnconfigure(0, weight=1)
+        progress_frame.columnconfigure(0, weight=0)
+        progress_frame.columnconfigure(1, weight=1)
+        progress_frame.columnconfigure(2, weight=0)
 
+        ttk.Label(progress_frame, text="Andamento:").grid(
+            row=0, column=0, padx=5, pady=5, sticky='w')
         self.progress = ttk.Progressbar(
             progress_frame,
             mode='determinate',
-            bootstyle=SUCCESS 
+            bootstyle=SUCCESS
         )
-        self.progress.grid(row=0, column=0, sticky="ew", padx=5, pady=(5, 5))
+        self.progress.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
 
         self.progress_label = ttk.Label(progress_frame, text="0/0")
-        self.progress_label.grid(row=0, column=1, padx=(0, 10), pady=5)
+        self.progress_label.grid(row=0, column=2, padx=5, pady=5, sticky='e')
+        self.indicadores_miolo = GPrintIndicadoresAndamento(progress_frame)
 
         # ================= STATUS =================
         status_frame = ttk.Frame(main_frame)
@@ -1028,7 +1191,8 @@ class MioloTab(ttk.Frame):
         self.btn_select.config(state='disabled')  # nao alterar a fila durante o processamento
         self.progress['value'] = 0
         self.progress['maximum'] = len(self.processos)
-        
+        self.indicadores_miolo.iniciar()
+
         for child in self.winfo_children():
             if isinstance(child, ttk.Frame):
                 for frame in child.winfo_children():
@@ -1418,10 +1582,12 @@ class MioloTab(ttk.Frame):
         self.status_var.set(f"Concluído: {success_count} OK, {error_count} Erros | Enviados: {envio_count} | Salvos: {salvos_count}")
         
         self.processando = False
+        self.after(0, self.indicadores_miolo.finalizar)
         self.btn_processar.config(state='normal', text='▶ Processar e Enviar')
         self.btn_select.config(state='normal')
-        self.progress['value'] = 0
-        self.progress_label.config(text="0/0")
+        # Exibe o andamento concluido ate a proxima execucao.
+        self.progress['value'] = len(self.processos)
+        self.progress_label.config(text=f"{len(self.processos)}/{len(self.processos)}")
         
         for child in self.winfo_children():
             if isinstance(child, ttk.Frame):
@@ -3117,18 +3283,20 @@ class Application:
         # ================= PROGRESSO =================
         progress_frame = ttk.LabelFrame(main_frame, text="⏳ Andamento", bootstyle=SUCCESS)
         progress_frame.grid(row=4, column=0, sticky="ew", pady=5)
-        progress_frame.columnconfigure(0, weight=3)
+        progress_frame.columnconfigure(0, weight=0)
         progress_frame.columnconfigure(1, weight=1)
-        progress_frame.columnconfigure(2, weight=1)
-        
-        self.progress_bar = ttk.Progressbar(progress_frame, mode='determinate', bootstyle="success-striped")
-        self.progress_bar.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
-        
-        self.progress_percent_label = ttk.Label(progress_frame, text="0%", font=('Helvetica', 9, 'bold'))
-        self.progress_percent_label.grid(row=0, column=1, padx=5, pady=5)
-        
-        self.tempo_label = ttk.Label(progress_frame, text="Tempo: 0s", font=('Helvetica', 9))
-        self.tempo_label.grid(row=0, column=2, padx=5, pady=5)
+        progress_frame.columnconfigure(2, weight=0)
+
+        ttk.Label(progress_frame, text="Andamento:").grid(
+            row=0, column=0, padx=5, pady=5, sticky='w')
+        self.progress_bar = ttk.Progressbar(
+            progress_frame, mode='determinate', bootstyle="success-striped")
+        self.progress_bar.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
+
+        self.progress_percent_label = ttk.Label(
+            progress_frame, text="0%", font=('Helvetica', 9, 'bold'))
+        self.progress_percent_label.grid(row=0, column=2, padx=5, pady=5, sticky='e')
+        self.indicadores_capa = GPrintIndicadoresAndamento(progress_frame)
         
         # ================= STATUS E AÇÃO =================
         status_frame = ttk.Frame(main_frame)
@@ -3197,23 +3365,20 @@ class Application:
         
         self.progress_bar['value'] = 0
         self.progress_percent_label.config(text="0%")
-        self.tempo_label.config(text="Tempo: 0s")
         self.status_label.config(text="⏳ Processando...", bootstyle="warning")
         self.btn_processar.config(state=DISABLED)
         self.btn_select.config(state=DISABLED)
         
         self.processamento_em_andamento = True
-        self.tempo_inicio = time.time()
-        self.atualizar_timer_ui()
+        self.indicadores_capa.iniciar()
         
         thread = threading.Thread(target=self.processar_arquivos, daemon=True)
         thread.start()
     
     def atualizar_timer_ui(self):
+        """Compatibilidade: o cronometro e atualizado por indicadores_capa."""
         if self.processamento_em_andamento:
-            elapsed = int(time.time() - self.tempo_inicio)
-            self.tempo_label.config(text=f"Tempo: {elapsed}s")
-            self.root.after(1000, self.atualizar_timer_ui)
+            self.indicadores_capa._atualizar_tempo()
     
     def atualizar_progresso_ui(self, percentual, texto):
         self.progress_bar['value'] = percentual
@@ -3223,6 +3388,7 @@ class Application:
     
     def finalizar_processamento(self, sucesso=True):
         self.processamento_em_andamento = False
+        self.indicadores_capa.finalizar()
         self.btn_processar.config(state=NORMAL)
         self.btn_select.config(state=NORMAL)
         if sucesso:
@@ -3616,7 +3782,7 @@ class Application:
         tk.Label(main, text="GPrint", font=("Segoe UI", 18, "bold"),
                 bg="#0f172a", fg="#f8fafc").pack(pady=(10, 0))
 
-        versao_badge = tk.Label(main, text="  v11.0  ", font=("Segoe UI", 10, "bold"),
+        versao_badge = tk.Label(main, text="  v5.0  ", font=("Segoe UI", 10, "bold"),
                                 bg="#3b82f6", fg="white", padx=8, pady=2)
         versao_badge.pack(pady=(4, 12))
 
