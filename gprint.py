@@ -32,6 +32,7 @@ from openpyxl import Workbook, load_workbook
 import uuid
 from openpyxl.utils import get_column_letter
 import random
+import ast
 
 DATA_LIMITE = "29/07/2027"
 PASTA_BASE = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\UICLAP\LOTES"
@@ -83,6 +84,115 @@ DEFAULT_CONFIG = {
         # NOVO
     "sangria_padrao_miolo": 3
 }
+
+# ============================================================================
+# REGISTROS DE PRODUÇÃO — CAMADA COMPARTILHADA (REVISÃO SEGURA)
+# Mantém a tabela existente e NÃO altera o modo de journal do banco produtivo.
+# Uma futura migração para API + PostgreSQL deverá ser feita separadamente.
+# ============================================================================
+class RegistroLogsSQLite:
+    COLUNAS = (
+        "data_hora", "lote", "pilha", "arquivo", "maquina", "ip", "formato",
+        "modo", "quantidade", "status", "erro", "copia", "usuario",
+        "montagem_ok", "envio_ok"
+    )
+
+    @staticmethod
+    def _adquirir_trava(caminho, timeout=5):
+        inicio = time.monotonic()
+        while time.monotonic() - inicio < timeout:
+            try:
+                fd = os.open(caminho, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w", encoding="ascii") as arquivo:
+                    arquivo.write(str(os.getpid()))
+                return True
+            except FileExistsError:
+                time.sleep(random.uniform(0.1, 0.25))
+            except OSError:
+                return False
+        return False
+
+    @classmethod
+    def _gravar(cls, caminho_db, dados):
+        pasta = os.path.dirname(caminho_db)
+        if pasta and not os.path.isdir(pasta):
+            # Evitar criar acidentalmente pastas na rede ao perder conexão.
+            if caminho_db.startswith("\\\\"):
+                raise OSError("Diretório do banco de rede indisponível")
+            os.makedirs(pasta, exist_ok=True)
+        lock_file = caminho_db + ".lock"
+        if not cls._adquirir_trava(lock_file):
+            raise TimeoutError("Tempo esgotado aguardando trava de escrita")
+        try:
+            # Context manager + finally para SEMPRE fechar conexão e liberar a trava.
+            conexao = sqlite3.connect(caminho_db, timeout=10)
+            try:
+                # Não configurar WAL por aqui: um WAL já existente requer migração
+                # coordenada quando o banco está hospedado em compartilhamento SMB.
+                conexao.execute("PRAGMA busy_timeout=10000")
+                conexao.execute("""
+                    CREATE TABLE IF NOT EXISTS logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        data_hora TEXT, lote TEXT, pilha TEXT, arquivo TEXT,
+                        maquina TEXT, ip TEXT, formato TEXT, modo TEXT,
+                        quantidade INTEGER, status TEXT, erro TEXT, copia TEXT,
+                        usuario TEXT, montagem_ok INTEGER DEFAULT 0,
+                        envio_ok INTEGER DEFAULT 0
+                    )
+                """)
+                colunas_sql = ", ".join(cls.COLUNAS)
+                placeholders = ", ".join("?" for _ in cls.COLUNAS)
+                valores = tuple(
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S") if c == "data_hora"
+                    else dados.get(c, 0 if c in ("quantidade", "montagem_ok", "envio_ok") else "")
+                    for c in cls.COLUNAS
+                )
+                conexao.execute(
+                    f"INSERT INTO logs ({colunas_sql}) VALUES ({placeholders})", valores
+                )
+                conexao.commit()
+                return True
+            except Exception:
+                conexao.rollback()
+                raise
+            finally:
+                conexao.close()
+        finally:
+            try:
+                os.remove(lock_file)
+            except OSError:
+                logging.exception("Não foi possível remover a trava %s", lock_file)
+
+    @classmethod
+    def registrar(cls, caminho_rede, caminho_local, dados, avisar):
+        try:
+            return cls._gravar(caminho_rede, dados)
+        except Exception as erro_rede:
+            avisar(f"⚠️ Histórico central indisponível: {erro_rede}")
+        try:
+            cls._gravar(caminho_local, dados)
+            avisar("⚠️ Registro salvo SOMENTE no banco local. Requer conciliação manual.")
+            return True
+        except Exception as erro_local:
+            avisar(f"❌ FALHA DE AUDITORIA: registro não salvo nem na rede nem localmente: {erro_local}")
+            logging.exception("Falha de persistência do histórico")
+            return False
+
+
+def interpretar_cor_configuracao(valor, padrao):
+    """Aceita lista JSON ou tupla legada em string, sem executar código."""
+    if isinstance(valor, str):
+        try:
+            valor = ast.literal_eval(valor)
+        except (ValueError, SyntaxError, MemoryError, RecursionError):
+            return padrao
+    if not isinstance(valor, (tuple, list)) or len(valor) != 3:
+        return padrao
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+               and math.isfinite(v) and 0 <= v <= 1 for v in valor):
+        return padrao
+    return tuple(float(v) for v in valor)
+
 class ConfigTab(ttk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent)
@@ -358,116 +468,12 @@ class MioloTab(ttk.Frame):
         self.atualizar_log_queue()
         logging.info("Sistema iniciado")
 
-    # ------------------------------------------------------------
-    # Mecanismo de trava para escrita concorrente no SQLite
-    # ------------------------------------------------------------
-    def _adquirir_trava(self, caminho_trava, timeout=5):
-        inicio = time.time()
-        while True:
-            try:
-                fd = os.open(caminho_trava, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-                os.close(fd)
-                return True
-            except FileExistsError:
-                if time.time() - inicio > timeout:
-                    return False
-                time.sleep(random.uniform(0.1, 0.4))
-            except Exception:
-                return False
-
-    def _liberar_trava(self, caminho_trava):
-        try:
-            os.remove(caminho_trava)
-        except:
-            pass
-
-    # ------------------------------------------------------------
-    # REGISTRO DE LOG NO BANCO SQLite (sem total_paginas)
-    # ------------------------------------------------------------
     def registrar_log_sqlite(self, dados):
-        caminho_db = self.log_db_path
-        try:
-            diretorio = os.path.dirname(caminho_db)
-            if not os.path.exists(diretorio):
-                raise Exception("Diretório de rede inacessível")
-            teste = os.path.join(diretorio, ".write_test")
-            with open(teste, 'w') as f:
-                f.write("test")
-            os.remove(teste)
-        except:
-            caminho_db = self.log_db_local_path
-            self.log(f"⚠️ Usando fallback local para banco: {caminho_db}", "INFO")
-
-        os.makedirs(os.path.dirname(caminho_db), exist_ok=True)
-
-        trava = caminho_db + ".lock"
-
-        if not self._adquirir_trava(trava, timeout=5):
-            self.log("❌ Não foi possível adquirir trava de escrita no banco", "ERRO")
-            return False
-
-        try:
-            conn = sqlite3.connect(caminho_db, timeout=10)
-            conn.execute("PRAGMA journal_mode=WAL;")
-            cursor = conn.cursor()
-
-            # Tabela original (sem total_paginas)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    data_hora TEXT,
-                    lote TEXT,
-                    pilha TEXT,
-                    arquivo TEXT,
-                    maquina TEXT,
-                    ip TEXT,
-                    formato TEXT,
-                    modo TEXT,
-                    quantidade INTEGER,
-                    status TEXT,
-                    erro TEXT,
-                    copia TEXT,
-                    usuario TEXT,
-                    montagem_ok INTEGER DEFAULT 0,
-                    envio_ok INTEGER DEFAULT 0
-                );
-            """)
-
-            valores = (
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                dados.get('lote', ''),
-                dados.get('pilha', ''),
-                dados.get('arquivo', ''),
-                dados.get('maquina', ''),
-                dados.get('ip', ''),
-                dados.get('formato', ''),
-                dados.get('modo', ''),
-                dados.get('quantidade', 0),
-                dados.get('status', ''),
-                dados.get('erro', ''),
-                dados.get('copia', ''),
-                dados.get('usuario', ''),
-                dados.get('montagem_ok', 0),
-                dados.get('envio_ok', 0)
-            )
-
-            cursor.execute("""
-                INSERT INTO logs 
-                (data_hora, lote, pilha, arquivo, maquina, ip,
-                 formato, modo, quantidade, status, erro, copia, usuario,
-                 montagem_ok, envio_ok)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, valores)
-
-            conn.commit()
-            conn.close()
-            self._liberar_trava(trava)
-            return True
-
-        except Exception as e:
-            self._liberar_trava(trava)
-            self.log(f"❌ Erro ao gravar no banco SQLite: {e}", "ERRO")
-            return False
+        """Registra na base central; usa fallback local com aviso se necessário."""
+        return RegistroLogsSQLite.registrar(
+            self.log_db_path, self.log_db_local_path, dados,
+            lambda mensagem: self.log(mensagem, "ERRO" if mensagem.startswith("❌") else "INFO")
+        )
 
     # ------------------------------------------------------------
     # Interface gráfica (setup_ui) - layout ajustado
@@ -895,8 +901,10 @@ class MioloTab(ttk.Frame):
                 break
                 
             try:
-                self.progress['value'] = i
-                self.progress_label.config(text=f"{i+1}/{len(self.processos)}")
+                self.after(0, lambda atual=i, total=len(self.processos): (
+                    self.progress.configure(value=atual),
+                    self.progress_label.config(text=f"{atual+1}/{total}")
+                ))
                 
                 self.log(f"\n--- Processando L{p['LINHA']}: {p['ARQUIVO']} ---", "INFO")
                 self.log(f"📄 Formato: {p['FORMATO']}", "INFO")
@@ -1098,12 +1106,13 @@ class MioloTab(ttk.Frame):
         self.log(f"💾 PDFs salvos (envio desligado): {salvos_count}", "INFO")
         self.log(f"{'='*50}", "INFO")
         
-        self.status_var.set(f"Concluído: {success_count} OK, {error_count} Erros | Enviados: {envio_count} | Salvos: {salvos_count}")
-        
         self.processando = False
-        self.btn_processar.config(state='normal', text='▶ Processar e Enviar')
-        self.progress['value'] = 0
-        self.progress_label.config(text="0/0")
+        self.after(0, lambda: self.status_var.set(
+            f"Concluído: {success_count} OK, {error_count} Erros | Enviados: {envio_count} | Salvos: {salvos_count}"
+        ))
+        self.after(0, lambda: self.btn_processar.config(state='normal', text='▶ Processar e Enviar'))
+        self.after(0, lambda: self.progress.configure(value=0))
+        self.after(0, lambda: self.progress_label.config(text="0/0"))
         
         for child in self.winfo_children():
             if isinstance(child, ttk.Frame):
@@ -1113,14 +1122,16 @@ class MioloTab(ttk.Frame):
                             if isinstance(btn, ttk.Button) and btn['text'] == '🔄 Cancelar':
                                 btn.config(state='disabled')
         
-        messagebox.showinfo("Concluído", 
-                        f"Processamento Finalizado!\n\n"
-                        f"✅ Montagens: {success_count}\n"
-                        f"❌ Erros: {error_count}\n"
-                        f"🚀 Envios: {envio_count}\n"
-                        f"💾 PDFs salvos: {salvos_count}\n"
-                        f"📁 Pasta: {output_dir}\n"
-                        f"📂 Salvos em: {pasta_salvos}")
+        mensagem_final = (
+            f"Processamento Finalizado!\n\n"
+            f"✅ Montagens: {success_count}\n"
+            f"❌ Erros: {error_count}\n"
+            f"🚀 Envios: {envio_count}\n"
+            f"💾 PDFs salvos: {salvos_count}\n"
+            f"📁 Pasta: {output_dir}\n"
+            f"📂 Salvos em: {pasta_salvos}"
+        )
+        self.after(0, lambda: messagebox.showinfo("Concluído", mensagem_final))
 
 
     def selecionar_txt(self):
@@ -2588,105 +2599,12 @@ class Application:
         self.log_db_local_path = os.path.join(os.path.expanduser("~"), "Desktop", "impressoes_fallback.db")
 
     # ==================== MÉTODOS DE LOG NO SQLITE ====================
-    def _adquirir_trava(self, lock_file, timeout):
-        inicio = time.time()
-        while time.time() - inicio < timeout:
-            try:
-                with open(lock_file, 'x') as f:
-                    f.write(str(os.getpid()))
-                return True
-            except FileExistsError:
-                time.sleep(0.1)
-        return False
-
-    def _liberar_trava(self, lock_file):
-        try:
-            os.remove(lock_file)
-        except:
-            pass
-
     def registrar_log_sqlite(self, dados):
-        """Grava um registro na tabela logs do SQLite (mesma estrutura do Miolo)."""
-        caminho_db = self.log_db_path
-        try:
-            diretorio = os.path.dirname(caminho_db)
-            if not os.path.exists(diretorio):
-                raise Exception("Diretório de rede inacessível")
-            teste = os.path.join(diretorio, ".write_test")
-            with open(teste, 'w') as f:
-                f.write("test")
-            os.remove(teste)
-        except:
-            caminho_db = self.log_db_local_path
-            self.adicionar_log(f"⚠️ Usando fallback local para banco: {caminho_db}")
-
-        os.makedirs(os.path.dirname(caminho_db), exist_ok=True)
-        trava = caminho_db + ".lock"
-
-        if not self._adquirir_trava(trava, timeout=5):
-            self.adicionar_log("❌ Não foi possível adquirir trava de escrita no banco")
-            return False
-
-        try:
-            conn = sqlite3.connect(caminho_db, timeout=10)
-            conn.execute("PRAGMA journal_mode=WAL;")
-            cursor = conn.cursor()
-
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    data_hora TEXT,
-                    lote TEXT,
-                    pilha TEXT,
-                    arquivo TEXT,
-                    maquina TEXT,
-                    ip TEXT,
-                    formato TEXT,
-                    modo TEXT,
-                    quantidade INTEGER,
-                    status TEXT,
-                    erro TEXT,
-                    copia TEXT,
-                    usuario TEXT,
-                    montagem_ok INTEGER DEFAULT 0,
-                    envio_ok INTEGER DEFAULT 0
-                );
-            """)
-
-            valores = (
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                dados.get('lote', ''),
-                dados.get('pilha', ''),
-                dados.get('arquivo', ''),
-                dados.get('maquina', ''),
-                dados.get('ip', ''),
-                dados.get('formato', ''),
-                dados.get('modo', ''),
-                dados.get('quantidade', 0),
-                dados.get('status', ''),
-                dados.get('erro', ''),
-                dados.get('copia', ''),
-                dados.get('usuario', ''),
-                dados.get('montagem_ok', 0),
-                dados.get('envio_ok', 0)
-            )
-
-            cursor.execute("""
-                INSERT INTO logs 
-                (data_hora, lote, pilha, arquivo, maquina, ip,
-                 formato, modo, quantidade, status, erro, copia, usuario,
-                 montagem_ok, envio_ok)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, valores)
-
-            conn.commit()
-            conn.close()
-            self._liberar_trava(trava)
-            return True
-        except Exception as e:
-            self._liberar_trava(trava)
-            self.adicionar_log(f"❌ Erro ao gravar no banco SQLite: {e}")
-            return False
+        """Mesmo serviço de histórico utilizado pela aba de miolo."""
+        return RegistroLogsSQLite.registrar(
+            self.log_db_path, self.log_db_local_path, dados,
+            self.adicionar_log
+        )
 
     # ==================== INTERFACE GRÁFICA ====================
     def setup_ui(self):
@@ -3280,11 +3198,14 @@ def carregar_configuracoes():
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
                 config = json.load(f)
-                # Converter cores de string para tupla
-                if isinstance(config.get('cor_fosco'), str):
-                    config['cor_fosco'] = eval(config['cor_fosco'])
-                if isinstance(config.get('cor_brilho'), str):
-                    config['cor_brilho'] = eval(config['cor_brilho'])
+                # Compatível com o formato legado, sem usar eval().
+                if not isinstance(config, dict):
+                    raise ValueError("Formato de configuração inválido")
+                config = {**DEFAULT_CONFIG, **config}
+                for chave in ('cor_fosco', 'cor_brilho'):
+                    config[chave] = interpretar_cor_configuracao(
+                        config[chave], DEFAULT_CONFIG[chave]
+                    )
                 return config
     except Exception as e:
         logging.error(f"Erro ao carregar configurações: {e}")
@@ -3293,8 +3214,8 @@ def carregar_configuracoes():
 def salvar_configuracoes(config):
     try:
         config_to_save = config.copy()
-        config_to_save['cor_fosco'] = str(config['cor_fosco'])
-        config_to_save['cor_brilho'] = str(config['cor_brilho'])
+        config_to_save['cor_fosco'] = list(config['cor_fosco'])
+        config_to_save['cor_brilho'] = list(config['cor_brilho'])
         
         with open(CONFIG_FILE, 'w') as f:
             json.dump(config_to_save, f, indent=4)
@@ -5279,7 +5200,7 @@ class HistoricoTab(ttk.Frame):
         # Será preenchido dinamicamente no primeiro acesso
 
         ttk.Label(row3, text="Status:").pack(side=tk.LEFT, padx=(20, 0))
-        self.status_combo = ttk.Combobox(row3, values=["", "Montagem OK", "Enviado", "Falha no envio", "Não enviado (manual)"],
+        self.status_combo = ttk.Combobox(row3, values=["", "Montagem OK", "Montagem Erro", "Enviado", "Falha no envio", "Não enviado (manual)", "Salvo", "Falha ao salvar"],
                                          width=20, state="readonly")
         self.status_combo.pack(side=tk.LEFT, padx=5)
         self.status_combo.current(0)
@@ -5327,7 +5248,7 @@ class HistoricoTab(ttk.Frame):
         resumo_frame.pack(fill=tk.X, pady=(5, 0))
         self.lbl_total_registros = ttk.Label(resumo_frame, text="Registros: 0", font=("Segoe UI", 9, "bold"))
         self.lbl_total_registros.pack(side=tk.LEFT, padx=20)
-        self.lbl_soma_qtd = ttk.Label(resumo_frame, text="Quantidade total: 0", font=("Segoe UI", 9, "bold"))
+        self.lbl_soma_qtd = ttk.Label(resumo_frame, text="Montadas: 0 | Enviadas: 0", font=("Segoe UI", 9, "bold"))
         self.lbl_soma_qtd.pack(side=tk.LEFT, padx=20)
 
         self.dados = []        # armazena os registros completos (excluindo cópia)
@@ -5350,16 +5271,17 @@ class HistoricoTab(ttk.Frame):
 
     def conectar_banco(self):
         caminho = self.app.log_db_path
-        try:
-            if not os.path.exists(os.path.dirname(caminho)):
-                raise Exception("Rede inacessível")
-            teste = os.path.join(os.path.dirname(caminho), ".write_test")
-            with open(teste, 'w') as f:
-                f.write("test")
-            os.remove(teste)
-        except:
+        if not os.path.isfile(caminho):
+            # O fallback local contém eventos ainda não conciliados; mostrar aviso.
             caminho = self.app.log_db_local_path
-        return sqlite3.connect(caminho)
+            if not os.path.isfile(caminho):
+                raise FileNotFoundError("Histórico central inacessível e nenhum histórico local disponível")
+            logging.warning("Histórico exibido é LOCAL, não contempla todas as estações")
+        # Abre o banco existente e bloqueia escritas nesta conexão.
+        # Evita problemas de URI do SQLite com caminhos UNC no Windows.
+        conexao = sqlite3.connect(caminho, timeout=10)
+        conexao.execute("PRAGMA query_only=ON")
+        return conexao
 
     def buscar(self):
         # Garantir que a lista de usuários esteja carregada
@@ -5436,15 +5358,24 @@ class HistoricoTab(ttk.Frame):
             cursor.execute(query, params)
             rows = cursor.fetchall()
 
-            soma_qtd = 0
+            montadas = 0
+            enviadas = 0
             for row in rows:
                 self.dados.append(row)
                 self.tree.insert("", tk.END, values=row)
-                soma_qtd += row[8]  # índice da quantidade (0‑based: 8)
+                quantidade = row[8] or 0
+                status = row[9]
+                modo = row[7]
+                if status == "Montagem OK":
+                    montadas += quantidade
+                elif status == "Enviado":
+                    # Capa: um registro por lote agrupado, com quantidade real.
+                    # Miolo: um registro por cópia, cada envio equivale a 1.
+                    enviadas += quantidade if modo == "envio" else 1
 
-            # Atualizar rodapé
-            self.lbl_total_registros.config(text=f"Registros: {len(rows)}")
-            self.lbl_soma_qtd.config(text=f"Quantidade total: {soma_qtd}")
+            # Os totais são relativos aos registros exibidos (LIMIT 5000).
+            self.lbl_total_registros.config(text=f"Registros: {len(rows)} (máx. 5000)")
+            self.lbl_soma_qtd.config(text=f"Montadas: {montadas} | Enviadas: {enviadas}")
 
         except Exception as e:
             messagebox.showerror("Erro", f"Falha ao consultar banco: {e}")
@@ -5471,7 +5402,7 @@ class HistoricoTab(ttk.Frame):
         self.tree.delete(*self.tree.get_children())
         self.dados = []
         self.lbl_total_registros.config(text="Registros: 0")
-        self.lbl_soma_qtd.config(text="Quantidade total: 0")
+        self.lbl_soma_qtd.config(text="Montadas: 0 | Enviadas: 0")
 
     def ordenar_por(self, coluna):
         if not self.dados:
