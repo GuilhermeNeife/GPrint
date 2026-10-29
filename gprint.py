@@ -35,111 +35,98 @@ import random
 
 
 # ============================================================================
-# GPRINT - COORDENACAO DO HISTORICO (SEM ALTERAR MONTAGEM OU ENVIO LPR)
+# GPRINT - HISTORICO EM LOTES / FILA LOCAL DURAVEL
+# Nao modifica imposicao de PDFs, montagem ou comandos LPR.
+# Cada evento e salvo PRIMEIRO no computador e transmitido em lotes ao final.
 # ============================================================================
 import socket
 from contextlib import contextmanager
 
-# Na rede, as estacoes utilizam o mesmo arquivo .lock que o GPrint original.
-# Uma estacao aguarda a outra concluir. NUNCA removemos automaticamente uma
-# trava que pareca antiga: outra estacao pode estar ativa ou desconectada.
-GPRINT_ESPERA_TRAVA_SEGUNDOS = 5
+# O arquivo .lock continua compativel com as estacoes que usam versoes antigas.
+# A nova versao tenta uma gravacao CENTRAL por lote, nao por copia/PDF.
+GPRINT_ESPERA_TRAVA_SEGUNDOS = 20
+GPRINT_TAMANHO_LOTE_BANCO = 250
 GPRINT_AVISO_INTERVALO_SEGUNDOS = 120
+GPRINT_FILA_LOCAL = os.path.join(
+    os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'),
+    'GPrint', 'historico_pendente.db'
+)
 _GPRINT_ULTIMOS_AVISOS = {}
 _GPRINT_AVISOS_MUTEX = threading.Lock()
+_GPRINT_SINCRONIZACAO_MUTEX = threading.Lock()
 
 
 class GPrintBancoIndisponivel(Exception):
-    """O compartilhamento de producao ou o arquivo central esta inacessivel."""
+    """Diretorio da rede ou arquivo do banco central indisponivel."""
 
 
 class GPrintBancoOcupado(Exception):
-    """O lock do banco continua ocupado apos a espera configurada."""
+    """Outra estacao manteve a trava alem da espera."""
 
 
 def gprint_checar_banco_central(caminho):
-    """Nao cria nem altera o arquivo central caso ele tenha desaparecido."""
-    pasta = os.path.dirname(caminho)
-    if not os.path.isdir(pasta):
-        raise GPrintBancoIndisponivel("Diretório de produção/LOGS inacessível")
-    if not os.path.isfile(caminho):
-        raise GPrintBancoIndisponivel("Arquivo impressoes.db não encontrado")
+    """Nao cria o banco central se a rede estiver fora do ar."""
+    if not os.path.isdir(os.path.dirname(caminho)) or not os.path.isfile(caminho):
+        raise GPrintBancoIndisponivel('Banco central ou pasta de producao inacessivel')
 
 
-def gprint_avisar_operador(root, tipo, detalhe=""):
-    """MessageBox agendada na thread Tk, com limitacao de repeticoes."""
+def gprint_avisar_operador(root, tipo, detalhe=''):
+    """Avisos de operacao sem nomes de arquivos, caminhos ou termos tecnicos."""
+    # 'trava' e lentidao temporaria nao devem gerar uma mensagem para producao.
+    if tipo not in ('rede', 'local'):
+        return
     agora = time.monotonic()
     with _GPRINT_AVISOS_MUTEX:
-        anterior = _GPRINT_ULTIMOS_AVISOS.get(tipo, -1e10)
-        if agora - anterior < GPRINT_AVISO_INTERVALO_SEGUNDOS:
+        ultimo = _GPRINT_ULTIMOS_AVISOS.get(tipo, -1e10)
+        if agora - ultimo < GPRINT_AVISO_INTERVALO_SEGUNDOS:
             return
         _GPRINT_ULTIMOS_AVISOS[tipo] = agora
 
-    if tipo == "rede":
-        titulo = "GPrint - BANCO DE DADOS NÃO ENCONTRADO"
+    if tipo == 'rede':
+        titulo = 'GPrint - HISTORICO INDISPONIVEL'
         mensagem = (
-            "O banco de dados central não foi encontrado ou a rede está indisponível.\n\n"
-            "Verifique se o diretório 'produção' está online e acessível.\n"
-            "INFORME O GUILHERME sobre o ocorrido.\n\n"
-            "Os registros serão salvos localmente, se possível, e NÃO aparecerão "
-            "no histórico central até serem conciliados."
-        )
-    elif tipo == "trava":
-        titulo = "GPrint - BANCO DE DADOS OCUPADO"
-        mensagem = (
-            "Outra estação pode estar gravando no banco, ou o arquivo .lock "
-            "pode ter ficado preso.\n\n"
-            "INFORME O GUILHERME. Não apague o .lock sem confirmar que "
-            "nenhuma estação esteja usando o banco.\n\n"
-            "O registro será tentado no banco local de emergência."
-        )
-    elif tipo == "local":
-        titulo = "GPrint - REGISTRO NAO SALVO"
-        mensagem = (
-            "Não foi possível salvar o registro nem na rede nem neste computador.\n"
-            "INFORME O GUILHERME IMEDIATAMENTE."
+            'Não foi possível acessar o banco de dados da produção.\n\n'
+            'Verifique se a pasta "produção" está online e acessível.\n'
+            'Se o problema continuar, INFORME O GUILHERME.\n\n'
+            'Os registros desta estação permanecerão guardados localmente '
+            'e serão reenviados na próxima sincronização com a rede disponível.'
         )
     else:
-        titulo = "GPrint - FALHA NO HISTORICO"
+        titulo = 'GPrint - FALHA AO GUARDAR HISTORICO'
         mensagem = (
-            "Falha ao acessar o banco central. Verifique o diretório 'produção' "
-            "e INFORME O GUILHERME.\n\n"
-            "O registro será tentado no banco local de emergência."
+            'Não foi possível guardar o histórico neste computador.\n'
+            'INFORME O GUILHERME imediatamente.\n\n'
+            'O processamento pode ter ocorrido sem registro completo.'
         )
-    if detalhe:
-        mensagem += "\n\nDetalhe técnico: " + str(detalhe)[:260]
 
     def mostrar():
         try:
             messagebox.showwarning(titulo, mensagem, parent=root)
         except Exception:
-            logging.exception("Erro ao exibir aviso de banco de dados")
+            logging.exception('Falha ao apresentar mensagem do banco')
 
-    # Chamada vem frequentemente de uma thread de processamento; never
-    # chamar showwarning diretamente nela.
     try:
         if root is not None:
             root.after(0, mostrar)
         else:
-            logging.error("%s: %s", titulo, mensagem)
+            logging.warning('%s: %s', titulo, mensagem)
     except Exception:
-        logging.exception("Falha ao agendar aviso de banco de dados")
+        logging.exception('Falha ao agendar aviso de banco')
 
 
 @contextmanager
 def gprint_lock_banco(caminho_lock, timeout=GPRINT_ESPERA_TRAVA_SEGUNDOS):
-    """Exclusao mutua entre estacoes com verificacao de propriedade do lock."""
-    identidade = f"{socket.gethostname()}|{os.getpid()}|{uuid.uuid4().hex}"
+    """Trava compativel entre estacoes, liberada somente por quem a criou."""
+    identidade = f'{socket.gethostname()}|{os.getpid()}|{uuid.uuid4().hex}'
     inicio = time.monotonic()
     while True:
         try:
             fd = os.open(caminho_lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(identidade)
-                    f.flush()
+                with os.fdopen(fd, 'w', encoding='utf-8') as arquivo:
+                    arquivo.write(identidade)
+                    arquivo.flush()
             except Exception:
-                # Criou arquivo mas nao conseguiu escrever; tenta desfazer.
                 try:
                     os.remove(caminho_lock)
                 except OSError:
@@ -148,117 +135,225 @@ def gprint_lock_banco(caminho_lock, timeout=GPRINT_ESPERA_TRAVA_SEGUNDOS):
             break
         except FileExistsError:
             if time.monotonic() - inicio >= timeout:
-                raise GPrintBancoOcupado(
-                    f"Tempo esgotado ({timeout}s) aguardando: {caminho_lock}"
-                )
-            time.sleep(random.uniform(0.12, 0.32))
-
+                raise GPrintBancoOcupado('Banco ocupado por outra estacao')
+            time.sleep(random.uniform(0.15, 0.35))
     try:
         yield
     finally:
-        # Evita remover um lock de outro processo caso a rede tenha oscilado.
         try:
-            with open(caminho_lock, "r", encoding="utf-8") as f:
-                atual = f.read()
+            with open(caminho_lock, 'r', encoding='utf-8') as arquivo:
+                atual = arquivo.read()
             if atual == identidade:
                 os.remove(caminho_lock)
             else:
-                logging.error("Nao removi lock de outro proprietario: %s", caminho_lock)
+                logging.error('Trava do banco pertence a outra estacao; nao removida')
         except FileNotFoundError:
-            logging.warning("Lock desapareceu durante a gravacao: %s", caminho_lock)
-        except OSError as e:
-            logging.error("Nao consegui liberar lock %s: %s", caminho_lock, e)
+            logging.warning('Trava do banco nao estava presente ao liberar')
+        except OSError:
+            logging.exception('Nao foi possivel liberar trava do banco')
 
 
-def gprint_gravar_evento_em_sqlite(caminho_db, dados, criar_banco=False):
-    """Mesma tabela/campos/quantidades do GPrint original; escrita serializada."""
-    if not criar_banco:
-        gprint_checar_banco_central(caminho_db)
-    else:
-        os.makedirs(os.path.dirname(caminho_db), exist_ok=True)
+_GPRINT_CRIAR_LOGS = """
+    CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        data_hora TEXT, lote TEXT, pilha TEXT, arquivo TEXT,
+        maquina TEXT, ip TEXT, formato TEXT, modo TEXT,
+        quantidade INTEGER, status TEXT, erro TEXT, copia TEXT,
+        usuario TEXT, montagem_ok INTEGER DEFAULT 0,
+        envio_ok INTEGER DEFAULT 0
+    )
+"""
+_GPRINT_INSERIR_LOG = """
+    INSERT INTO logs
+    (data_hora, lote, pilha, arquivo, maquina, ip, formato, modo,
+     quantidade, status, erro, copia, usuario, montagem_ok, envio_ok)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
 
-    with gprint_lock_banco(caminho_db + ".lock"):
-        conn = None
+
+def gprint_guardar_evento_local(dados, caminho_local=GPRINT_FILA_LOCAL):
+    """Commit local antes de retornar; sobrevive ao encerramento do GPrint."""
+    pasta = os.path.dirname(caminho_local)
+    os.makedirs(pasta, exist_ok=True)
+    identificador = uuid.uuid4().hex
+    instante = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with sqlite3.connect(caminho_local, timeout=20) as conexao:
+        # Local apenas: WAL nao e ativado no banco central em rede.
+        conexao.execute('PRAGMA busy_timeout=20000')
+        conexao.execute("""
+            CREATE TABLE IF NOT EXISTS fila_eventos (
+                evento_id TEXT PRIMARY KEY,
+                data_hora TEXT NOT NULL,
+                dados_json TEXT NOT NULL
+            )
+        """)
+        conexao.execute("""
+            INSERT INTO fila_eventos (evento_id, data_hora, dados_json)
+            VALUES (?, ?, ?)
+        """, (identificador, instante, json.dumps(dados, ensure_ascii=False)))
+    return identificador
+
+
+def gprint_contar_pendentes(caminho_local=GPRINT_FILA_LOCAL):
+    if not os.path.isfile(caminho_local):
+        return 0
+    with sqlite3.connect(caminho_local, timeout=10) as conexao:
         try:
-            # timeout adicional para locks internos do SQLite.
-            conn = sqlite3.connect(caminho_db, timeout=10)
-            conn.execute("PRAGMA busy_timeout=10000")
-            # IMPORTANTE: nao ativar WAL no banco de rede. Se o banco antigo
-            # ja estiver em WAL, sua migracao exige manutencao supervisionada.
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    data_hora TEXT, lote TEXT, pilha TEXT, arquivo TEXT,
-                    maquina TEXT, ip TEXT, formato TEXT, modo TEXT,
-                    quantidade INTEGER, status TEXT, erro TEXT, copia TEXT,
-                    usuario TEXT, montagem_ok INTEGER DEFAULT 0,
-                    envio_ok INTEGER DEFAULT 0
+            return conexao.execute('SELECT COUNT(*) FROM fila_eventos').fetchone()[0]
+        except sqlite3.OperationalError as e:
+            if 'no such table' in str(e).lower():
+                return 0
+            raise
+
+
+def gprint_ler_pendentes(limite=GPRINT_TAMANHO_LOTE_BANCO,
+                        caminho_local=GPRINT_FILA_LOCAL):
+    if not os.path.isfile(caminho_local):
+        return []
+    with sqlite3.connect(caminho_local, timeout=10) as conexao:
+        try:
+            return conexao.execute("""
+                SELECT evento_id, data_hora, dados_json FROM fila_eventos
+                ORDER BY rowid LIMIT ?
+            """, (limite,)).fetchall()
+        except sqlite3.OperationalError as e:
+            if 'no such table' in str(e).lower():
+                return []
+            raise
+
+
+def gprint_gravar_lote_central(caminho_central, eventos):
+    """Uma trava / uma transacao por lote, compatível com a tabela existente.
+
+    gprint_ids_recebidos impede duplicacoes se a rede falhar DEPOIS do commit
+    mas ANTES de apagar a fila local. Nao altera colunas da tabela logs.
+    """
+    if not eventos:
+        return 0
+    gprint_checar_banco_central(caminho_central)
+    with gprint_lock_banco(caminho_central + '.lock'):
+        conexao = sqlite3.connect(caminho_central, timeout=15)
+        try:
+            conexao.execute('PRAGMA busy_timeout=15000')
+            conexao.execute('BEGIN IMMEDIATE')
+            conexao.execute(_GPRINT_CRIAR_LOGS)
+            conexao.execute("""
+                CREATE TABLE IF NOT EXISTS gprint_ids_recebidos (
+                    evento_id TEXT PRIMARY KEY,
+                    data_hora TEXT NOT NULL
                 )
             """)
-            valores = (
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                dados.get("lote", ""), dados.get("pilha", ""),
-                dados.get("arquivo", ""), dados.get("maquina", ""),
-                dados.get("ip", ""), dados.get("formato", ""),
-                dados.get("modo", ""), dados.get("quantidade", 0),
-                dados.get("status", ""), dados.get("erro", ""),
-                dados.get("copia", ""), dados.get("usuario", ""),
-                dados.get("montagem_ok", 0), dados.get("envio_ok", 0),
-            )
-            conn.execute("""
-                INSERT INTO logs
-                (data_hora, lote, pilha, arquivo, maquina, ip, formato, modo,
-                 quantidade, status, erro, copia, usuario, montagem_ok, envio_ok)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, valores)
-            conn.commit()
-            return True
+            novos = 0
+            for evento_id, instante, dados_json in eventos:
+                dados = json.loads(dados_json)
+                cursor = conexao.execute("""
+                    INSERT OR IGNORE INTO gprint_ids_recebidos
+                    (evento_id, data_hora) VALUES (?, ?)
+                """, (evento_id, instante))
+                if cursor.rowcount != 1:
+                    continue
+                valores = (
+                    instante, dados.get('lote', ''), dados.get('pilha', ''),
+                    dados.get('arquivo', ''), dados.get('maquina', ''),
+                    dados.get('ip', ''), dados.get('formato', ''),
+                    dados.get('modo', ''), dados.get('quantidade', 0),
+                    dados.get('status', ''), dados.get('erro', ''),
+                    dados.get('copia', ''), dados.get('usuario', ''),
+                    dados.get('montagem_ok', 0), dados.get('envio_ok', 0)
+                )
+                conexao.execute(_GPRINT_INSERIR_LOG, valores)
+                novos += 1
+            conexao.commit()
+            return novos
         except Exception:
-            if conn is not None:
-                try:
-                    conn.rollback()
-                except sqlite3.Error:
-                    pass
+            conexao.rollback()
             raise
         finally:
-            if conn is not None:
-                conn.close()
+            conexao.close()
+
+
+def gprint_remover_enviados_local(ids, caminho_local=GPRINT_FILA_LOCAL):
+    if not ids:
+        return
+    with sqlite3.connect(caminho_local, timeout=20) as conexao:
+        conexao.executemany('DELETE FROM fila_eventos WHERE evento_id=?', [(i,) for i in ids])
+
+
+def gprint_sincronizar_pendentes(central, root=None, emitir_log=None,
+                                caminho_local=GPRINT_FILA_LOCAL):
+    """Tenta sincronizar a fila; nunca reenvia PDFs ou comandos LPR."""
+    if emitir_log is None:
+        emitir_log = lambda mensagem: logging.info('%s', mensagem)
+    if not _GPRINT_SINCRONIZACAO_MUTEX.acquire(blocking=False):
+        return 0  # Outra sincronizacao desta instancia esta em andamento.
+    enviados = 0
+    try:
+        while True:
+            eventos = gprint_ler_pendentes(caminho_local=caminho_local)
+            if not eventos:
+                if enviados:
+                    emitir_log(f'Historico sincronizado: {enviados} registro(s).')
+                return enviados
+            try:
+                gprint_gravar_lote_central(central, eventos)
+            except GPrintBancoOcupado:
+                # Nao incomoda operadores com arquivos .lock ou detalhes de banco.
+                emitir_log('Historico aguardando disponibilidade do banco central. Registros protegidos neste computador.')
+                return enviados
+            except (GPrintBancoIndisponivel, OSError) as e:
+                logging.warning('Historico: falha de rede ao sincronizar: %s', e)
+                gprint_avisar_operador(root, 'rede')
+                emitir_log('Historico aguardando rede de producao. Registros protegidos neste computador.')
+                return enviados
+            except sqlite3.OperationalError as e:
+                # SQLite ocupado NAO equivale a rede offline.
+                logging.warning('Historico: banco central temporariamente ocupado/erro: %s', e)
+                emitir_log('Historico ainda nao sincronizado. Registros protegidos neste computador.')
+                return enviados
+            except Exception as e:
+                logging.exception('Erro inesperado ao sincronizar historico: %s', e)
+                emitir_log('Historico aguardando verificacao. Registros protegidos neste computador.')
+                return enviados
+            # Somente depois de o commit central confirmar e que removemos da fila.
+            # Se a limpeza falhar, a mesma ID sera ignorada na proxima tentativa.
+            ids = [evento[0] for evento in eventos]
+            try:
+                gprint_remover_enviados_local(ids, caminho_local=caminho_local)
+            except Exception:
+                logging.exception('Central confirmou registros, mas fila nao foi limpa')
+                return enviados
+            enviados += len(ids)
+    except Exception as e:
+        logging.exception('Nao foi possivel consultar fila local de historico: %s', e)
+        gprint_avisar_operador(root, 'local')
+        return enviados
+    finally:
+        _GPRINT_SINCRONIZACAO_MUTEX.release()
 
 
 def gprint_registrar_log_seguro(dados, central, local, root, emitir_log):
-    """Grava na rede; se falhar, salva localmente e avisa o operador."""
+    """Compativel com chamadas anteriores, mas SEM acessar a rede por evento."""
     try:
-        gprint_gravar_evento_em_sqlite(central, dados, criar_banco=False)
+        gprint_guardar_evento_local(dados)
         return True
-    except GPrintBancoIndisponivel as e:
-        tipo, erro_central = "rede", str(e)
-    except GPrintBancoOcupado as e:
-        tipo, erro_central = "trava", str(e)
-    except Exception as e:
-        tipo, erro_central = "erro", str(e)
-
-    emitir_log(f"ATENCAO: historico central indisponivel: {erro_central}")
-    gprint_avisar_operador(root, tipo, erro_central)
-    try:
-        gprint_gravar_evento_em_sqlite(local, dados, criar_banco=True)
-        emitir_log(
-            "ATENCAO: registro salvo SOMENTE no banco local. "
-            "Informar Guilherme para conciliacao manual."
-        )
-        return True
-    except Exception as erro_local:
-        emitir_log(f"ERRO CRITICO: registro nao salvo em nenhum banco: {erro_local}")
-        gprint_avisar_operador(root, "local", str(erro_local))
+    except Exception:
+        logging.exception('ERRO: falha ao registrar evento na fila local')
+        emitir_log('ATENCAO: registro do historico nao foi guardado. Informar Guilherme.')
+        gprint_avisar_operador(root, 'local')
         return False
 
 
 def gprint_verificar_banco_no_inicio(caminho, root):
-    """Checagem inicial em thread, sem bloquear a abertura da interface."""
+    """Verificacao e recuperacao de eventos anteriores, sem travar a interface."""
     try:
         gprint_checar_banco_central(caminho)
-    except (OSError, GPrintBancoIndisponivel) as e:
-        gprint_avisar_operador(root, "rede", str(e))
+    except (OSError, GPrintBancoIndisponivel):
+        gprint_avisar_operador(root, 'rede')
+        return
+    if gprint_contar_pendentes():
+        gprint_sincronizar_pendentes(caminho, root=root)
+
+# ============================================================================
 
 # ============================================================================
 
@@ -1297,6 +1392,13 @@ class MioloTab(ttk.Frame):
                 self.log(f"⚠️ Não foi possível remover temporários: {erro_limpeza}", "INFO")
 
         
+        # Registros foram guardados localmente durante o processamento.
+        # Uma unica sincronizacao de lotes, sem entrar no banco por PDF/copia.
+        gprint_sincronizar_pendentes(
+            self.log_db_path, root=self.app.root,
+            emitir_log=lambda msg: self.log(msg, "INFO")
+        )
+
         self.log(f"\n{'='*50}", "INFO")
         self.log(f"📊 RESUMO FINAL", "INFO")
         self.log(f"{'='*50}", "INFO")
@@ -3313,6 +3415,12 @@ class Application:
             self.root.after(0, lambda: self.finalizar_processamento(False))
             self.root.after(0, lambda: messagebox.showerror("Erro", f"Ocorreu um erro durante o processamento: {e}"))
         finally:
+            # Historico acumulado localmente durante a execucao:
+            # sincroniza so ao concluir o grupo inteiro, inclusive se houve erro.
+            gprint_sincronizar_pendentes(
+                self.log_db_path, root=self.root,
+                emitir_log=self.adicionar_log
+            )
             # Limpa apenas a pasta desta execucao, inclusive subpastas de itens.
             # Repetir a tentativa atende a bloqueios de arquivo momentaneos no Windows.
             for tentativa in range(3):
