@@ -1259,12 +1259,14 @@ class MioloTab(ttk.Frame):
                     dados_montagem = {
                         'lote': lote,
                         'pilha': pilha,
-                        'arquivo': p['NOMEFIC'],
+                        'arquivo': os.path.basename(output_path),
                         'maquina': impressora_selecionada,
                         'ip': ip_extraido,
                         'formato': p['FORMATO'],
                         'modo': p['MODO'],
-                        'quantidade': qtd_envios,
+                        # Um PDF final preparado. As copias enviadas sao
+                        # registradas individualmente na etapa de envio.
+                        'quantidade': 1,
                         'status': 'Montagem OK',
                         'erro': '',
                         'copia': '0/0',
@@ -1340,12 +1342,16 @@ class MioloTab(ttk.Frame):
                         dados_log = {
                             'lote': lote,
                             'pilha': pilha,
-                            'arquivo': p['NOMEFIC'],
+                            'arquivo': os.path.basename(output_path),
                             'maquina': impressora_selecionada,
                             'ip': ip_extraido,
                             'formato': p['FORMATO'],
                             'modo': p['MODO'],
-                            'quantidade': qtd_envios,
+                            # Cada linha representa UM envio LPR (ou uma
+                            # copia salva manualmente), nunca o total do grupo.
+                            # Quando um unico job encapsula varios exemplares,
+                            # o total fisico deve ser apurado separadamente.
+                            'quantidade': 1,
                             'status': status,
                             'erro': erro,
                             'copia': f"{copia_num}/{qtd_envios}",
@@ -3294,26 +3300,26 @@ class Application:
                                 pdfs_para_mesclar[chave].extend([pdf_marcado] * quantidade)
                                 totais_montagem[chave] += quantidade
                                 
-                                # ===== REGISTRO DE MONTAGEM (SQLite) =====
-                                # Para cada cópia, um registro individual
-                                for copia_idx in range(quantidade):
-                                    dados_montagem = {
-                                        'lote': os.path.dirname(arquivo_txt),
-                                        'pilha': pilha_txt,
-                                        'arquivo': linha["ARQUIVO"],
-                                        'maquina': MAQUINA_CAPA,
-                                        'ip': IP_CAPA,
-                                        'formato': filacolor,
-                                        'modo': 'capa_marcacao',
-                                        'quantidade': 1,
-                                        'status': 'Montagem OK',
-                                        'erro': '',
-                                        'copia': f"{copia_idx+1}/{quantidade}",
-                                        'usuario': usuario,
-                                        'montagem_ok': 1,
-                                        'envio_ok': 0
-                                    }
-                                    self.registrar_log_sqlite(dados_montagem)
+                                # Um registro por arquivo de capa preparado.
+                                # A quantidade indica quantas capas deste
+                                # arquivo entraram na mesclagem, nao envios LPR.
+                                dados_montagem = {
+                                    'lote': os.path.dirname(arquivo_txt),
+                                    'pilha': pilha_txt,
+                                    'arquivo': os.path.basename(linha["ARQUIVO"]),
+                                    'maquina': MAQUINA_CAPA,
+                                    'ip': IP_CAPA,
+                                    'formato': filacolor,
+                                    'modo': 'capa_marcacao',
+                                    'quantidade': quantidade,
+                                    'status': 'Montagem OK',
+                                    'erro': '',
+                                    'copia': '',
+                                    'usuario': usuario,
+                                    'montagem_ok': 1,
+                                    'envio_ok': 0
+                                }
+                                self.registrar_log_sqlite(dados_montagem)
                         
                         arquivos_processados += 1
                         percentual = (arquivos_processados / total_arquivos) * 80
@@ -3355,6 +3361,27 @@ class Application:
                     raise
                 self.adicionar_log(f"✅ Arquivo gerado para TXT {pilha_txt}: {nome_final}")
 
+                # A mesclagem final e uma etapa separada do preparo das capas
+                # e do envio LPR. Nao altera o arquivo nem a rotina de envio.
+                self.registrar_log_sqlite({
+                    'lote': pasta_destino,
+                    'pilha': pilha_txt,
+                    'arquivo': os.path.basename(nome_final),
+                    'maquina': MAQUINA_CAPA,
+                    'ip': IP_CAPA,
+                    'formato': filacolor,
+                    'modo': 'mesclagem',
+                    'quantidade': total_montagens,
+                    'status': 'Mesclagem OK',
+                    'erro': '',
+                    'copia': '',
+                    'usuario': usuario,
+                    # Mesclagem nao e outra capa montada; evita dupla contagem
+                    # em consultas antigas que somam montagem_ok.
+                    'montagem_ok': 0,
+                    'envio_ok': 0
+                })
+
                 if self.imprimir_automaticamente.get():
                     sucesso = self.enviar_para_impressora(
                         nome_final,
@@ -3367,7 +3394,7 @@ class Application:
                     dados_envio = {
                         'lote': pasta_destino,
                         'pilha': pilha_txt,
-                        'arquivo': identific,
+                        'arquivo': os.path.basename(nome_final),
                         'maquina': MAQUINA_CAPA,
                         'ip': IP_CAPA,
                         'formato': filacolor,
@@ -3385,7 +3412,7 @@ class Application:
                     dados_nao_enviado = {
                         'lote': pasta_destino,
                         'pilha': pilha_txt,
-                        'arquivo': identific,
+                        'arquivo': os.path.basename(nome_final),
                         'maquina': MAQUINA_CAPA,
                         'ip': IP_CAPA,
                         'formato': filacolor,
@@ -3589,7 +3616,7 @@ class Application:
         tk.Label(main, text="GPrint", font=("Segoe UI", 18, "bold"),
                 bg="#0f172a", fg="#f8fafc").pack(pady=(10, 0))
 
-        versao_badge = tk.Label(main, text="  v5.0  ", font=("Segoe UI", 10, "bold"),
+        versao_badge = tk.Label(main, text="  v11.0  ", font=("Segoe UI", 10, "bold"),
                                 bg="#3b82f6", fg="white", padx=8, pady=2)
         versao_badge.pack(pady=(4, 12))
 
@@ -5553,23 +5580,159 @@ from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
+def gprint_material_historico(pilha, arquivo, modo):
+    """O TXT de origem tem prioridade sobre nomes de arquivos e modos."""
+    origem = str(pilha or '').upper()
+    if 'UICLAP_MIOLO_' in origem:
+        return 'Miolo'
+    if 'UICLAP_CAPA_' in origem:
+        return 'Capa'
+    if modo in ('capa_marcacao', 'mesclagem', 'envio'):
+        return 'Capa'
+    arquivo = str(arquivo or '').upper()
+    if '-MIOLO-' in arquivo or 'MIOLO_' in arquivo:
+        return 'Miolo'
+    if '-CAPA-' in arquivo or 'CAPA_' in arquivo:
+        return 'Capa'
+    return 'Outro'
+
+
+def gprint_resumir_lote(caminho):
+    """Exibe a pasta do lote, sem perder o caminho completo no banco."""
+    componentes = str(caminho or '').replace('\\', '/').split('/')
+    for parte in componentes:
+        if re.match(r'^\d{3,}[-_]', parte):
+            return parte
+    return componentes[-1] if componentes else ''
+
+
+def gprint_resumir_pilha(nome):
+    texto = str(nome or '')
+    texto = re.sub(r'^UICLAP_(?:CAPA|MIOLO)_', '', texto, flags=re.I)
+    texto = re.sub(r'_\d+ ITENS?_\d+ TOTAL$', '', texto, flags=re.I)
+    return texto
+
+
+def gprint_nome_equipamento(maquina):
+    return str(maquina or '').split(' - ')[0]
+
+
+def gprint_descricao_modo(modo):
+    nomes = {
+        'capa_marcacao': 'Marcação de capa',
+        'mesclagem': 'Mesclagem de capas',
+        'envio': 'Envio do PDF mesclado',
+        'corta_empilha_rotacionado': 'Corta/empilha rotacionado',
+        'Corta_empilha': 'Corta e empilha',
+        'grampo': 'Grampo',
+        'dois_na_folha': 'Dois na folha',
+        'dois_na_folha_rotacionado': 'Dois na folha rotacionado',
+        'um_na_folha_atexco': 'Uma na folha ATEXCO',
+        'um_na_folha': 'Uma na folha',
+    }
+    return nomes.get(modo, str(modo or ''))
+
+
+def gprint_situacao_historico(status, material, maquina, copia):
+    """Texto didatico de exibicao; nao muda o status salvo no SQLite."""
+    destino = gprint_nome_equipamento(maquina)
+    rotulos = {
+        'Montagem OK': 'Capa preparada' if material == 'Capa' else 'PDF de miolo preparado',
+        'Mesclagem OK': 'Capas mescladas em PDF final',
+        'Enviado': f'Enviado à {destino}',
+        'Falha no envio': f'Falha no envio à {destino}',
+        'Montagem Erro': 'Erro na montagem',
+        'Não enviado (manual)': 'PDF salvo, sem envio LPR',
+        'Salvo': 'PDF salvo localmente',
+        'Falha ao salvar': 'Falha ao salvar PDF',
+    }
+    return rotulos.get(str(status or ''), str(status or ''))
+
+
+def gprint_resumo_historico_agrupado(grupos):
+    """Resumo de operações obtido por SQL agrupado, sem LIMIT da tabela visual.
+
+    grupos: (tipo, status, modo, total_eventos, soma_quantidade).
+    - Capa preparada: soma quantidades, pois registros antigos eram por copia
+      (qtd=1) e os novos sao por arquivo com a quantidade total.
+    - Capa mesclada/enviada: soma quantidades dos eventos correspondentes.
+    - Miolo: conta eventos, porque um envio LPR pode conter mais de um livro.
+    """
+    r = {
+        'registros': 0,
+        'capa_preparadas': 0,
+        'capa_mescladas': 0, 'capa_pdfs_mesclados': 0,
+        'capa_pdfs_enviados': 0, 'capa_capas_enviadas': 0,
+        'capa_falhas_lpr': 0,
+        'miolo_pdfs_montados': 0, 'miolo_envios_lpr': 0,
+        'miolo_falhas_lpr': 0, 'miolo_pdfs_salvos': 0,
+        'outros': 0,
+    }
+    for material, status, modo, eventos, quantidade in grupos:
+        eventos = int(eventos or 0)
+        quantidade = int(quantidade or 0)
+        status, modo = str(status or ''), str(modo or '')
+        r['registros'] += eventos
+        if material == 'Capa':
+            if status == 'Montagem OK':
+                r['capa_preparadas'] += quantidade
+            elif status == 'Mesclagem OK':
+                r['capa_mescladas'] += quantidade
+                r['capa_pdfs_mesclados'] += eventos
+            elif status == 'Enviado':
+                r['capa_pdfs_enviados'] += eventos
+                if modo == 'envio':
+                    r['capa_capas_enviadas'] += quantidade
+            elif status == 'Falha no envio':
+                r['capa_falhas_lpr'] += eventos
+        elif material == 'Miolo':
+            if status == 'Montagem OK':
+                r['miolo_pdfs_montados'] += eventos
+            elif status == 'Enviado':
+                r['miolo_envios_lpr'] += eventos
+            elif status == 'Falha no envio':
+                r['miolo_falhas_lpr'] += eventos
+            elif status == 'Salvo':
+                r['miolo_pdfs_salvos'] += eventos
+        else:
+            r['outros'] += eventos
+    return r
+
+
+def gprint_tipo_historico_sql():
+    """Classificacao no SQL, compativel com a exibicao de eventos antigos."""
+    return ("CASE "
+            "WHEN instr(upper(coalesce(pilha,'')), 'UICLAP_MIOLO_') > 0 THEN 'Miolo' "
+            "WHEN instr(upper(coalesce(pilha,'')), 'UICLAP_CAPA_') > 0 THEN 'Capa' "
+            "WHEN modo IN ('capa_marcacao','mesclagem','envio') THEN 'Capa' "
+            "WHEN instr(upper(coalesce(arquivo,'')), '-MIOLO-') > 0 "
+            "OR instr(upper(coalesce(arquivo,'')), 'MIOLO_') > 0 THEN 'Miolo' "
+            "WHEN instr(upper(coalesce(arquivo,'')), '-CAPA-') > 0 "
+            "OR instr(upper(coalesce(arquivo,'')), 'CAPA_') > 0 THEN 'Capa' "
+            "ELSE 'Outro' END")
+
+
 class HistoricoTab(ttk.Frame):
+    """Busca explicitamente acionada pelo operador; nao consulta DB na abertura."""
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
+        self.dados = []
+        self.dados_brutos = {}
+        self.ordem_atual = None
+        self._busca_em_andamento = False
+        self._usuarios_carregados = False
+        self._resultado_busca = queue.Queue()
         self.setup_ui()
-        # Carregar dados ao abrir a aba
-        self.after(300, self.buscar)
+        # Sem self.after(..., buscar): nao acessar rede apenas por abrir a aba.
 
     def setup_ui(self):
         main_frame = ttk.Frame(self, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # ===== FILTROS =====
-        filtro_frame = ttk.LabelFrame(main_frame, text="🔍 Filtros", bootstyle="primary")
+        filtro_frame = ttk.LabelFrame(main_frame, text="🔍 Filtros de Histórico", bootstyle="primary")
         filtro_frame.pack(fill=tk.X, pady=(0, 10))
 
-        # Linha 1: Data
         row1 = ttk.Frame(filtro_frame)
         row1.pack(fill=tk.X, padx=5, pady=5)
         ttk.Label(row1, text="De:").pack(side=tk.LEFT, padx=(0, 2))
@@ -5580,224 +5743,284 @@ class HistoricoTab(ttk.Frame):
         self.data_fim = ttk.Entry(row1, width=12)
         self.data_fim.pack(side=tk.LEFT, padx=2)
         self.data_fim.insert(0, datetime.now().strftime("%d/%m/%Y"))
-
         self.usar_data = tk.BooleanVar(value=True)
         ttk.Checkbutton(row1, text="Filtrar por data", variable=self.usar_data).pack(side=tk.LEFT, padx=20)
 
-        # Linha 2: Lote, Pilha, Arquivo
         row2 = ttk.Frame(filtro_frame)
         row2.pack(fill=tk.X, padx=5, pady=5)
         ttk.Label(row2, text="Lote:").pack(side=tk.LEFT)
-        self.lote_entry = ttk.Entry(row2, width=30)
+        self.lote_entry = ttk.Entry(row2, width=26)
         self.lote_entry.pack(side=tk.LEFT, padx=5)
-
-        ttk.Label(row2, text="Pilha:").pack(side=tk.LEFT, padx=(20, 0))
+        ttk.Label(row2, text="Pilha:").pack(side=tk.LEFT, padx=(12, 0))
         self.pilha_entry = ttk.Entry(row2, width=25)
         self.pilha_entry.pack(side=tk.LEFT, padx=5)
-
-        ttk.Label(row2, text="Arquivo:").pack(side=tk.LEFT, padx=(20, 0))
+        ttk.Label(row2, text="Arquivo:").pack(side=tk.LEFT, padx=(12, 0))
         self.arquivo_entry = ttk.Entry(row2, width=25)
         self.arquivo_entry.pack(side=tk.LEFT, padx=5)
 
-        # Linha 3: Máquina, Usuário, Status
         row3 = ttk.Frame(filtro_frame)
         row3.pack(fill=tk.X, padx=5, pady=5)
-
-        ttk.Label(row3, text="Máquina:").pack(side=tk.LEFT)
-        maquinas = [
-            "Todas",
-            "ATEXCO - 192.168.200.121",
-            "BALTORO - 192.168.200.73",
-            "OCÉ 1 - 192.168.200.80",
-            "OCÉ 3 - 192.168.200.85",
-            "RICOH - 192.168.200.84"
-        ]
-        self.maquina_combo = ttk.Combobox(row3, values=maquinas, width=30, state="readonly")
+        ttk.Label(row3, text="Tipo:").pack(side=tk.LEFT)
+        self.tipo_combo = ttk.Combobox(row3, values=["Todos", "Capa", "Miolo"], width=10, state="readonly")
+        self.tipo_combo.pack(side=tk.LEFT, padx=5)
+        self.tipo_combo.current(0)
+        ttk.Label(row3, text="Operação:").pack(side=tk.LEFT, padx=(12, 0))
+        self.operacao_combo = ttk.Combobox(
+            row3, values=["Todas", "Montagem", "Mesclagem", "Envio LPR", "Falha LPR", "Salvo sem envio"],
+            width=18, state="readonly")
+        self.operacao_combo.pack(side=tk.LEFT, padx=5)
+        self.operacao_combo.current(0)
+        ttk.Label(row3, text="Máquina:").pack(side=tk.LEFT, padx=(12, 0))
+        maquinas = ["Todas", "ATEXCO - 192.168.200.121", "BALTORO - 192.168.200.73",
+                    "OCÉ 1 - 192.168.200.80", "OCÉ 3 - 192.168.200.85", "RICOH - 192.168.200.84"]
+        self.maquina_combo = ttk.Combobox(row3, values=maquinas, width=27, state="readonly")
         self.maquina_combo.pack(side=tk.LEFT, padx=5)
         self.maquina_combo.current(0)
 
-        ttk.Label(row3, text="Usuário:").pack(side=tk.LEFT, padx=(20, 0))
-        self.usuario_combo = ttk.Combobox(row3, values=[], width=15, state="readonly")
-        self.usuario_combo.pack(side=tk.LEFT, padx=5)
-        # Será preenchido dinamicamente no primeiro acesso
-
-        ttk.Label(row3, text="Status:").pack(side=tk.LEFT, padx=(20, 0))
-        self.status_combo = ttk.Combobox(row3, values=["", "Montagem OK", "Enviado", "Falha no envio", "Não enviado (manual)"],
-                                         width=20, state="readonly")
-        self.status_combo.pack(side=tk.LEFT, padx=5)
-        self.status_combo.current(0)
-
-        # Linha 4: Modo + botões
         row4 = ttk.Frame(filtro_frame)
         row4.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(row4, text="Modo:").pack(side=tk.LEFT)
-        modos = ["", "mesclagem", "capa_marcacao", "envio", "dois_na_folha", "grampo", "Corta_empilha", "um_na_folha"]
-        self.modo_combo = ttk.Combobox(row4, values=modos, width=20, state="readonly")
+        ttk.Label(row4, text="Usuário:").pack(side=tk.LEFT)
+        self.usuario_combo = ttk.Combobox(row4, values=["Todos"], width=17, state="readonly")
+        self.usuario_combo.pack(side=tk.LEFT, padx=5)
+        self.usuario_combo.current(0)
+        ttk.Label(row4, text="Status:").pack(side=tk.LEFT, padx=(12, 0))
+        self.status_combo = ttk.Combobox(
+            row4, values=["", "Montagem OK", "Mesclagem OK", "Enviado", "Falha no envio",
+                          "Não enviado (manual)", "Montagem Erro", "Salvo", "Falha ao salvar"],
+            width=22, state="readonly")
+        self.status_combo.pack(side=tk.LEFT, padx=5)
+        self.status_combo.current(0)
+        ttk.Label(row4, text="Modo:").pack(side=tk.LEFT, padx=(12, 0))
+        modos = ["", "mesclagem", "capa_marcacao", "envio", "dois_na_folha",
+                 "dois_na_folha_rotacionado", "grampo", "Corta_empilha",
+                 "corta_empilha_rotacionado", "um_na_folha", "um_na_folha_atexco"]
+        self.modo_combo = ttk.Combobox(row4, values=modos, width=27, state="readonly")
         self.modo_combo.pack(side=tk.LEFT, padx=5)
         self.modo_combo.current(0)
 
-        # Botões de ação
         btn_frame = ttk.Frame(filtro_frame)
         btn_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Button(btn_frame, text="🔎 Buscar", command=self.buscar, bootstyle="primary").pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="🧹 Limpar Filtros", command=self.limpar_filtros, bootstyle="secondary").pack(side=tk.LEFT, padx=5)
+        self.btn_buscar = ttk.Button(btn_frame, text="🔎 Buscar", command=self.buscar, bootstyle="primary")
+        self.btn_buscar.pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="🧹 Limpar Filtros", command=self.limpar_filtros,
+                   bootstyle="secondary").pack(side=tk.LEFT, padx=5)
+        ttk.Label(btn_frame, text="Mostrar:").pack(side=tk.LEFT, padx=(18, 3))
+        self.limite_combo = ttk.Combobox(btn_frame, values=["100", "500", "1000", "3000"],
+                                        width=6, state="readonly")
+        self.limite_combo.pack(side=tk.LEFT, padx=5)
+        self.limite_combo.set("500")
+        self.lbl_estado = ttk.Label(btn_frame, text="Defina os filtros e clique Buscar. O banco não é carregado ao abrir.")
+        self.lbl_estado.pack(side=tk.LEFT, padx=12)
 
-        # ===== RESULTADOS (TREEVIEW) =====
         tree_frame = ttk.Frame(main_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True)
-
-        # Colunas (sem "Cópia")
-        colunas = ("Data/Hora", "Lote", "Pilha", "Arquivo", "Máquina", "IP", "Formato", "Modo",
-                   "Qtd", "Status", "Erro", "Usuário")
-        self.tree = ttk.Treeview(tree_frame, columns=colunas, show="headings", height=15)
+        colunas = ("Data/Hora", "Tipo", "Lote", "Pilha", "Arquivo", "Máquina", "Formato", "Operação",
+                   "Qtd", "Cópia", "Situação", "Erro", "Usuário")
+        self.tree = ttk.Treeview(tree_frame, columns=colunas, show="headings", height=14)
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-
         self.tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
         tree_frame.grid_rowconfigure(0, weight=1)
         tree_frame.grid_columnconfigure(0, weight=1)
-
-        larguras = [130, 150, 120, 180, 160, 120, 80, 100, 50, 130, 150, 100]
+        larguras = [145, 65, 175, 190, 260, 115, 115, 165, 50, 60, 195, 140, 100]
         for col, larg in zip(colunas, larguras):
             self.tree.heading(col, text=col, command=lambda c=col: self.ordenar_por(c))
             self.tree.column(col, width=larg, minwidth=50)
+        self.tree.bind('<Double-1>', self.mostrar_detalhes)
 
-        # ===== RODAPÉ COM TOTAIS =====
-        resumo_frame = ttk.Frame(main_frame)
+        resumo_frame = ttk.LabelFrame(main_frame, text="📊 Resumo do lote / operação pesquisada", bootstyle="secondary")
         resumo_frame.pack(fill=tk.X, pady=(5, 0))
-        self.lbl_total_registros = ttk.Label(resumo_frame, text="Registros: 0", font=("Segoe UI", 9, "bold"))
-        self.lbl_total_registros.pack(side=tk.LEFT, padx=20)
-        self.lbl_soma_qtd = ttk.Label(resumo_frame, text="Quantidade total: 0", font=("Segoe UI", 9, "bold"))
-        self.lbl_soma_qtd.pack(side=tk.LEFT, padx=20)
+        self.lbl_total_registros = ttk.Label(resumo_frame, text="Nenhuma consulta realizada",
+                                              font=("Segoe UI", 9, "bold"))
+        self.lbl_total_registros.pack(anchor="w", padx=10, pady=(4, 0))
+        self.lbl_capa = ttk.Label(resumo_frame, text="CAPA | Preparadas: — | Mescladas: — | PDFs enviados: — | Capas nos PDFs enviados: —",
+                                   font=("Segoe UI", 9, "bold"))
+        self.lbl_capa.configure(wraplength=1120, justify=tk.LEFT)
+        self.lbl_capa.pack(anchor="w", padx=10, pady=2)
+        self.lbl_miolo = ttk.Label(resumo_frame, text="MIOLO | PDFs montados: — | Envios LPR: — | Falhas: —",
+                                    font=("Segoe UI", 9, "bold"))
+        self.lbl_miolo.configure(wraplength=1120, justify=tk.LEFT)
+        self.lbl_miolo.pack(anchor="w", padx=10, pady=(0, 4))
+        self.lbl_nota = ttk.Label(resumo_frame,
+                                  text="'Enviado' = LPR aceitou o trabalho; não confirma impressão física. Totais não misturam montagem e envio.",
+                                  font=("Segoe UI", 8))
+        self.lbl_nota.pack(anchor="w", padx=10, pady=(0, 4))
 
-        self.dados = []        # armazena os registros completos (excluindo cópia)
-        self.ordem_atual = None
-
-    def _carregar_usuarios(self):
-        """Obtém lista de usuários distintos do banco e atualiza o combobox."""
-        usuarios = ["Todos"]
-        try:
-            conn = self.conectar_banco()
-            cursor = conn.cursor()
-            cursor.execute("SELECT DISTINCT usuario FROM logs WHERE usuario != '' ORDER BY usuario")
-            for row in cursor.fetchall():
-                usuarios.append(row[0])
-            conn.close()
-        except Exception:
-            pass
-        self.usuario_combo['values'] = usuarios
-        self.usuario_combo.current(0)
-
-    def conectar_banco(self):
-        caminho = self.app.log_db_path
-        try:
-            gprint_checar_banco_central(caminho)
-        except (GPrintBancoIndisponivel, OSError) as e:
-            gprint_avisar_operador(self.app.root, "rede", str(e))
-            caminho = self.app.log_db_local_path
-            # Nao criar banco vazio no Historico quando a rede cair.
-            if not os.path.isfile(caminho):
-                raise FileNotFoundError("Banco central indisponivel e nao existe historico local") from e
-        return sqlite3.connect(caminho, timeout=15)
+    def _montar_filtro(self):
+        """Cria cláusula WHERE/parametros a partir dos controles, sem acessar o BD."""
+        filtros, params = [], []
+        if self.usar_data.get():
+            try:
+                di = datetime.strptime(self.data_inicio.get().strip(), "%d/%m/%Y")
+                df = datetime.strptime(self.data_fim.get().strip(), "%d/%m/%Y")
+                if df < di:
+                    raise ValueError("Data final anterior à inicial")
+            except ValueError as exc:
+                raise ValueError("Informe datas válidas (dd/mm/aaaa), com início anterior ao fim.") from exc
+            filtros += ["data_hora >= ?", "data_hora < ?"]
+            params += [di.strftime("%Y-%m-%d"), (df + timedelta(days=1)).strftime("%Y-%m-%d")]
+        for campo, widget in (("lote", self.lote_entry), ("pilha", self.pilha_entry),
+                              ("arquivo", self.arquivo_entry)):
+            valor = widget.get().strip()
+            if valor:
+                # Pesquisa literal: % e _ digitados nao sao wildcards SQL.
+                valor = valor.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+                filtros.append(f"{campo} LIKE ? ESCAPE '\\'")
+                params.append(f"%{valor}%")
+        tipo = self.tipo_combo.get()
+        if tipo in ("Capa", "Miolo"):
+            filtros.append(gprint_tipo_historico_sql() + " = ?")
+            params.append(tipo)
+        etapa = self.operacao_combo.get()
+        etapas = {"Montagem": ("Montagem OK", "Montagem Erro"), "Mesclagem": ("Mesclagem OK",),
+                  "Envio LPR": ("Enviado",), "Falha LPR": ("Falha no envio",),
+                  "Salvo sem envio": ("Salvo", "Não enviado (manual)", "Falha ao salvar")}
+        if etapa in etapas:
+            choices = etapas[etapa]
+            filtros.append("status IN (" + ",".join("?" for _ in choices) + ")")
+            params.extend(choices)
+        maquina = self.maquina_combo.get()
+        if maquina and maquina != "Todas":
+            filtros.append("maquina = ?")
+            params.append(maquina)
+        usuario = self.usuario_combo.get()
+        if usuario and usuario != "Todos":
+            filtros.append("usuario = ?")
+            params.append(usuario)
+        status = self.status_combo.get().strip()
+        if status:
+            filtros.append("status = ?")
+            params.append(status)
+        modo = self.modo_combo.get().strip()
+        if modo:
+            filtros.append("modo = ?")
+            params.append(modo)
+        return (' WHERE ' + ' AND '.join(filtros)) if filtros else '', params
 
     def buscar(self):
-        # Garantir que a lista de usuários esteja carregada
-        if not self.usuario_combo['values']:
-            self._carregar_usuarios()
+        if self._busca_em_andamento:
+            return
+        try:
+            where, params = self._montar_filtro()
+            limite = int(self.limite_combo.get())
+        except ValueError as exc:
+            messagebox.showerror("Filtros inválidos", str(exc), parent=self)
+            return
+        self._busca_em_andamento = True
+        self.btn_buscar.configure(state='disabled')
+        self.lbl_estado.configure(text="Consultando o histórico…")
+        # Queries SQLite e checagem de rede fora da thread de Tkinter.
+        threading.Thread(target=self._consultar_em_background,
+                         args=(where, tuple(params), limite), daemon=True).start()
+        self.after(100, self._verificar_resultado)
 
-        self.tree.delete(*self.tree.get_children())
-        self.dados = []
+    def _consultar_em_background(self, where, params, limite):
         conn = None
         try:
-            conn = self.conectar_banco()
+            caminho = self.app.log_db_path
+            origem = 'central'
+            try:
+                gprint_checar_banco_central(caminho)
+            except (GPrintBancoIndisponivel, OSError):
+                caminho = self.app.log_db_local_path
+                origem = 'local'
+                if not os.path.isfile(caminho):
+                    raise FileNotFoundError("O histórico central está indisponível e não existe banco local.")
+            # As consultas abaixo sao apenas SELECT e nao alteram o esquema SQL.
+            # O caminho nativo funciona tanto com unidade mapeada quanto com UNC.
+            if not os.path.isfile(caminho):
+                raise FileNotFoundError('O banco de histórico não foi encontrado.')
+            conn = sqlite3.connect(caminho, timeout=15)
             cursor = conn.cursor()
-
-            # Query sem a coluna 'copia'
-            query = ("SELECT data_hora, lote, pilha, arquivo, maquina, ip, formato, modo, "
-                     "quantidade, status, erro, usuario FROM logs WHERE 1=1")
-            params = []
-
-            # Filtro de data
-            if self.usar_data.get():
-                try:
-                    di = datetime.strptime(self.data_inicio.get().strip(), "%d/%m/%Y")
-                    df = datetime.strptime(self.data_fim.get().strip(), "%d/%m/%Y") + timedelta(days=1)
-                    query += " AND data_hora BETWEEN ? AND ?"
-                    params.extend([di.strftime("%Y-%m-%d"), df.strftime("%Y-%m-%d")])
-                except ValueError:
-                    messagebox.showerror("Erro", "Formato de data inválido. Use dd/mm/aaaa.")
-                    return
-
-            # Lote (aproximação)
-            lote = self.lote_entry.get().strip()
-            if lote:
-                query += " AND lote LIKE ?"
-                params.append(f"%{lote}%")
-
-            # Pilha
-            pilha = self.pilha_entry.get().strip()
-            if pilha:
-                query += " AND pilha LIKE ?"
-                params.append(f"%{pilha}%")
-
-            # Arquivo
-            arquivo = self.arquivo_entry.get().strip()
-            if arquivo:
-                query += " AND arquivo LIKE ?"
-                params.append(f"%{arquivo}%")
-
-            # Máquina
-            maquina = self.maquina_combo.get()
-            if maquina and maquina != "Todas":
-                query += " AND maquina = ?"
-                params.append(maquina)
-
-            # Status
-            status = self.status_combo.get().strip()
-            if status:
-                query += " AND status = ?"
-                params.append(status)
-
-            # Usuário
-            usuario = self.usuario_combo.get()
-            if usuario and usuario != "Todos":
-                query += " AND usuario = ?"
-                params.append(usuario)
-
-            # Modo
-            modo = self.modo_combo.get().strip()
-            if modo:
-                query += " AND modo = ?"
-                params.append(modo)
-
-            query += " ORDER BY data_hora DESC LIMIT 5000"
-
-            cursor.execute(query, params)
+            campos = ("data_hora, lote, pilha, arquivo, maquina, ip, formato, modo, "
+                      "quantidade, status, erro, usuario, copia")
+            cursor.execute("SELECT " + campos + " FROM logs" + where +
+                           " ORDER BY data_hora DESC, id DESC LIMIT ?", params + (limite,))
             rows = cursor.fetchall()
-
-            soma_qtd = 0
-            for row in rows:
-                self.dados.append(row)
-                self.tree.insert("", tk.END, values=row)
-                soma_qtd += row[8]  # índice da quantidade (0‑based: 8)
-
-            # Atualizar rodapé
-            self.lbl_total_registros.config(text=f"Registros: {len(rows)}")
-            self.lbl_soma_qtd.config(text=f"Quantidade total: {soma_qtd}")
-
-        except FileNotFoundError:
-            # Ja foi exibido aviso "producao offline / informar Guilherme".
-            pass
-        except Exception as e:
-            messagebox.showerror("Erro", f"Falha ao consultar banco: {e}")
+            tipo_sql = gprint_tipo_historico_sql()
+            cursor.execute("SELECT " + tipo_sql + " AS material, status, modo, "
+                           "COUNT(*) AS eventos, COALESCE(SUM(CASE WHEN quantidade > 0 "
+                           "THEN quantidade ELSE 0 END),0) AS unidades "
+                           "FROM logs" + where + " GROUP BY material, status, modo", params)
+            grupos = cursor.fetchall()
+            resumo = gprint_resumo_historico_agrupado(grupos)
+            usuarios = None
+            if not self._usuarios_carregados:
+                cursor.execute("SELECT DISTINCT usuario FROM logs WHERE usuario IS NOT NULL "
+                               "AND usuario != '' ORDER BY usuario")
+                usuarios = [r[0] for r in cursor.fetchall()]
+            self._resultado_busca.put((True, rows, resumo, usuarios, origem))
+        except Exception as exc:
+            self._resultado_busca.put((False, exc))
         finally:
-            if conn:
+            if conn is not None:
                 conn.close()
 
-
+    def _verificar_resultado(self):
+        try:
+            resultado = self._resultado_busca.get_nowait()
+        except queue.Empty:
+            if self.winfo_exists():
+                self.after(100, self._verificar_resultado)
+            return
+        self._busca_em_andamento = False
+        self.btn_buscar.configure(state='normal')
+        if not resultado[0]:
+            erro = resultado[1]
+            self.lbl_estado.configure(text="Não foi possível consultar o histórico.")
+            if isinstance(erro, FileNotFoundError):
+                messagebox.showwarning("GPrint - Histórico indisponível",
+                                       "Não foi possível acessar o banco de dados da produção.\n\n"
+                                       "Verifique se a pasta 'produção' está online.\n"
+                                       "Se o problema continuar, INFORME O GUILHERME.", parent=self)
+            else:
+                messagebox.showerror("GPrint - Histórico", f"Falha ao consultar histórico: {erro}", parent=self)
+            return
+        _, rows, resumo, usuarios, origem = resultado
+        if origem == 'local':
+            messagebox.showwarning("GPrint - Histórico local",
+                                   "O histórico central da produção não está acessível.\n"
+                                   "Os dados exibidos são somente do banco local desta estação.\n\n"
+                                   "Verifique o diretório 'produção' e, se necessário, INFORME O GUILHERME.",
+                                   parent=self)
+        if usuarios is not None:
+            anterior = self.usuario_combo.get() or 'Todos'
+            self.usuario_combo.configure(values=['Todos'] + usuarios)
+            self.usuario_combo.set(anterior if anterior in ['Todos'] + usuarios else 'Todos')
+            self._usuarios_carregados = True
+        self.tree.delete(*self.tree.get_children())
+        self.dados = []
+        self.dados_brutos = {}
+        for row in rows:
+            material = gprint_material_historico(row[2], row[3], row[7])
+            visivel = (
+                row[0], material, gprint_resumir_lote(row[1]),
+                gprint_resumir_pilha(row[2]), row[3],
+                gprint_nome_equipamento(row[4]), row[6], gprint_descricao_modo(row[7]),
+                row[8], row[12] or '-',
+                gprint_situacao_historico(row[9], material, row[4], row[12]),
+                row[10], row[11]
+            )
+            self.dados.append(visivel)
+            iid = self.tree.insert('', tk.END, values=visivel)
+            self.dados_brutos[iid] = row
+        self.lbl_total_registros.configure(text=f"Exibindo {len(rows)} de {resumo['registros']} registros filtrados")
+        self.lbl_capa.configure(text=(
+            f"CAPA | Preparadas: {resumo['capa_preparadas']} | "
+            f"Mescladas: {resumo['capa_mescladas']} em {resumo['capa_pdfs_mesclados']} PDFs | "
+            f"PDFs enviados: {resumo['capa_pdfs_enviados']} | "
+            f"Capas nesses envios: {resumo['capa_capas_enviadas']} | "
+            f"Falhas LPR: {resumo['capa_falhas_lpr']}"))
+        self.lbl_miolo.configure(text=(
+            f"MIOLO | PDFs montados: {resumo['miolo_pdfs_montados']} | "
+            f"Envios LPR: {resumo['miolo_envios_lpr']} | "
+            f"Falhas: {resumo['miolo_falhas_lpr']} | "
+            f"Cópias salvas sem LPR: {resumo['miolo_pdfs_salvos']}"))
+        self.lbl_estado.configure(text="Consulta concluída." +
+                                 (" Histórico LOCAL." if origem == 'local' else " Histórico CENTRAL."))
 
     def limpar_filtros(self):
         self.data_inicio.delete(0, tk.END)
@@ -5805,37 +6028,71 @@ class HistoricoTab(ttk.Frame):
         self.data_fim.delete(0, tk.END)
         self.data_fim.insert(0, datetime.now().strftime("%d/%m/%Y"))
         self.usar_data.set(True)
-        self.lote_entry.delete(0, tk.END)
-        self.pilha_entry.delete(0, tk.END)
-        self.arquivo_entry.delete(0, tk.END)
-        self.maquina_combo.set("Todas")
-        self.status_combo.set("")
-        if self.usuario_combo['values']:
-            self.usuario_combo.current(0)  # "Todos"
-        self.modo_combo.set("")
+        for entry in (self.lote_entry, self.pilha_entry, self.arquivo_entry):
+            entry.delete(0, tk.END)
+        for combo, valor in ((self.tipo_combo, 'Todos'), (self.operacao_combo, 'Todas'),
+                             (self.maquina_combo, 'Todas'), (self.usuario_combo, 'Todos'),
+                             (self.status_combo, ''), (self.modo_combo, '')):
+            combo.set(valor)
+        self.limite_combo.set('500')
         self.tree.delete(*self.tree.get_children())
-        self.dados = []
-        self.lbl_total_registros.config(text="Registros: 0")
-        self.lbl_soma_qtd.config(text="Quantidade total: 0")
+        self.dados, self.dados_brutos = [], {}
+        self.lbl_total_registros.configure(text='Nenhuma consulta realizada')
+        self.lbl_capa.configure(text='CAPA | Preparadas: — | Mescladas: — | PDFs enviados: — | Capas nos PDFs enviados: —')
+        self.lbl_miolo.configure(text='MIOLO | PDFs montados: — | Envios LPR: — | Falhas: —')
+        self.lbl_estado.configure(text='Defina os filtros e clique Buscar.')
 
     def ordenar_por(self, coluna):
         if not self.dados:
             return
-        # Mapeamento das colunas visíveis para índice nos dados (0‑based)
-        idx_map = {
-            "Data/Hora": 0, "Lote": 1, "Pilha": 2, "Arquivo": 3,
-            "Máquina": 4, "IP": 5, "Formato": 6, "Modo": 7,
-            "Qtd": 8, "Status": 9, "Erro": 10, "Usuário": 11
-        }
-        idx = idx_map[coluna]
-        reverse = False
-        if self.ordem_atual == coluna:
-            reverse = True
+        idx_map = {"Data/Hora": 0, "Tipo": 1, "Lote": 2, "Pilha": 3, "Arquivo": 4,
+                   "Máquina": 5, "Formato": 6, "Operação": 7, "Qtd": 8,
+                   "Cópia": 9, "Situação": 10, "Erro": 11, "Usuário": 12}
+        reverse = self.ordem_atual == coluna
         self.ordem_atual = coluna
-        self.dados.sort(key=lambda x: x[idx] if x[idx] is not None else "", reverse=reverse)
-        self.tree.delete(*self.tree.get_children())
-        for row in self.dados:
-            self.tree.insert("", tk.END, values=row)
+        itens = list(self.tree.get_children())
+        itens.sort(key=lambda iid: self._chave_ordenacao(self.tree.set(iid, coluna), coluna),
+                   reverse=reverse)
+        for indice, iid in enumerate(itens):
+            self.tree.move(iid, '', indice)
+
+    @staticmethod
+    def _chave_ordenacao(valor, coluna):
+        if coluna == 'Qtd':
+            try:
+                return int(valor)
+            except (ValueError, TypeError):
+                return 0
+        return str(valor).casefold()
+
+    def mostrar_detalhes(self, _event=None):
+        selecao = self.tree.selection()
+        if not selecao:
+            return
+        row = self.dados_brutos.get(selecao[0])
+        if row is None:
+            return
+        titulos = ('Data/hora', 'Diretório do lote', 'Arquivo TXT / Pilha',
+                   'Arquivo PDF', 'Máquina', 'IP', 'Fila / Formato', 'Modo',
+                   'Quantidade', 'Status', 'Erro', 'Usuário', 'Cópia')
+        mensagem = '\n'.join(f'{titulo}: {valor}' for titulo, valor in zip(titulos, row))
+        material = gprint_material_historico(row[2], row[3], row[7])
+        if material == 'Miolo':
+            significado = ('Um PDF montado' if row[9] == 'Montagem OK'
+                           else 'Uma tentativa de envio LPR' if row[9] in ('Enviado', 'Falha no envio')
+                           else 'Registro desta etapa')
+        elif material == 'Capa':
+            significado = ('Capas preparadas' if row[9] == 'Montagem OK' else
+                           'Capas no PDF final' if row[9] in ('Mesclagem OK', 'Enviado') else
+                           'Quantidade registrada pela rotina de capa')
+        else:
+            significado = 'Quantidade registrada pela rotina original'
+        mensagem += f'\n\nSignificado da quantidade: {significado}'
+        if row[9] == 'Enviado':
+            mensagem += ('\n\nEnviado significa sucesso da rotina LPR, '
+                         'não confirma que a impressora terminou fisicamente.')
+        messagebox.showinfo('GPrint - Detalhes do registro', mensagem, parent=self)
+
 if __name__ == "__main__":
     
     logging.basicConfig(
