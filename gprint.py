@@ -262,6 +262,11 @@ def gprint_verificar_banco_no_inicio(caminho, root):
 
 # ============================================================================
 
+# LIMITE DE ARQUIVOS TXT NA ABA MIOLO:
+# 0 = sem limite (quantos arquivos TXT desejar)
+# 1, 2, 3... = quantidade maxima de TXT por processamento
+MAX_ARQUIVOS_TXT_MIOLO = 2
+
 DATA_LIMITE = "29/07/2027"
 PASTA_BASE = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\UICLAP\LOTES"
 PASTA_TRABALHO = os.path.join(os.environ.get('TEMP', os.path.expanduser("~")), "UICLAP_TEMP")
@@ -593,6 +598,7 @@ class MioloTab(ttk.Frame):
         super().__init__(parent)
         self.app = app
         self.processos = []
+        self.arquivos_txt = []  # arquivos selecionados para a proxima execucao
         self.processando = False
         self.thread = None
         self.log_queue = queue.Queue()
@@ -755,7 +761,7 @@ class MioloTab(ttk.Frame):
 
         self.btn_select = ttk.Button(
             file_frame,
-            text="Selecionar TXT",
+            text="Selecionar TXT(s)",
             command=self.selecionar_txt,
             bootstyle=(PRIMARY)
         )
@@ -791,13 +797,14 @@ class MioloTab(ttk.Frame):
         preview_frame.columnconfigure(0, weight=1)
         preview_frame.rowconfigure(0, weight=1)
 
-        columns = ('Linha', 'Arquivo', 'Formato', 'Acabamento', 'Modo', 'QTD', 'Total')
+        columns = ('TXT', 'Linha', 'Arquivo', 'Formato', 'Acabamento', 'Modo', 'QTD', 'Total')
 
         self.tree = ttk.Treeview(preview_frame, columns=columns, show='headings')
 
         for col in columns:
             self.tree.heading(col, text=col)
 
+        self.tree.column('TXT', width=50, anchor="center")
         self.tree.column('Linha', width=50, anchor="center")
         self.tree.column('Arquivo', width=250)
         self.tree.column('Formato', width=80, anchor="center")
@@ -923,6 +930,7 @@ class MioloTab(ttk.Frame):
         
         self.processando = True
         self.btn_processar.config(state='disabled', text='⏳ Processando...')
+        self.btn_select.config(state='disabled')  # nao alterar a fila durante o processamento
         self.progress['value'] = 0
         self.progress['maximum'] = len(self.processos)
         
@@ -1069,6 +1077,7 @@ class MioloTab(ttk.Frame):
         pasta_salvos = os.path.join(pasta_lote, "COPIAS_SALVAS")
         self.log(f"📁 PDFs finalizados desta pilha ({nome_pasta_salvos}): {pasta_lote}", "INFO")
 
+        varios_txt = len(getattr(self, 'arquivos_txt', [])) > 1
         try:
             for i, p in enumerate(self.processos):
                 if not self.processando:
@@ -1076,10 +1085,21 @@ class MioloTab(ttk.Frame):
                     break
                 
                 try:
+                    # Cada processo mantem a origem para log, historico e saida.
+                    # A imposicao e o LPR abaixo nao sao modificados.
+                    origem_txt = p.get("TXT_ORIGEM", getattr(self, "arquivo_txt", ""))
+                    lote = os.path.dirname(origem_txt) if origem_txt else "desconhecido"
+                    pilha = os.path.splitext(os.path.basename(origem_txt))[0] if origem_txt else "desconhecido"
+                    numero_txt = p.get("TXT_NUMERO", 1)
+                    # Com varios TXT, isola os PDFs por arquivo de entrada:
+                    # nomes NOMEFIC iguais nao se sobrescrevem.
+                    pasta_saida_txt = os.path.join(pasta_lote, f"TXT_{numero_txt:02d}") if varios_txt else pasta_lote
+                    os.makedirs(pasta_saida_txt, exist_ok=True)
+                    pasta_salvos = os.path.join(pasta_saida_txt, "COPIAS_SALVAS")
                     self.progress['value'] = i
                     self.progress_label.config(text=f"{i+1}/{len(self.processos)}")
                 
-                    self.log(f"\n--- Processando L{p['LINHA']}: {p['ARQUIVO']} ---", "INFO")
+                    self.log(f"\n--- TXT {numero_txt}: {os.path.basename(origem_txt)} | L{p['LINHA']}: {p['ARQUIVO']} ---", "INFO")
                     self.log(f"📄 Formato: {p['FORMATO']}", "INFO")
                     self.log(f"🔧 Modo: {p['MODO']}", "INFO")
                     self.log(f"📊 QTD para envio: {p['QTD']}, QTD Total: {p['QTD_total']}", "INFO")
@@ -1090,11 +1110,11 @@ class MioloTab(ttk.Frame):
                         error_count += 1
                         continue
                 
-                    local = os.path.join(sessao_temp, f"L{p['LINHA']}_{p['ARQUIVO']}")
+                    local = os.path.join(sessao_temp, f"TXT{numero_txt:02d}_L{p['LINHA']}_{p['ARQUIVO']}")
                     shutil.copy2(origem, local)
                     self.log(f"📋 Arquivo copiado para temporário", "INFO")
                 
-                    output_path = os.path.join(pasta_lote, f"{p['NOMEFIC']}.pdf")
+                    output_path = os.path.join(pasta_saida_txt, f"{p['NOMEFIC']}.pdf")
                     w_pt, h_pt = p["LARGURA_MM"] * MM, p["ALTURA_MM"] * MM
                 
                     self.log(f"⚙️ Gerando PDF montado...", "INFO")
@@ -1291,6 +1311,7 @@ class MioloTab(ttk.Frame):
         
         self.processando = False
         self.btn_processar.config(state='normal', text='▶ Processar e Enviar')
+        self.btn_select.config(state='normal')
         self.progress['value'] = 0
         self.progress_label.config(text="0/0")
         
@@ -1309,160 +1330,203 @@ class MioloTab(ttk.Frame):
                         f"🚀 Envios: {envio_count}\n"
                         f"💾 PDFs salvos: {salvos_count}\n"
                         f"📁 Pasta: {pasta_lote}\n"
-                        f"📂 Salvos em: {pasta_salvos if salvos_count else 'Nenhuma cópia manual'}")
+                        f"📂 Salvos em: {(pasta_lote if varios_txt else pasta_salvos) if salvos_count else 'Nenhuma cópia manual'}")
 
 
     def selecionar_txt(self):
-        file_path = filedialog.askopenfilename(filetypes=[("Arquivos TXT", "*.txt")])
-        if file_path:
-            self.arquivo_txt = file_path
-            self.file_label.config(text=os.path.basename(file_path))
-            self.ler_arquivo_txt_miolo()
+        """Seleciona ate MAX_ARQUIVOS_TXT_MIOLO arquivos (0 = ilimitado)."""
+        if self.processando:
+            messagebox.showwarning("Miolo em processamento", "Aguarde o processamento atual terminar.")
+            return
+        selecionados = filedialog.askopenfilenames(
+            title="Selecionar arquivos TXT de miolo",
+            filetypes=[("Arquivos TXT", "*.txt")]
+        )
+        if not selecionados:
+            return  # Cancelar nao altera a selecao anterior
+        arquivos = list(dict.fromkeys(os.path.normpath(p) for p in selecionados))
+        if MAX_ARQUIVOS_TXT_MIOLO > 0 and len(arquivos) > MAX_ARQUIVOS_TXT_MIOLO:
+            messagebox.showwarning(
+                "Limite de arquivos TXT",
+                f"Selecione no maximo {MAX_ARQUIVOS_TXT_MIOLO} arquivo(s) TXT por vez.\n"
+                f"Voce selecionou {len(arquivos)}.\n\n"
+                "Altere MAX_ARQUIVOS_TXT_MIOLO no inicio do codigo para mudar o limite "
+                "(0 = ilimitado)."
+            )
+            return
+        self.ler_arquivo_txt_miolo(arquivos)
 
-    def ler_arquivo_txt_miolo(self):
+    def ler_arquivo_txt_miolo(self, arquivos=None):
+        """Carrega todos os TXT mantendo cada linha vinculada ao seu TXT de origem."""
         try:
-            self.processos = []
+            if self.processando:
+                raise RuntimeError("Aguarde o processamento atual terminar.")
+            if arquivos is None:
+                arquivos = getattr(self, "arquivos_txt", []) or (
+                    [self.arquivo_txt] if getattr(self, "arquivo_txt", None) else []
+                )
+            arquivos = list(dict.fromkeys(os.path.normpath(p) for p in arquivos))
+            if not arquivos:
+                return False
+            if MAX_ARQUIVOS_TXT_MIOLO > 0 and len(arquivos) > MAX_ARQUIVOS_TXT_MIOLO:
+                raise ValueError(f"O limite atual e de {MAX_ARQUIVOS_TXT_MIOLO} arquivos TXT.")
+
+            novos_processos = []
+            # Somente substitui a fila atual quando TODOS os arquivos forem lidos.
+            for numero_txt, caminho_txt in enumerate(arquivos, start=1):
+                lines = None
+                encodings = ['utf-8-sig', 'utf-8', 'cp1252', 'latin-1']
+                for enc in encodings:
+                    try:
+                        with open(caminho_txt, 'r', encoding=enc) as f:
+                            lines = f.readlines()
+                        self.log(f"TXT {numero_txt}: {os.path.basename(caminho_txt)} (encoding: {enc})", "INFO")
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                if lines is None:
+                    raise ValueError(f"Nao foi possivel identificar a codificacao do TXT: {caminho_txt}")
+
+                for idx, linha in enumerate(lines):
+                    linha = linha.strip()
+                    if not linha or linha.startswith('#'):
+                        continue
+
+                    campos = linha.split('|')
+                    if len(campos) < 13:
+                        continue
+
+                    cod_acab = campos[9].strip()
+                    mapa_acab = {
+                        "1": "Corta e Empilha / 2 na folha",
+                        "2": "Grampo",
+                        "3": "1 na folha",
+                        "4": "Corta e Empilha Rotacionado"
+                    }
+                    desc_acab = mapa_acab.get(cod_acab, "Desconhecido")
+
+                    qtd = int(campos[2].strip()) if campos[2].strip().isdigit() else 1
+                    qtd_total_str = campos[10].strip() if len(campos) > 10 else "0"
+                    try:
+                        qtd_total = int(qtd_total_str)
+                    except:
+                        qtd_total = 0
+
+                    processo = {
+                        "LINHA": idx + 1,
+                        "CAMINHO": os.path.normpath(campos[0].strip().replace('\ufeff', '').replace('/', '\\')),
+                        "ARQUIVO": campos[1].strip(),
+                        "QTD": qtd,
+                        "CODIGOACAB": cod_acab,
+                        "QTD_total": qtd_total,
+                        "NOMEFIC": campos[11].strip(),
+                        "FORMATO": campos[12].strip(),
+                        "IDENTIFIC": campos[13].strip() if len(campos) > 13 else ""
+                    }
+
+                    if cod_acab == "1":
+                        modo = "corta_empilha_rotacionado" if qtd < 10 else "dois_na_folha"
+                    elif cod_acab == "2":
+                        modo = "grampo"
+                    elif cod_acab == "3":
+                        modo = "um_na_folha"
+                    elif cod_acab == "4":
+                        modo = "corta_empilha_rotacionado" if qtd < 10 else "dois_na_folha"
+                    elif cod_acab == "5":
+                        modo = "um_na_folha_atexco"
+                    elif cod_acab == "6":
+                        modo = "dois_na_folha_rotacionado"
+                    else:
+                        modo = "Corta_empilha"
+
+                    partes = processo["FORMATO"].split('_')
+                    if len(partes) >= 2:
+                        formato_str = partes[1]
+                    else:
+                        formato_str = partes[0]
+
+                    formato_limpo = formato_str.lower().replace(',', '.')
+                    try:
+                        if 'x' in formato_limpo:
+                            dim_parts = formato_limpo.split('x')
+                        elif 'X' in formato_limpo:
+                            dim_parts = formato_limpo.lower().split('x')
+                        else:
+                            raise ValueError("Formato não contém 'x'")
+
+                        dim1 = float(dim_parts[0])
+                        dim2 = float(dim_parts[1])
+
+                        if cod_acab == "3":
+                            largura_mm = min(dim1, dim2) * 10
+                            altura_mm = max(dim1, dim2) * 10
+                            espacamento = 0
+                        else:
+                            largura_mm = max(dim1, dim2) * 10
+                            altura_mm = min(dim1, dim2) * 10
+                            if (int(round(dim1)) == 22 and int(round(dim2)) == 32) or \
+                               (int(round(dim1)) == 32 and int(round(dim2)) == 22):
+                                espacamento = 3
+                            else:
+                                espacamento = 0
+
+                        processo.update({
+                            "LARGURA_MM": largura_mm,
+                            "ALTURA_MM": altura_mm,
+                            "ESPACAMENTO": espacamento,
+                            "MODO": modo,
+                            "DESC_ACAB": desc_acab
+                        })
+
+                    except Exception as e:
+                        self.log(f"Erro ao converter formato da linha {idx+1}: {e} - usando valores padrão", "AVISO")
+                        processo.update({
+                            "LARGURA_MM": 480,
+                            "ALTURA_MM": 320,
+                            "ESPACAMENTO": 0,
+                            "MODO": modo,
+                            "DESC_ACAB": desc_acab
+                        })
+
+                    processo["TXT_ORIGEM"] = caminho_txt
+                    processo["TXT_NUMERO"] = numero_txt
+                    novos_processos.append(processo)
+
+
+            # Confirmacao atomica da nova fila de trabalhos: nao deixa selecao parcial.
+            self.processos = novos_processos
+            self.arquivos_txt = arquivos
+            self.arquivo_txt = arquivos[0]  # compatibilidade com fluxo de TXT unico
+            self.nome_base_txt = os.path.splitext(os.path.basename(arquivos[0]))[0]
 
             for item in self.tree.get_children():
                 self.tree.delete(item)
-
-            lines = None
-            encodings = ['utf-8-sig', 'utf-8', 'cp1252', 'latin-1']
-
-            for enc in encodings:
-                try:
-                    with open(self.arquivo_txt, 'r', encoding=enc) as f:
-                        lines = f.readlines()
-                    self.log(f"Arquivo lido com encoding: {enc}", "INFO")
-                    self.nome_base_txt = os.path.splitext(os.path.basename(self.arquivo_txt))[0]
-                    break
-                except UnicodeDecodeError:
-                    continue
-
-            if lines is None:
-                raise Exception("Não foi possível identificar o encoding do arquivo.")
-
-            for idx, linha in enumerate(lines):
-                linha = linha.strip()
-                if not linha or linha.startswith('#'):
-                    continue
-
-                campos = linha.split('|')
-                if len(campos) < 13:
-                    continue
-
-                cod_acab = campos[9].strip()
-                mapa_acab = {
-                    "1": "Corta e Empilha / 2 na folha",
-                    "2": "Grampo",
-                    "3": "1 na folha",
-                    "4": "Corta e Empilha Rotacionado"
-                }
-                desc_acab = mapa_acab.get(cod_acab, "Desconhecido")
-
-                qtd = int(campos[2].strip()) if campos[2].strip().isdigit() else 1
-                qtd_total_str = campos[10].strip() if len(campos) > 10 else "0"
-                try:
-                    qtd_total = int(qtd_total_str)
-                except:
-                    qtd_total = 0
-
-                processo = {
-                    "LINHA": idx + 1,
-                    "CAMINHO": os.path.normpath(campos[0].strip().replace('\ufeff', '').replace('/', '\\')),
-                    "ARQUIVO": campos[1].strip(),
-                    "QTD": qtd,
-                    "CODIGOACAB": cod_acab,
-                    "QTD_total": qtd_total,
-                    "NOMEFIC": campos[11].strip(),
-                    "FORMATO": campos[12].strip(),
-                    "IDENTIFIC": campos[13].strip() if len(campos) > 13 else ""
-                }
-
-                if cod_acab == "1":
-                    modo = "corta_empilha_rotacionado" if qtd < 10 else "dois_na_folha"
-                elif cod_acab == "2":
-                    modo = "grampo"
-                elif cod_acab == "3":
-                    modo = "um_na_folha"
-                elif cod_acab == "4":
-                    modo = "corta_empilha_rotacionado" if qtd < 10 else "dois_na_folha"
-                elif cod_acab == "5":
-                    modo = "um_na_folha_atexco"
-                elif cod_acab == "6":
-                    modo = "dois_na_folha_rotacionado"
-                else:
-                    modo = "Corta_empilha"
-
-                partes = processo["FORMATO"].split('_')
-                if len(partes) >= 2:
-                    formato_str = partes[1]
-                else:
-                    formato_str = partes[0]
-
-                formato_limpo = formato_str.lower().replace(',', '.')
-                try:
-                    if 'x' in formato_limpo:
-                        dim_parts = formato_limpo.split('x')
-                    elif 'X' in formato_limpo:
-                        dim_parts = formato_limpo.lower().split('x')
-                    else:
-                        raise ValueError("Formato não contém 'x'")
-
-                    dim1 = float(dim_parts[0])
-                    dim2 = float(dim_parts[1])
-
-                    if cod_acab == "3":
-                        largura_mm = min(dim1, dim2) * 10
-                        altura_mm = max(dim1, dim2) * 10
-                        espacamento = 0
-                    else:
-                        largura_mm = max(dim1, dim2) * 10
-                        altura_mm = min(dim1, dim2) * 10
-                        if (int(round(dim1)) == 22 and int(round(dim2)) == 32) or \
-                           (int(round(dim1)) == 32 and int(round(dim2)) == 22):
-                            espacamento = 3
-                        else:
-                            espacamento = 0
-
-                    processo.update({
-                        "LARGURA_MM": largura_mm,
-                        "ALTURA_MM": altura_mm,
-                        "ESPACAMENTO": espacamento,
-                        "MODO": modo,
-                        "DESC_ACAB": desc_acab
-                    })
-
-                except Exception as e:
-                    self.log(f"Erro ao converter formato da linha {idx+1}: {e} - usando valores padrão", "AVISO")
-                    processo.update({
-                        "LARGURA_MM": 480,
-                        "ALTURA_MM": 320,
-                        "ESPACAMENTO": 0,
-                        "MODO": modo,
-                        "DESC_ACAB": desc_acab
-                    })
-
-                self.processos.append(processo)
-
+            for processo in self.processos:
                 self.tree.insert('', 'end', values=(
+                    processo['TXT_NUMERO'],
                     f"L{processo['LINHA']}",
                     os.path.basename(processo['ARQUIVO']),
-                    formato_str.upper(),
+                    processo['FORMATO'].split('_')[1].upper() if len(processo['FORMATO'].split('_')) >= 2 else processo['FORMATO'].upper(),
                     processo['CODIGOACAB'],
                     processo['MODO'],
                     processo['QTD'],
                     processo['QTD_total']
                 ))
-
-            self.status_var.set(f"✅ {len(self.processos)} processos carregados")
-            self.log(f"Arquivo carregado: {os.path.basename(self.arquivo_txt)}", "SUCESSO")
-            self.log(f"Total de processos: {len(self.processos)}", "INFO")
-            self.nome_base_txt = os.path.splitext(os.path.basename(self.arquivo_txt))[0]
-
+            quantidade = len(arquivos)
+            self.file_label.config(text=(
+                os.path.basename(arquivos[0]) if quantidade == 1
+                else f"{quantidade} TXT selecionados | {len(self.processos)} processos"
+            ))
+            self.status_var.set(f"✅ {len(self.processos)} processos de {quantidade} TXT carregados")
+            self.log(f"✅ {quantidade} TXT carregado(s), total {len(self.processos)} processos", "SUCESSO")
+            for numero, caminho in enumerate(arquivos, start=1):
+                self.log(f"   TXT {numero}: {caminho}", "INFO")
+            return True
         except Exception as e:
-            messagebox.showerror("Erro", f"Erro ao ler arquivo: {e}")
-            self.log(f"ERRO ao ler arquivo: {e}", "ERRO")
+            messagebox.showerror("Erro ao carregar TXT", f"Nao foi possivel carregar todos os TXT:\n{e}")
+            self.log(f"ERRO ao carregar TXT: {e}", "ERRO")
+            return False
+
 def get_border_pixmap(page, rect, zoom=2.0):
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, clip=rect)
