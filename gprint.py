@@ -17,7 +17,7 @@ import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 from ttkbootstrap.style import Style
 from tkinterdnd2 import DND_FILES, TkinterDnD
-from datetime import datetime
+from datetime import datetime, timedelta, date
 from typing import List
 import fitz  
 from PyPDF2 import PdfMerger
@@ -35,6 +35,7 @@ import random
 import ctypes
 import ipaddress
 import hmac
+from contextlib import closing
 from tkinter import simpledialog
 
 # ============================================================================
@@ -45,11 +46,216 @@ from tkinter import simpledialog
 GPRINT_DIRETORIO_DADOS = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\UICLAP\LOGS"
 GPRINT_BANCO_HISTORICO = os.path.join(GPRINT_DIRETORIO_DADOS, "impressoes.db")
 GPRINT_BANCO_EQUIPAMENTOS = os.path.join(GPRINT_DIRETORIO_DADOS, "equipamentos.db")
+# ============================================================================
+# GPRINT - BASE DO REFAZER (perdas e resultados), SEM ALTERAR MONTAGEM OU LPR
+# Banco local por estacao para durabilidade + sincronizacao em lote para rede.
+# ============================================================================
+GPRINT_BANCO_REFAZER = os.path.join(GPRINT_DIRETORIO_DADOS, 'refazer.db')
+GPRINT_REFAZER_LOCAL = os.path.join(
+    os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'),
+    'GPrint', 'refazer_pendente.db'
+)
+
+GPRINT_REFAZER_CAMPOS = (
+    'id', 'sessao_id', 'criado_em', 'atualizado_em', 'cliente', 'lote',
+    'arquivo_original', 'codigo', 'tipo', 'quantidade', 'setor', 'operador',
+    'maquina', 'fila_lpr', 'pdf_resultado', 'montagem_status',
+    'envio_status', 'erro', 'estacao'
+)
+
+
+def gprint_criar_schema_refazer(conexao, local=False):
+    """Schema aditivo: nao modifica equipamentos, filas ou historico de impressao."""
+    conexao.execute('''CREATE TABLE IF NOT EXISTS refazer_registros (
+        id TEXT PRIMARY KEY,
+        sessao_id TEXT NOT NULL,
+        criado_em TEXT NOT NULL,
+        atualizado_em TEXT NOT NULL,
+        cliente TEXT NOT NULL,
+        lote TEXT NOT NULL,
+        arquivo_original TEXT NOT NULL,
+        codigo TEXT,
+        tipo TEXT NOT NULL CHECK(tipo IN ('CAPA','MIOLO')),
+        quantidade INTEGER NOT NULL DEFAULT 1 CHECK(quantidade >= 0),
+        setor TEXT,
+        operador TEXT,
+        maquina TEXT,
+        fila_lpr TEXT,
+        pdf_resultado TEXT,
+        montagem_status TEXT NOT NULL DEFAULT 'PENDENTE',
+        envio_status TEXT NOT NULL DEFAULT 'PENDENTE',
+        erro TEXT NOT NULL DEFAULT '',
+        estacao TEXT NOT NULL DEFAULT ''
+    )''')
+    conexao.execute('''CREATE INDEX IF NOT EXISTS idx_refazer_data
+        ON refazer_registros(criado_em)''')
+    conexao.execute('''CREATE INDEX IF NOT EXISTS idx_refazer_lote
+        ON refazer_registros(lote, tipo)''')
+    conexao.execute('''CREATE INDEX IF NOT EXISTS idx_refazer_setor
+        ON refazer_registros(setor, operador)''')
+    if local:
+        conexao.execute('''CREATE TABLE IF NOT EXISTS refazer_sincronizacao (
+            registro_id TEXT PRIMARY KEY REFERENCES refazer_registros(id) ON DELETE CASCADE,
+            pendente INTEGER NOT NULL DEFAULT 1
+        )''')
+        conexao.execute('''CREATE INDEX IF NOT EXISTS idx_refazer_pendente
+            ON refazer_sincronizacao(pendente)''')
+
+
+class GPrintRefazerRepositorio:
+    """Grava primeiro no computador; envia em lote ao servidor, sem repetir LPR."""
+    def __init__(self, central=GPRINT_BANCO_REFAZER, local=GPRINT_REFAZER_LOCAL):
+        self.central = central
+        self.local = local
+        self._mutex = threading.RLock()
+        self._preparado = False
+
+    def _conectar_local(self):
+        os.makedirs(os.path.dirname(self.local), exist_ok=True)
+        con = sqlite3.connect(self.local, timeout=15)
+        con.row_factory = sqlite3.Row
+        con.execute('PRAGMA busy_timeout=15000')
+        con.execute('PRAGMA foreign_keys=ON')
+        return con
+
+    def preparar_local(self):
+        with self._mutex:
+            if not self._preparado:
+                with self._conectar_local() as con:
+                    gprint_criar_schema_refazer(con, local=True)
+                self._preparado = True
+
+    def registrar(self, **dados):
+        """INSERT/UPDATE duravel; nao acessa a rede durante a montagem."""
+        self.preparar_local()
+        dados.setdefault('id', str(uuid.uuid4()))
+        agora = datetime.now().isoformat(timespec='microseconds')
+        colunas = GPRINT_REFAZER_CAMPOS
+        placeholders = ', '.join('?' for _ in colunas)
+        updates = ', '.join(f'{col}=excluded.{col}' for col in colunas if col != 'id')
+        sql = (f"INSERT INTO refazer_registros ({', '.join(colunas)}) "
+               f"VALUES ({placeholders}) ON CONFLICT(id) DO UPDATE SET {updates}")
+        with self._mutex:
+            with self._conectar_local() as con:
+                antigo = con.execute('SELECT * FROM refazer_registros WHERE id=?',
+                                     (dados['id'],)).fetchone()
+                if antigo is not None:
+                    completo = dict(antigo)
+                else:
+                    completo = {
+                        'sessao_id': str(uuid.uuid4()), 'criado_em': agora,
+                        'cliente': '', 'lote': '', 'arquivo_original': '',
+                        'tipo': 'MIOLO', 'quantidade': 1,
+                        'montagem_status': 'PENDENTE', 'envio_status': 'PENDENTE',
+                        'erro': '', 'estacao': socket.gethostname()
+                    }
+                completo.update(dados)
+                completo['atualizado_em'] = agora
+                con.execute(sql, tuple(completo.get(col) for col in colunas))
+                con.execute('''INSERT INTO refazer_sincronizacao(registro_id, pendente)
+                    VALUES(?, 1) ON CONFLICT(registro_id) DO UPDATE SET pendente=1''',
+                    (dados['id'],))
+        return dados['id']
+
+    def sincronizar(self, tamanho_lote=200):
+        """Idempotente por UUID; DB central nunca recebe dois registros iguais."""
+        self.preparar_local()
+        with self._mutex:
+            if not os.path.isdir(os.path.dirname(self.central)):
+                return 0, 'Pasta de produção indisponível'
+            total = 0
+            try:
+                with self._conectar_local() as local:
+                    while True:
+                        registros = local.execute('''SELECT r.* FROM refazer_registros r
+                            JOIN refazer_sincronizacao s ON s.registro_id=r.id
+                            WHERE s.pendente=1 ORDER BY r.criado_em LIMIT ?''',
+                            (tamanho_lote,)).fetchall()
+                        if not registros:
+                            return total, ''
+                        colunas = GPRINT_REFAZER_CAMPOS
+                        placeholders = ', '.join('?' for _ in colunas)
+                        updates = ', '.join(
+                            f'{c}=excluded.{c}' for c in colunas if c != 'id')
+                        sql = (f"INSERT INTO refazer_registros ({', '.join(colunas)}) "
+                               f"VALUES ({placeholders}) ON CONFLICT(id) DO UPDATE SET "
+                               f"{updates} WHERE excluded.atualizado_em >= refazer_registros.atualizado_em")
+                        with closing(sqlite3.connect(self.central, timeout=20)) as remoto:
+                            remoto.execute('PRAGMA busy_timeout=20000')
+                            # Usar rollback journal; nao ativar WAL em arquivo compartilhado.
+                            gprint_criar_schema_refazer(remoto, local=False)
+                            with remoto:
+                                remoto.executemany(sql, [tuple(r[col] for col in colunas)
+                                                        for r in registros])
+                        # Marcacao separada: reenvio posterior e seguro se o processo cair aqui.
+                        with local:
+                            local.executemany('''UPDATE refazer_sincronizacao
+                                SET pendente=0 WHERE registro_id=?''',
+                                [(r['id'],) for r in registros])
+                        total += len(registros)
+            except (OSError, sqlite3.Error) as exc:
+                logging.warning('Refazer: banco central indisponivel para sincronizacao: %s', exc)
+                return total, 'Não foi possível atualizar o banco central; registros preservados localmente.'
+
+    def pendentes(self):
+        self.preparar_local()
+        with self._conectar_local() as con:
+            return con.execute('SELECT COUNT(*) FROM refazer_sincronizacao WHERE pendente=1').fetchone()[0]
+
+    def resumo_periodo(self, dias=30):
+        """Soma perdas por setor, sem carregar todos os registros na tela."""
+        if not os.path.isfile(self.central):
+            raise FileNotFoundError('Banco central de retrabalhos indisponivel.')
+        inicio = (datetime.now() - timedelta(days=dias)).isoformat()
+        with sqlite3.connect(self.central, timeout=10) as con:
+            return con.execute('''SELECT setor, COUNT(*), SUM(quantidade),
+                SUM(CASE WHEN envio_status='ENVIADO' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN envio_status='FALHOU' THEN 1 ELSE 0 END)
+                FROM refazer_registros WHERE criado_em >= ?
+                GROUP BY setor ORDER BY SUM(quantidade) DESC''', (inicio,)).fetchall()
+
+
+    def resumo_entre_datas(self, data_inicio, data_fim, setor='', operador='', tipo='Todos'):
+        """Resumo central por periodo inclusivo, consultado APENAS ao clicar em Buscar.
+
+        Recebe objetos date. Limites sao timestamp ISO em intervalos [inicio, fim+1 dia).
+        Mantem os registros antigos e o banco atual sem migrações.
+        """
+        if not isinstance(data_inicio, date) or not isinstance(data_fim, date):
+            raise ValueError('Informe datas validas.')
+        if data_inicio > data_fim:
+            raise ValueError('A data inicial deve ser anterior ou igual a data final.')
+        if not os.path.isfile(self.central):
+            raise FileNotFoundError('Banco central de retrabalhos indisponivel.')
+        inicio = data_inicio.isoformat() + 'T00:00:00'
+        fim_exclusivo = (data_fim + timedelta(days=1)).isoformat() + 'T00:00:00'
+        filtros = ['criado_em >= ?', 'criado_em < ?']
+        parametros = [inicio, fim_exclusivo]
+        if setor.strip():
+            filtros.append('UPPER(setor) LIKE ?')
+            parametros.append('%' + setor.strip().upper() + '%')
+        if operador.strip():
+            filtros.append('UPPER(operador) LIKE ?')
+            parametros.append('%' + operador.strip().upper() + '%')
+        if tipo in ('CAPA', 'MIOLO'):
+            filtros.append('tipo = ?')
+            parametros.append(tipo)
+        where = ' AND '.join(filtros)
+        consulta = f"""SELECT setor, COUNT(*) AS arquivos,
+            COALESCE(SUM(quantidade), 0) AS unidades,
+            COALESCE(SUM(CASE WHEN envio_status='ENVIADO' THEN 1 ELSE 0 END), 0) AS enviados,
+            COALESCE(SUM(CASE WHEN envio_status='FALHOU' THEN 1 ELSE 0 END), 0) AS falhas,
+            COALESCE(SUM(CASE WHEN montagem_status IN ('MONTADO', 'PREPARADO') THEN 1 ELSE 0 END), 0) AS montados
+            FROM refazer_registros WHERE {where}
+            GROUP BY setor ORDER BY unidades DESC, setor COLLATE NOCASE"""
+        with sqlite3.connect(self.central, timeout=10) as conexao:
+            return conexao.execute(consulta, parametros).fetchall()
+
 
 # Senha de acesso a Configuracoes > Equipamentos.
 # ALTERE antes de compilar o EXE. Nunca use a senha real em um GitHub publico.
 # Protege a interface do cadastro; nao substitui permissoes da pasta de rede.
-GPRINT_SENHA_ADMIN_EQUIPAMENTOS = "ALTERE_ESTA_SENHA_ANTES_DE_USAR"
+GPRINT_SENHA_ADMIN_EQUIPAMENTOS = "aaa"
 
 
 # ============================================================================
@@ -657,6 +863,12 @@ class GPrintEquipamentosRepository:
                     UNIQUE(equipamento_id, nome)
                 )''')
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_filas_equipamento ON filas(equipamento_id, ativo)')
+                conn.execute('''CREATE TABLE IF NOT EXISTS operadores (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    nome TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    ativo INTEGER NOT NULL DEFAULT 1,
+                    criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )''')
 
     def listar_equipamentos(self, tipo=None, incluir_inativos=False):
         sql = 'SELECT id,nome,ip,tipo,ativo FROM equipamentos WHERE 1=1'
@@ -764,8 +976,86 @@ class GPrintEquipamentosRepository:
         return sorted({x for x in filas if x and x not in disponiveis})
 
 
+    def listar_operadores(self, incluir_inativos=False):
+        sql = 'SELECT id, nome, ativo FROM operadores'
+        if not incluir_inativos:
+            sql += ' WHERE ativo=1'
+        sql += ' ORDER BY nome COLLATE NOCASE'
+        with self._conectar() as conn:
+            return [dict(r) for r in conn.execute(sql)]
+
+    def salvar_operador(self, nome, operador_id=None):
+        nome = str(nome).strip().upper()
+        if not nome or len(nome) > 80:
+            raise ValueError('Informe nome de operador com ate 80 caracteres.')
+        with self._conectar() as conn:
+            with conn:
+                if operador_id:
+                    conn.execute('UPDATE operadores SET nome=? WHERE id=?', (nome, operador_id))
+                    return operador_id
+                cur = conn.execute('INSERT INTO operadores(nome) VALUES(?)', (nome,))
+                return cur.lastrowid
+
+    def alterar_ativo_operador(self, operador_id, ativo):
+        with self._conectar() as conn:
+            with conn:
+                conn.execute('UPDATE operadores SET ativo=? WHERE id=?',
+                             (int(bool(ativo)), operador_id))
+
+
+    def excluir_operador(self, operador_id):
+        """Exclui cadastro; nao apaga nomes gravados no banco de perdas."""
+        with self._conectar() as conn:
+            with conn:
+                return conn.execute('DELETE FROM operadores WHERE id=?', (operador_id,)).rowcount
+
+
 def gprint_nome_maquina(equipamento):
     return f"{equipamento['nome']} - {equipamento['ip']}"
+
+
+def gprint_centralizar_janela(janela, parent=None, largura=None, altura=None):
+    """Centraliza um Toplevel em relacao a janela principal, respeitando a tela.
+
+    Nao altera dialogos nativos do Windows nem os tooltips.
+    """
+    janela.update_idletasks()
+    tela_largura = janela.winfo_screenwidth()
+    tela_altura = janela.winfo_screenheight()
+    largura = min(int(largura or max(janela.winfo_width(), janela.winfo_reqwidth())), tela_largura)
+    altura = min(int(altura or max(janela.winfo_height(), janela.winfo_reqheight())), tela_altura)
+    if parent is not None and parent.winfo_exists():
+        referencia = parent.winfo_toplevel()
+        x = referencia.winfo_rootx() + (referencia.winfo_width() - largura) // 2
+        y = referencia.winfo_rooty() + (referencia.winfo_height() - altura) // 2
+    else:
+        x = (tela_largura - largura) // 2
+        y = (tela_altura - altura) // 2
+    x = max(0, min(x, tela_largura - largura))
+    y = max(0, min(y, tela_altura - altura))
+    janela.geometry(f'{largura}x{altura}+{x}+{y}')
+    janela.deiconify()
+
+
+def gprint_autorizar_relatorio(parent):
+    """Solicita a MESMA senha definida para administrar os equipamentos."""
+    senha_configurada = GPRINT_SENHA_ADMIN_EQUIPAMENTOS
+    if not senha_configurada.strip() or senha_configurada == 'ALTERE_ESTA_SENHA_ANTES_DE_USAR':
+        messagebox.showwarning('GPrint - Acesso restrito',
+            'Configure a senha administrativa antes de consultar os relatórios.',
+            parent=parent)
+        return False
+    senha = simpledialog.askstring('GPrint - Relatorio de perdas',
+        'Informe a senha administrativa para consultar as perdas:',
+        show='*', parent=parent)
+    if senha is None:
+        return False
+    if not hmac.compare_digest(senha, senha_configurada):
+        messagebox.showerror('GPrint - Acesso negado',
+            'Senha incorreta. O resumo de perdas permanece protegido.',
+            parent=parent)
+        return False
+    return True
 
 
 class GPrintGerenciadorFilas(tk.Toplevel):
@@ -782,8 +1072,10 @@ class GPrintGerenciadorFilas(tk.Toplevel):
         self.minsize(730, 470)
         self.transient(cadastro.winfo_toplevel())
         self.protocol('WM_DELETE_WINDOW', self.fechar)
+        self.withdraw()
         self._montar()
         self.atualizar()
+        gprint_centralizar_janela(self, cadastro, 980, 650)
         self.grab_set()
         self.focus_set()
 
@@ -959,6 +1251,7 @@ class GPrintCadastroEquipamentosTab(ttk.Frame):
         self.equipamento_id=None
         self.equipamentos={}
         self._janela_filas=None
+        self._janela_operadores=None
         self._montar_tela()
 
     def _montar_tela(self):
@@ -986,6 +1279,8 @@ class GPrintCadastroEquipamentosTab(ttk.Frame):
         ttk.Button(acoes,text='Ativar / Desativar',command=self.alternar_equipamento).pack(side=tk.LEFT,padx=3)
         ttk.Button(acoes,text='Gerenciar filas da maquina selecionada',
                    command=self.gerenciar_filas,bootstyle=PRIMARY).pack(side=tk.LEFT,padx=12)
+        ttk.Button(acoes,text='Gerenciar operadores',
+                   command=self.gerenciar_operadores,bootstyle=INFO).pack(side=tk.LEFT,padx=5)
         ttk.Button(acoes,text='Atualizar',command=self.atualizar).pack(side=tk.RIGHT,padx=3)
 
         painel=ttk.LabelFrame(self,text='Equipamentos cadastrados (duplo clique para ver as filas)',padding=8)
@@ -1088,6 +1383,134 @@ class GPrintCadastroEquipamentosTab(ttk.Frame):
             self._janela_filas.focus_set()
             return
         self._janela_filas=GPrintGerenciadorFilas(self,row)
+
+    def gerenciar_operadores(self):
+        if self._janela_operadores is not None and self._janela_operadores.winfo_exists():
+            self._janela_operadores.lift()
+            return
+        self._janela_operadores = GPrintGerenciadorOperadores(self)
+
+class GPrintGerenciadorOperadores(tk.Toplevel):
+    """Cadastro de operadores protegido pela mesma senha de Equipamentos."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.painel = parent
+        self.repo = parent.app.repositorio_equipamentos
+        self.title('GPrint - Operadores do Refazer')
+        self.withdraw()
+        self.geometry('680x470')
+        self.transient(parent.winfo_toplevel())
+        self.nome_var = tk.StringVar()
+        self.operador_id = None
+        frame = ttk.Frame(self, padding=14)
+        frame.pack(fill='both', expand=True)
+        ttk.Label(frame, text='Operadores - cadastro central',
+                  font=('Segoe UI', 13, 'bold')).pack(anchor='w', pady=(0, 10))
+        linha = ttk.Frame(frame)
+        linha.pack(fill='x', pady=4)
+        ttk.Label(linha, text='Nome:').pack(side='left')
+        ttk.Entry(linha, textvariable=self.nome_var, width=36).pack(side='left', padx=8)
+        ttk.Button(linha, text='Salvar', command=self.salvar, bootstyle=SUCCESS).pack(side='left', padx=4)
+        ttk.Button(linha, text='Novo', command=self.novo).pack(side='left', padx=4)
+        cols = ('nome', 'situacao')
+        self.lista = ttk.Treeview(frame, columns=cols, show='headings', selectmode='browse')
+        self.lista.heading('nome', text='Operador')
+        self.lista.heading('situacao', text='Situação')
+        self.lista.column('nome', width=350)
+        self.lista.column('situacao', width=120, anchor='center')
+        self.lista.pack(fill='both', expand=True, pady=10)
+        self.lista.bind('<<TreeviewSelect>>', self.selecionar)
+        botoes = ttk.Frame(frame)
+        botoes.pack(fill='x')
+        ttk.Button(botoes, text='Ativar / Desativar', command=self.alternar,
+                   bootstyle=WARNING).pack(side='left')
+        ttk.Button(botoes, text='Excluir operador', command=self.excluir,
+                   bootstyle=DANGER).pack(side='left', padx=8)
+        ttk.Button(botoes, text='Atualizar', command=self.atualizar).pack(side='right')
+        self.dados = {}
+        self.atualizar()
+        gprint_centralizar_janela(self, parent, 680, 470)
+        self.protocol('WM_DELETE_WINDOW', self.fechar)
+        self.grab_set()
+        self.focus_set()
+
+    def fechar(self):
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
+
+    def novo(self):
+        self.operador_id = None
+        self.nome_var.set('')
+        for iid in self.lista.selection():
+            self.lista.selection_remove(iid)
+
+    def atualizar(self):
+        try:
+            linhas = self.repo.listar_operadores(incluir_inativos=True)
+            self.dados = {str(r['id']): r for r in linhas}
+            self.lista.delete(*self.lista.get_children())
+            for r in linhas:
+                self.lista.insert('', 'end', iid=str(r['id']),
+                                  values=(r['nome'], 'Ativo' if r['ativo'] else 'Inativo'))
+        except Exception as exc:
+            messagebox.showerror('GPrint - Operadores', str(exc), parent=self)
+
+    def selecionar(self, _event=None):
+        selecionado = self.lista.selection()
+        if selecionado:
+            linha = self.dados.get(selecionado[0])
+            if linha:
+                self.operador_id = linha['id']
+                self.nome_var.set(linha['nome'])
+
+    def salvar(self):
+        try:
+            self.repo.salvar_operador(self.nome_var.get(), self.operador_id)
+            self.atualizar()
+            self.painel.app.aba_refazer.atualizar_operadores_refazer()
+        except Exception as exc:
+            messagebox.showerror('GPrint - Operadores', str(exc), parent=self)
+
+    def alternar(self):
+        if self.operador_id is None:
+            return
+        linha = self.dados.get(str(self.operador_id))
+        if not linha:
+            return
+        try:
+            self.repo.alterar_ativo_operador(self.operador_id, not linha['ativo'])
+            self.atualizar()
+            self.painel.app.aba_refazer.atualizar_operadores_refazer()
+        except Exception as exc:
+            messagebox.showerror('GPrint - Operadores', str(exc), parent=self)
+
+
+    def excluir(self):
+        if self.operador_id is None:
+            messagebox.showwarning('GPrint - Operadores',
+                'Selecione um operador para excluir.', parent=self)
+            return
+        linha = self.dados.get(str(self.operador_id))
+        if not linha:
+            return
+        if not messagebox.askyesno('GPrint - Excluir operador',
+                f"Excluir definitivamente o cadastro de '{linha['nome']}'?\n\n"
+                'Essa pessoa deixara de aparecer nas novas selecoes do Refazer.\n'
+                'Os retrabalhos ja registrados permanecerao no historico.',
+                parent=self):
+            return
+        try:
+            if not self.repo.excluir_operador(self.operador_id):
+                raise ValueError('O operador selecionado nao foi encontrado.')
+            self.novo()
+            self.atualizar()
+            self.painel.app.aba_refazer.atualizar_operadores_refazer()
+        except Exception as exc:
+            messagebox.showerror('GPrint - Operadores', str(exc), parent=self)
+
 
 class ConfigTab(ttk.Frame):
     def __init__(self, parent, app):
@@ -3789,6 +4212,7 @@ class Application:
     def setup_ui(self):
         self.root.title("GPrint")
         self.root.geometry("900x700")
+        self.root.minsize(800, 600)
         self.root.state('zoomed')
         self.center_window()
         
@@ -3859,6 +4283,7 @@ class Application:
             self.aba_config.bloquear_cadastro()
         if aba_atual == str(self.aba_refazer):
             self.aba_refazer.atualizar_destinos_refazer()
+            self.aba_refazer.atualizar_operadores_refazer()
         if aba_atual in (str(self.aba_principal),str(self.aba_miolo),str(self.aba_hotfolder)):
             try:
                 self.atualizar_listas_equipamentos()
@@ -4468,12 +4893,8 @@ class Application:
         about_window.resizable(False, False)
         about_window.configure(bg="#0f172a")
 
-        # Centralizar
-        about_window.update_idletasks()
-        w, h = 450, 350
-        x = (about_window.winfo_screenwidth() // 2) - (w // 2)
-        y = (about_window.winfo_screenheight() // 2) - (h // 2)
-        about_window.geometry(f"{w}x{h}+{x}+{y}")
+        # Centraliza em relacao ao GPrint (sem alterar botoes/menus).
+        gprint_centralizar_janela(about_window, self.root, 450, 350)
 
         main = tk.Frame(about_window, bg="#0f172a", padx=30, pady=20)
         main.pack(fill="both", expand=True)
@@ -4481,7 +4902,7 @@ class Application:
         tk.Label(main, text="GPrint", font=("Segoe UI", 18, "bold"),
                 bg="#0f172a", fg="#f8fafc").pack(pady=(10, 0))
 
-        versao_badge = tk.Label(main, text="  v5.0  ", font=("Segoe UI", 10, "bold"),
+        versao_badge = tk.Label(main, text="  v12.0  ", font=("Segoe UI", 10, "bold"),
                                 bg="#3b82f6", fg="white", padx=8, pady=2)
         versao_badge.pack(pady=(4, 12))
 
@@ -5174,6 +5595,175 @@ def gprint_validar_destino_refazer(equipamentos, filas_por_equipamento, nome_maq
     return {'maquina': maquina.copy(), 'fila': str(nome_fila).strip()}
 
 
+class GPrintJanelaResumoPerdas(tk.Toplevel):
+    """Resumo restrito. Apenas SQL agregado; nada e carregado ao abrir."""
+    PERIODOS = ('Ultimos 30 dias', 'Mes anterior', 'Ultimos 3 meses (90 dias)',
+                'Mes atual', 'Personalizado')
+
+    def __init__(self, parent, repositorio):
+        super().__init__(parent)
+        self.withdraw()
+        self.repositorio = repositorio
+        self.title('GPrint - Relatorio de perdas (acesso restrito)')
+        self.geometry('940x590')
+        self.minsize(760, 500)
+        self.transient(parent.winfo_toplevel())
+        self.periodo = tk.StringVar(value='Ultimos 30 dias')
+        self.inicio = tk.StringVar()
+        self.fim = tk.StringVar()
+        self.setor = tk.StringVar()
+        self.operador = tk.StringVar()
+        self.tipo = tk.StringVar(value='Todos')
+        self.status = tk.StringVar(value='Selecione o periodo e clique em Buscar.')
+        self.total = tk.StringVar(value='Nenhuma consulta realizada.')
+        self._buscando = False
+        self._montar()
+        self._atualizar_periodo()
+        gprint_centralizar_janela(self, parent, 940, 590)
+        self.grab_set()
+        self.focus_set()
+
+    @staticmethod
+    def intervalo_periodo(nome, hoje=None):
+        """Periodos prontos; datas inclusivas com inicio/fim do calendario."""
+        hoje = hoje or date.today()
+        if nome == 'Ultimos 30 dias':
+            return hoje - timedelta(days=29), hoje
+        if nome == 'Mes anterior':
+            primeiro_atual = hoje.replace(day=1)
+            ultimo_anterior = primeiro_atual - timedelta(days=1)
+            return ultimo_anterior.replace(day=1), ultimo_anterior
+        if nome == 'Ultimos 3 meses (90 dias)':
+            return hoje - timedelta(days=89), hoje
+        if nome == 'Mes atual':
+            return hoje.replace(day=1), hoje
+        raise ValueError('Selecione um periodo valido.')
+
+    def _montar(self):
+        base = ttk.Frame(self, padding=14)
+        base.pack(fill='both', expand=True)
+        ttk.Label(base, text='Resumo de perdas e retrabalhos',
+                  font=('Segoe UI', 16, 'bold')).pack(anchor='w', pady=(0, 8))
+        ttk.Label(base, text='Dados do refazer.db central. Somente consulta; nenhum registro e alterado.',
+                  bootstyle=SECONDARY).pack(anchor='w', pady=(0, 10))
+        filtros = ttk.LabelFrame(base, text='Filtros', padding=10)
+        filtros.pack(fill='x')
+        for col in range(6):
+            filtros.columnconfigure(col, weight=1)
+        ttk.Label(filtros, text='Periodo').grid(row=0, column=0, sticky='w')
+        self.combo_periodo = ttk.Combobox(filtros, state='readonly',
+                                          values=self.PERIODOS, textvariable=self.periodo)
+        self.combo_periodo.grid(row=1, column=0, columnspan=2, sticky='ew', padx=(0, 10))
+        self.combo_periodo.bind('<<ComboboxSelected>>', lambda _event: self._atualizar_periodo())
+        ttk.Label(filtros, text='Inicio (DD/MM/AAAA)').grid(row=0, column=2, sticky='w')
+        self.entrada_inicio = ttk.Entry(filtros, textvariable=self.inicio)
+        self.entrada_inicio.grid(row=1, column=2, sticky='ew', padx=(0, 10))
+        ttk.Label(filtros, text='Fim (DD/MM/AAAA)').grid(row=0, column=3, sticky='w')
+        self.entrada_fim = ttk.Entry(filtros, textvariable=self.fim)
+        self.entrada_fim.grid(row=1, column=3, sticky='ew', padx=(0, 10))
+        ttk.Button(filtros, text='Buscar', command=self.buscar,
+                   bootstyle=PRIMARY).grid(row=1, column=4, columnspan=2, sticky='ew')
+        ttk.Label(filtros, text='Tipo').grid(row=2, column=0, sticky='w', pady=(9, 0))
+        ttk.Combobox(filtros, state='readonly', textvariable=self.tipo,
+                     values=('Todos', 'CAPA', 'MIOLO')).grid(row=3, column=0, columnspan=2,
+                                                             sticky='ew', padx=(0, 10))
+        ttk.Label(filtros, text='Setor (opcional)').grid(row=2, column=2, sticky='w', pady=(9, 0))
+        ttk.Entry(filtros, textvariable=self.setor).grid(row=3, column=2, columnspan=2,
+                                                         sticky='ew', padx=(0, 10))
+        ttk.Label(filtros, text='Operador (opcional)').grid(row=2, column=4, sticky='w', pady=(9, 0))
+        ttk.Entry(filtros, textvariable=self.operador).grid(row=3, column=4, columnspan=2,
+                                                            sticky='ew')
+        ttk.Label(base, textvariable=self.total, font=('Segoe UI', 11, 'bold')).pack(
+            anchor='w', pady=(14, 6))
+        painel = ttk.Frame(base)
+        painel.pack(fill='both', expand=True)
+        painel.rowconfigure(0, weight=1)
+        painel.columnconfigure(0, weight=1)
+        cols = ('setor', 'arquivos', 'unidades', 'montados', 'enviados', 'falhas')
+        self.tabela = ttk.Treeview(painel, columns=cols, show='headings', selectmode='none')
+        for col, label, width in [
+            ('setor','Setor',210),('arquivos','Arquivos',100),
+            ('unidades','Unidades',100),('montados','Preparados',100),
+            ('enviados','Envios LPR',110),('falhas','Falhas LPR',110)]:
+            self.tabela.heading(col, text=label)
+            self.tabela.column(col, width=width, anchor='w' if col=='setor' else 'center',
+                               stretch=True)
+        self.tabela.grid(row=0, column=0, sticky='nsew')
+        rolagem = ttk.Scrollbar(painel, orient='vertical', command=self.tabela.yview)
+        rolagem.grid(row=0, column=1, sticky='ns')
+        self.tabela.configure(yscrollcommand=rolagem.set)
+        rodape = ttk.Frame(base)
+        rodape.pack(fill='x', pady=(9, 0))
+        ttk.Label(rodape, textvariable=self.status, bootstyle=SECONDARY).pack(side='left')
+        ttk.Button(rodape, text='Fechar', command=self.destroy).pack(side='right')
+
+    def _atualizar_periodo(self):
+        personalizado = self.periodo.get() == 'Personalizado'
+        if not personalizado:
+            inicio, fim = self.intervalo_periodo(self.periodo.get())
+            self.inicio.set(inicio.strftime('%d/%m/%Y'))
+            self.fim.set(fim.strftime('%d/%m/%Y'))
+        self.entrada_inicio.configure(state='normal' if personalizado else 'readonly')
+        self.entrada_fim.configure(state='normal' if personalizado else 'readonly')
+
+    def buscar(self):
+        if self._buscando:
+            return
+        try:
+            inicio = datetime.strptime(self.inicio.get().strip(), '%d/%m/%Y').date()
+            fim = datetime.strptime(self.fim.get().strip(), '%d/%m/%Y').date()
+            if inicio > fim:
+                raise ValueError('A data inicial deve ser anterior ou igual a data final.')
+            if fim > date.today():
+                raise ValueError('O fim do periodo nao pode estar no futuro.')
+        except ValueError as exc:
+            messagebox.showwarning('GPrint - Periodo invalido',
+                'Informe datas validas em DD/MM/AAAA.\n' + str(exc), parent=self)
+            return
+        self._buscando = True
+        self.status.set('Consultando o banco central...')
+        periodo_texto = f'{inicio:%d/%m/%Y} a {fim:%d/%m/%Y}'
+        setor, operador, tipo = self.setor.get(), self.operador.get(), self.tipo.get()
+
+        def tarefa():
+            try:
+                linhas = self.repositorio.resumo_entre_datas(inicio, fim, setor, operador, tipo)
+                erro = None
+            except Exception as exc:
+                linhas, erro = [], exc
+            try:
+                self.after(0, lambda: self._concluir_busca(linhas, erro, periodo_texto))
+            except (tk.TclError, RuntimeError):
+                pass
+        threading.Thread(target=tarefa, daemon=True).start()
+
+    def _concluir_busca(self, linhas, erro, periodo):
+        if not self.winfo_exists():
+            return
+        self._buscando = False
+        if erro is not None:
+            self.status.set('Consulta nao concluida.')
+            messagebox.showwarning('GPrint - Relatorio de perdas',
+                'Nao foi possivel consultar o banco de retrabalhos. '
+                'Verifique a pasta producao e, se necessario, informe o Guilherme.',
+                parent=self)
+            logging.warning('Refazer: falha na consulta de perdas: %s', erro)
+            return
+        antigos = self.tabela.get_children()
+        if antigos:
+            self.tabela.delete(*antigos)
+        for setor, arquivos, unidades, enviados, falhas, montados in linhas:
+            self.tabela.insert('', 'end', values=(setor or 'Nao informado',
+                arquivos, unidades, montados, enviados, falhas))
+        arquivos = sum(int(r[1] or 0) for r in linhas)
+        unidades = sum(int(r[2] or 0) for r in linhas)
+        montados = sum(int(r[5] or 0) for r in linhas)
+        enviados = sum(int(r[3] or 0) for r in linhas)
+        falhas = sum(int(r[4] or 0) for r in linhas)
+        self.total.set(f'{periodo}  |  {arquivos} arquivos  |  {unidades} unidades de retrabalho')
+        self.status.set(f'PDFs preparados: {montados}   |   Envios LPR aceitos: {enviados}   |   Falhas: {falhas}')
+
+
 class RefazerTab(ttk.Frame):
     # ---------- CONFIGURAÇÕES (agora atributos da classe) ----------
     CAMINHO_CAPAS_POD_AGRUPADAS = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\_CAPAS DE POD AGRUPADAS"
@@ -5196,7 +5786,7 @@ class RefazerTab(ttk.Frame):
     SETORES_PERDA = [ "PRE-IMPRESSÃO", "PROBLEMA DE FONTE","IMPRESSÃO", "REFILE INICIAL MIOLO","REFILE INICIAL CAPA","SEPARAÇÃO", "ENCADERNAÇÃO", "LAMINAÇÃO","REFILE ORELHA",
                      "REFILE FINAL", "SHIRINK","EXPEDIÇÃO"]
     MAQUINAS_REF = ["RICOH", "OCÉ 1", "OCÉ 3", "BALTORO","ATEXCO"]
-    OPERADORES = ["FRAN", "MONALISA", "PALOMA", "PEDRO", "ISMENIO", "CAMILA", "EDUARDO", "DIOGO", "KENNEDY"]
+    OPERADORES = []  # Carregados do equipamentos.db, nao fixos no codigo.
 
     def __init__(self, parent, app=None):
         super().__init__(parent)
@@ -5213,7 +5803,10 @@ class RefazerTab(ttk.Frame):
         self.idx_miolo = -1
         self.idx_caminho = -1
         # O refazer antigo (preparar/salvar) permanece como modo padrão.
-        self.enviar_refazer_var = tk.BooleanVar(value=False)
+        # Envio marcado por padrao, mas operador pode desativar para apenas montar.
+        self.enviar_refazer_var = tk.BooleanVar(value=True)
+        self.repositorio_refazer = GPrintRefazerRepositorio()
+        self._consulta_operadores_em_andamento = False
         self._equipamentos_refazer = {}
         self._filas_refazer = {}
         self._tipos_por_linha = {}
@@ -5899,9 +6492,9 @@ class RefazerTab(ttk.Frame):
         self.cb_lote.bind("<<ComboboxSelected>>", self.on_lote_change)
 
         ttk.Label(top, text="Operador").grid(row=1, column=0, padx=5, pady=5, sticky="w")
-        self.cb_operador = ttk.Combobox(top, values=self.OPERADORES, textvariable=self.operador_var)
+        self.cb_operador = ttk.Combobox(top, values=[], textvariable=self.operador_var, state='readonly')
         self.cb_operador.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
-        self.cb_operador.current(0)
+        # Operadores sao recebidos do cadastro central ao entrar na aba.
 
         ttk.Label(top, text="Filtro").grid(row=1, column=2, padx=5, pady=5, sticky="w")
         filtro_entry = ttk.Entry(top, textvariable=self.filtro_var)
@@ -5926,6 +6519,9 @@ class RefazerTab(ttk.Frame):
         self.btn_limpar = ttk.Button(botoes_top, text="Limpar", command=self.limpar,
                                     bootstyle=DANGER)
         self.btn_limpar.grid(row=0, column=2, padx=5, sticky="ew")
+        ttk.Button(botoes_top, text='Resumo de perdas (restrito)',
+                   command=self.mostrar_resumo_perdas, bootstyle=SECONDARY
+                   ).grid(row=1, column=0, columnspan=3, sticky='ew', padx=5, pady=(6, 0))
 
         paned = tk.PanedWindow(main_frame, orient="vertical", sashrelief="raised", sashwidth=8, bg="#000000")
         paned.grid(row=1, column=0, sticky="nsew", pady=5,padx=10)
@@ -6036,7 +6632,7 @@ class RefazerTab(ttk.Frame):
         opcoes_envio.grid(row=4, column=0, sticky='ew', padx=12, pady=(0, 5))
         ttk.Checkbutton(opcoes_envio, text='Enviar os PDFs preparados às impressoras após o refazer',
                         variable=self.enviar_refazer_var, bootstyle='info-square-toggle').pack(side='left')
-        ttk.Label(opcoes_envio, text='(1 trabalho por PDF final; quantidade continua no relatório)',
+        ttk.Label(opcoes_envio, text='(1 trabalho por PDF final; quantidade é registrada no banco)',
                   bootstyle=SECONDARY).pack(side='left', padx=12)
 
         # ================= ANDAMENTO (PROGRESSBAR) =================
@@ -6079,6 +6675,32 @@ class RefazerTab(ttk.Frame):
             width=22
         )
         self.btn_processar.grid(row=0, column=1, sticky="e")
+
+    def atualizar_operadores_refazer(self):
+        """Busca operadores ativos sem bloquear a interface durante leitura da rede."""
+        if self._consulta_operadores_em_andamento:
+            return
+        self._consulta_operadores_em_andamento = True
+        def consultar():
+            try:
+                operadores = self.app.repositorio_equipamentos.listar_operadores()
+                nomes = [o['nome'] for o in operadores]
+            except Exception as exc:
+                logging.warning('Refazer: cadastro de operadores indisponivel: %s', exc)
+                nomes = []
+            def aplicar():
+                self._consulta_operadores_em_andamento = False
+                if not self.winfo_exists():
+                    return
+                atual = self.operador_var.get()
+                self.cb_operador.configure(values=nomes)
+                if atual not in nomes:
+                    self.operador_var.set(nomes[0] if len(nomes) == 1 else '')
+            try:
+                self.after(0, aplicar)
+            except (tk.TclError, RuntimeError):
+                pass
+        threading.Thread(target=consultar, daemon=True).start()
 
     def atualizar_destinos_refazer(self):
         """Lê cadastro em segundo plano ao entrar na aba; não bloqueia a abertura."""
@@ -6216,42 +6838,39 @@ class RefazerTab(ttk.Frame):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     def _enviar_resultados_refazer(self, trabalhos):
-        if not trabalhos:
-            messagebox.showwarning('GPrint - Refazer',
-                'Nenhum PDF final ficou pronto para envio. Confira os registros de processamento.',
-                parent=self)
-            return
-        # Um envio para cada PDF preparado, sem mexer em quantidade ou modo de montagem.
+        """Mantem a mesma chamada LPR; devolve resumo para UMA mensagem final."""
         total = len(trabalhos)
-        self.progress['maximum'] = total
+        self.progress['maximum'] = max(1, total)
         self.progress['value'] = 0
         enviados = 0
         falhas = []
-        for idx, (arquivo, destino) in enumerate(trabalhos, 1):
+        for idx, (arquivo, destino, registro_id) in enumerate(trabalhos, 1):
             self.progress_label.configure(text=f'Enviando: {idx}/{total}')
             self.update_idletasks()
             if not os.path.isfile(arquivo):
-                falhas.append(f'{os.path.basename(arquivo)}: arquivo final não encontrado')
+                ok, detalhe = False, 'PDF final nao encontrado para envio'
             else:
+                # Rotina LPR existente preservada; nenhuma nova chamada por quantidade.
                 ok, detalhe = self._enviar_refazer_lpr(arquivo, destino)
-                if ok:
-                    enviados += 1
-                    logging.info('Refazer: trabalho aceito via LPR (%s / %s / %s)',
-                                 os.path.basename(arquivo), destino['maquina']['nome'], destino['fila'])
-                else:
-                    falhas.append(f"{os.path.basename(arquivo)} ({destino['maquina']['nome']} / "
-                                  f"{destino['fila']}): {detalhe}")
-                    logging.error('Refazer - falha LPR: %s', falhas[-1])
+            if ok:
+                enviados += 1
+                logging.info('Refazer: trabalho aceito via LPR (%s / %s / %s)',
+                             os.path.basename(arquivo), destino['maquina']['nome'], destino['fila'])
+            else:
+                falha = (f"{os.path.basename(arquivo)} ({destino['maquina']['nome']} / "
+                         f"{destino['fila']}): {detalhe}")
+                falhas.append(falha)
+                logging.error('Refazer - falha LPR: %s', falha)
+            try:
+                self.repositorio_refazer.registrar(
+                    id=registro_id, envio_status='ENVIADO' if ok else 'FALHOU',
+                    erro='' if ok else detalhe)
+            except Exception:
+                logging.exception('Refazer: erro ao registrar retorno do LPR localmente')
+                falhas.append('Falha ao registrar o resultado no historico local.')
             self.progress['value'] = idx
-        if falhas:
-            messagebox.showwarning('GPrint - Refazer: envios concluídos com falhas',
-                f'{enviados}/{total} trabalhos aceitos pelo LPR.\n\n'
-                + '\n'.join(falhas[:8])
-                + ('\n... e outros erros. Consulte o console.' if len(falhas) > 8 else ''),
-                parent=self)
-        else:
-            messagebox.showinfo('GPrint - Refazer: envio finalizado',
-                f'{enviados} trabalho(s) aceitos pelo LPR.', parent=self)
+        return enviados, falhas
+
 
     # ---------- HANDLERS E LÓGICA ----------
     def _limpar_tudo_exceto_cliente_lote(self):
@@ -6373,7 +6992,7 @@ class RefazerTab(ttk.Frame):
     def limpar(self):
         self._limpar_tudo_exceto_cliente_lote()
         self.filtro_var.set("")
-        self.operador_var.set(self.OPERADORES[0])
+        self.operador_var.set('')
 
     def _aplicar_edicao_em_linhas(self, iids):
         """Atualiza setor/máquina/fila sem misturar filas de equipamentos distintos."""
@@ -6540,8 +7159,17 @@ class RefazerTab(ttk.Frame):
                                  'Não foi possível concluir o processamento.\n' + str(exc),
                                  parent=self)
         finally:
+            # Zera inclusive se houver cancelamento ou erro de banco.
+            self.progress['value'] = 0
+            self.progress_label.configure(text='0/0')
             self._refazer_em_execucao = False
             self.btn_processar.configure(state='normal')
+
+    def mostrar_resumo_perdas(self):
+        """Relatorio restrito: consulta e renderizacao somente apos senha correta."""
+        if not gprint_autorizar_relatorio(self):
+            return
+        GPrintJanelaResumoPerdas(self, self.repositorio_refazer)
 
     def _executar_refazer_impl(self):
         self._finalizar_editor_refazer()
@@ -6555,7 +7183,7 @@ class RefazerTab(ttk.Frame):
                     f'Serão preparados e enviados {len(plano_destinos)} arquivo(s), '
                     'um trabalho LPR por PDF final.\n\n'
                     'Confirme se máquina e fila estão corretas.\n'
-                    'A quantidade informada no Refazer continua sendo usada no relatório, '
+                    'A quantidade informada no Refazer será registrada no banco, '
                     'não como multiplicador do envio.', parent=self):
                 return
         cliente = self.pasta_var.get()
@@ -6569,13 +7197,21 @@ class RefazerTab(ttk.Frame):
         else:
             pasta_lote = os.path.join(self.CAMINHO_CAPAS_POD_AGRUPADAS, cliente, lote)
 
-        try:
-            wb = openpyxl.load_workbook(self.CAMINHO_RELATORIOS_PERDA)
-            aba = "UICLAP" if cliente == "uiclap" else "PODS"
-            ws = wb[aba]
-        except Exception as e:
-            messagebox.showerror("Erro", str(e), parent=self)
+        if not operador:
+            messagebox.showwarning('GPrint - Refazer',
+                'Selecione um operador cadastrado em Configuracoes > Equipamentos e filas '
+                '> Gerenciar operadores.', parent=self)
             return
+        # Inicializa a fila DURAVEL antes de copiar ou montar qualquer PDF.
+        try:
+            self.repositorio_refazer.preparar_local()
+        except (OSError, sqlite3.Error) as exc:
+            messagebox.showerror('GPrint - Refazer',
+                f'Nao foi possivel preparar o banco LOCAL de retrabalhos.\n{exc}\n'
+                'Nenhum processamento foi iniciado.', parent=self)
+            return
+        sessao_id = str(uuid.uuid4())
+        registros_por_linha = {}
 
         copias_capas = []
         miolos_info = []
@@ -6600,15 +7236,27 @@ class RefazerTab(ttk.Frame):
                 continue
 
             tipo_atual = item_original["tipo"]
+            registro_id = self.repositorio_refazer.registrar(
+                sessao_id=sessao_id, cliente=cliente, lote=lote,
+                arquivo_original=nome, codigo=str(valores[1]), tipo=tipo_atual,
+                quantidade=max(0, int(qtd)), setor=setor, operador=operador,
+                maquina=maquina, fila_lpr=str(valores[5]),
+                montagem_status='PENDENTE',
+                envio_status='PENDENTE' if plano_destinos.get(iid) else 'DESATIVADO')
+            registros_por_linha[iid] = registro_id
             linha = item_original["linha"]
             caminho_fisico = item_original["caminho_fisico"]
             if not caminho_fisico or not os.path.exists(caminho_fisico):
                 caminho_fisico = os.path.join(pasta_lote, nome)
 
             destino = self.copiar_para_refazer(caminho_fisico, cliente, lote, tipo_atual)
+            self.repositorio_refazer.registrar(
+                id=registro_id, montagem_status='COPIADO' if destino else 'FALHOU',
+                pdf_resultado=destino or '',
+                erro='' if destino else 'Arquivo original nao localizado ou copia falhou')
 
             if tipo_atual == "CAPA" and destino and destino.lower().endswith('.pdf'):
-                copias_capas.append((destino, os.path.splitext(nome)[0], setor, plano_destinos.get(iid)))
+                copias_capas.append((destino, os.path.splitext(nome)[0], setor, plano_destinos.get(iid), registro_id))
             elif tipo_atual == "MIOLO" and destino and destino.lower().endswith('.pdf'):
                 miolos_info.append((
                     destino,
@@ -6616,7 +7264,8 @@ class RefazerTab(ttk.Frame):
                     item_original.get("acabamento"),
                     item_original.get("formato_miolo"),
                     setor,
-                    plano_destinos.get(iid)
+                    plano_destinos.get(iid),
+                    registro_id
                 ))
 
             # Copia o outro tipo (miolo/capa) se existir
@@ -6632,16 +7281,12 @@ class RefazerTab(ttk.Frame):
                         caminho_outro = os.path.join(pasta_lote, nome_outro)
                     self.copiar_para_refazer(caminho_outro, cliente, lote, tipo_outro)
 
-            nova_linha = linha + (qtd, setor, maquina, operador, data_hora, tipo_atual)
-            ws.append(nova_linha)
-            processados += 1
+            # Registros gravados no refazer.db. Excel de perdas nao e mais atualizado.
+            # Sera contado somente apos a preparacao final da capa/miolo.
 
             self.progress["value"] = idx
             self.progress_label.config(text=f"Copiando: {idx}/{total_itens}")
             self.update_idletasks()
-
-        wb.save(self.CAMINHO_RELATORIOS_PERDA)
-        wb.close()
 
         # Etapa 2: marca d'água nas capas
         total_capas = len(copias_capas)
@@ -6650,16 +7295,21 @@ class RefazerTab(ttk.Frame):
             self.progress["value"] = 0
             self.progress_label.config(text=f"Capas: 0/{total_capas}")
             self.update_idletasks()
-            for idx, (destino, nome_base, setor_capa, destino_impressao) in enumerate(copias_capas, start=1):
+            for idx, (destino, nome_base, setor_capa, destino_impressao, registro_id) in enumerate(copias_capas, start=1):
                 try:
                     self.adicionar_marca_dagua(destino, nome_base)
                     if setor_capa == "PROBLEMA DE FONTE":
                         temp_outlines = destino.replace('.pdf', '_TEMP_OUTLINES.pdf')
                         self.converter_em_contornos(destino, temp_outlines)
                         os.replace(temp_outlines, destino)
+                    self.repositorio_refazer.registrar(
+                        id=registro_id, montagem_status='PREPARADO', pdf_resultado=destino)
+                    processados += 1
                     if destino_impressao and os.path.isfile(destino):
-                        arquivos_para_envio.append((destino, destino_impressao))
+                        arquivos_para_envio.append((destino, destino_impressao, registro_id))
                 except Exception as e:
+                    self.repositorio_refazer.registrar(
+                        id=registro_id, montagem_status='FALHOU', erro=str(e))
                     print(f"Erro na marca d'água/contornos de {nome_base}: {e}")
                 self.progress["value"] = idx
                 self.progress_label.config(text=f"Capas: {idx}/{total_capas}")
@@ -6673,7 +7323,7 @@ class RefazerTab(ttk.Frame):
             self.progress_label.config(text=f"Miolos: 0/{total_miolos}")
             self.update_idletasks()
 
-            for idx, (copia_dest, nome_base, acab, fmt_miolo, setor_item, destino_impressao) in enumerate(miolos_info, start=1):
+            for idx, (copia_dest, nome_base, acab, fmt_miolo, setor_item, destino_impressao, registro_id) in enumerate(miolos_info, start=1):
                 self.progress_label.config(text=f"Miolo {idx}/{total_miolos}: {nome_base}")
                 self.update_idletasks()
                 try:
@@ -6722,9 +7372,15 @@ class RefazerTab(ttk.Frame):
                             if os.path.exists(copia_dest): os.remove(copia_dest)
                             arquivo_final_refazer = nome_final
                         print(f"Miolo {nome_base}: sem tipo de montagem definido (acabamento: {acab}), mantido como cópia simples.")
+                    self.repositorio_refazer.registrar(
+                        id=registro_id, montagem_status='MONTADO',
+                        pdf_resultado=arquivo_final_refazer)
+                    processados += 1
                     if destino_impressao and os.path.isfile(arquivo_final_refazer):
-                        arquivos_para_envio.append((arquivo_final_refazer, destino_impressao))
+                        arquivos_para_envio.append((arquivo_final_refazer, destino_impressao, registro_id))
                 except Exception as e:
+                    self.repositorio_refazer.registrar(
+                        id=registro_id, montagem_status='FALHOU', erro=str(e))
                     print(f"Erro ao processar miolo {nome_base}: {e}")
 
                 self.progress["value"] = idx
@@ -6737,12 +7393,31 @@ class RefazerTab(ttk.Frame):
         for item in self.tree_selecao.get_children():
             self.tree_selecao.delete(item)
         self.lista_completa = []
-        self.progress["value"] = 0
-        self.progress_label.config(text="")
+        enviados, falhas = (0, [])
         if plano_destinos:
-            self._enviar_resultados_refazer(arquivos_para_envio)
+            enviados, falhas = self._enviar_resultados_refazer(arquivos_para_envio)
+            if len(arquivos_para_envio) < len(plano_destinos):
+                falhas.append(f'{len(plano_destinos)-len(arquivos_para_envio)} arquivo(s) sem PDF pronto para envio.')
+        # Registros novos e pendentes de execucoes anteriores sao sincronizados.
+        sincronizados, erro_sincronizacao = self.repositorio_refazer.sincronizar()
+        pendentes = self.repositorio_refazer.pendentes()
+        self.progress['value'] = 0
+        self.progress_label.configure(text='0/0')
+        self.status_var.set('Pronto para o próximo Refazer')
+        if plano_destinos:
+            resumo = (f'{processados} arquivo(s) preparados.\n'
+                      f'{enviados}/{len(arquivos_para_envio)} envio(s) aceitos pelo LPR.\n')
+            if falhas:
+                resumo += f'{len(falhas)} falha(s) no envio/registro.\n' + '\n'.join(falhas[:5])
         else:
-            messagebox.showinfo("Concluído", f"{processados} arquivos processados.", parent=self)
+            resumo = f'{processados} arquivo(s) preparados.\nEnvio às impressoras desativado.'
+        if pendentes:
+            resumo += (f'\n\nATENÇÃO: {pendentes} registro(s) permanecem no computador.'
+                       '\nVerifique a rede da produção e informe o Guilherme.')
+        else:
+            resumo += f'\n\nHistórico de retrabalho sincronizado ({sincronizados} registro(s)).'
+        (messagebox.showwarning if falhas or pendentes else messagebox.showinfo)(
+            'GPrint - Resultado do Refazer', resumo, parent=self)
 
 import os
 import csv
