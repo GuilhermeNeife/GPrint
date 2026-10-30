@@ -3857,6 +3857,8 @@ class Application:
         if aba_atual != str(self.aba_config):
             # Sair de Configuracoes revoga o acesso; novo acesso pede senha.
             self.aba_config.bloquear_cadastro()
+        if aba_atual == str(self.aba_refazer):
+            self.aba_refazer.atualizar_destinos_refazer()
         if aba_atual in (str(self.aba_principal),str(self.aba_miolo),str(self.aba_hotfolder)):
             try:
                 self.atualizar_listas_equipamentos()
@@ -4845,20 +4847,14 @@ class HotfolderTab(ttk.Frame):
         print_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         print_frame.columnconfigure(1, weight=1)
         print_frame.columnconfigure(3, weight=1)
-        print_frame.columnconfigure(5, weight=1)
 
-        ttk.Label(print_frame, text="Fila cadastrada:", width=15).grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        self.format_cb = ttk.Combobox(print_frame, state="readonly", width=25, bootstyle=(PRIMARY))
-        self.format_cb.grid(row=0, column=1, padx=5, pady=5, sticky="w")
-        self.format_cb.bind("<<ComboboxSelected>>", self.on_format_change)
+        ttk.Label(print_frame, text="Fila de impressão:", width=18).grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.format_cb = ttk.Combobox(print_frame, state="readonly", width=36, bootstyle=(PRIMARY))
+        self.format_cb.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
 
-        ttk.Label(print_frame, text="Descricao:", width=18).grid(row=0, column=2, padx=5, pady=5, sticky="w")
-        self.paper_cb = ttk.Combobox(print_frame, state="disabled", width=25, bootstyle=(PRIMARY))
-        self.paper_cb.grid(row=0, column=3, padx=5, pady=5, sticky="w")
-
-        ttk.Label(print_frame, text="Identificação (opcional):", width=20).grid(row=0, column=4, padx=5, pady=5, sticky="w")
-        self.id_entry = ttk.Entry(print_frame, width=30, bootstyle=(PRIMARY))
-        self.id_entry.grid(row=0, column=5, padx=5, pady=5, sticky="w")
+        ttk.Label(print_frame, text="Identificação (opcional):", width=22).grid(row=0, column=2, padx=5, pady=5, sticky="w")
+        self.id_entry = ttk.Entry(print_frame, width=36, bootstyle=(PRIMARY))
+        self.id_entry.grid(row=0, column=3, padx=5, pady=5, sticky="ew")
         self._setup_placeholder()
 
         # ================= LOG DE EVENTOS =================
@@ -4977,7 +4973,6 @@ class HotfolderTab(ttk.Frame):
         self.ip_label.configure(text=f"IP: {maquina['ip']}" if maquina else 'IP: ---')
         self.format_cb.configure(values=[])
         self.format_cb.set('')
-        self.paper_cb.set('')
 
     def on_machine_change(self, event=None):
         maquina=self.equipamentos_disponiveis.get(self.machine_var.get()) if hasattr(self,'equipamentos_disponiveis') else None
@@ -4985,7 +4980,6 @@ class HotfolderTab(ttk.Frame):
             self.ip_label.configure(text='IP: ---')
             self.format_cb.configure(values=[])
             self.format_cb.set('')
-            self.paper_cb.set('')
             return
         self.ip_label.configure(text=f"IP: {maquina['ip']}")
         try:
@@ -4996,11 +4990,6 @@ class HotfolderTab(ttk.Frame):
         self.filas_disponiveis={r['nome']:r for r in filas}
         self.format_cb.configure(values=list(self.filas_disponiveis))
         self.format_cb.set('')
-        self.paper_cb.set('')
-
-    def on_format_change(self, event=None):
-        fila=getattr(self,'filas_disponiveis',{}).get(self.format_cb.get())
-        self.paper_cb.set(fila['descricao'] if fila else '')
 
     def on_drop(self, event):
         files = re.findall(r'\{.*?\}|\S+', event.data)
@@ -5166,6 +5155,25 @@ from datetime import datetime
 import fitz  # PyMuPDF
 from PIL import Image, ImageOps
 import openpyxl
+def gprint_validar_destino_refazer(equipamentos, filas_por_equipamento, nome_maquina, nome_fila, tipo):
+    """Valida o destino de um retrabalho sem alterar o nome da fila LPR.
+
+    Retorna um cadastro (nome, IP, tipo) ou gera ValueError.
+    Equipamentos e filas vêm do cadastro central; só ativos são aceitos.
+    """
+    maquina = equipamentos.get(str(nome_maquina).strip())
+    if not maquina:
+        raise ValueError('Selecione uma máquina cadastrada e ativa.')
+    if maquina['tipo'] not in (str(tipo).upper(), 'AMBOS'):
+        raise ValueError(f"A máquina {maquina['nome']} não está habilitada para {tipo}.")
+    if not str(nome_fila).strip():
+        raise ValueError(f"Escolha uma fila para a máquina {maquina['nome']}.")
+    filas = filas_por_equipamento.get(maquina['id'], {})
+    if str(nome_fila).strip() not in filas:
+        raise ValueError(f"A fila escolhida não está ativa em {maquina['nome']}.")
+    return {'maquina': maquina.copy(), 'fila': str(nome_fila).strip()}
+
+
 class RefazerTab(ttk.Frame):
     # ---------- CONFIGURAÇÕES (agora atributos da classe) ----------
     CAMINHO_CAPAS_POD_AGRUPADAS = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\_CAPAS DE POD AGRUPADAS"
@@ -5204,6 +5212,12 @@ class RefazerTab(ttk.Frame):
         self.idx_capa = -1
         self.idx_miolo = -1
         self.idx_caminho = -1
+        # O refazer antigo (preparar/salvar) permanece como modo padrão.
+        self.enviar_refazer_var = tk.BooleanVar(value=False)
+        self._equipamentos_refazer = {}
+        self._filas_refazer = {}
+        self._tipos_por_linha = {}
+        self._refazer_em_execucao = False
 
         self._criar_interface()
         self.carregar_clientes()
@@ -5948,7 +5962,7 @@ class RefazerTab(ttk.Frame):
 
         toolbar = ttk.Frame(self.frame_edicao)
         toolbar.grid(row=0, column=0, sticky="ew", padx=5, pady=(5, 0))
-        ttk.Label(toolbar, text="💡 Clique ÚNICO nas colunas Quantidade / Setor / Máquina para editar",
+        ttk.Label(toolbar, text="💡 Clique ÚNICO nas colunas Quantidade / Setor / Máquina / Fila LPR para editar",
                 foreground="#1e5eff", font=("Arial", 10, "bold"), anchor="w").pack(fill="x", padx=5, pady=5)
 
         edit_container = ttk.Frame(self.frame_edicao)
@@ -5957,18 +5971,22 @@ class RefazerTab(ttk.Frame):
         edit_container.columnconfigure(0, weight=1)
 
         self.tree_edicao = ttk.Treeview(edit_container,
-                                        columns=("Nome", "Código", "Quantidade", "Setor", "Máquina"),
+                                        columns=("Nome", "Código", "Quantidade", "Setor", "Máquina", "Fila LPR"),
                                         show="headings")
         self.tree_edicao.heading("Nome", text="Arquivo")
         self.tree_edicao.heading("Código", text="Código")
         self.tree_edicao.heading("Quantidade", text="Quantidade")
         self.tree_edicao.heading("Setor", text="Setor")
         self.tree_edicao.heading("Máquina", text="Máquina")
-        self.tree_edicao.column("Nome", width=80, minwidth=250)
-        self.tree_edicao.column("Código", width=20, anchor="center")
-        self.tree_edicao.column("Quantidade", width=20, anchor="center")
-        self.tree_edicao.column("Setor", width=80, anchor="center")
-        self.tree_edicao.column("Máquina", width=60, anchor="center")
+        self.tree_edicao.heading("Fila LPR", text="Fila LPR")
+        # Larguras adequadas para nomes reais de filas e equipamentos.
+        # A rolagem horizontal continua disponível para nomes longos.
+        self.tree_edicao.column("Nome", width=350, minwidth=220, stretch=True)
+        self.tree_edicao.column("Código", width=90, minwidth=65, anchor="center", stretch=False)
+        self.tree_edicao.column("Quantidade", width=90, minwidth=70, anchor="center", stretch=False)
+        self.tree_edicao.column("Setor", width=165, minwidth=120, anchor="center", stretch=False)
+        self.tree_edicao.column("Máquina", width=145, minwidth=110, anchor="center", stretch=False)
+        self.tree_edicao.column("Fila LPR", width=260, minwidth=200, anchor="w", stretch=False)
 
         vsb2 = ttk.Scrollbar(edit_container, orient="vertical", command=self.tree_edicao.yview)
         hsb2 = ttk.Scrollbar(edit_container, orient="horizontal", command=self.tree_edicao.xview)
@@ -5990,9 +6008,14 @@ class RefazerTab(ttk.Frame):
         self.cb_setor.current(0)
 
         ttk.Label(controles, text="Máquina:").pack(side="left", padx=(10, 5))
-        self.cb_maquina = ttk.Combobox(controles, values=self.MAQUINAS_REF, width=15)
+        self.cb_maquina = ttk.Combobox(controles, values=self.MAQUINAS_REF, width=18, state='readonly')
         self.cb_maquina.pack(side="left", padx=5)
         self.cb_maquina.current(0)
+        self.cb_maquina.bind('<<ComboboxSelected>>', self._alterar_maquina_refazer)
+
+        ttk.Label(controles, text='Fila:').pack(side='left', padx=(7, 2))
+        self.cb_fila_refazer = ttk.Combobox(controles, width=30, values=[], state='readonly')
+        self.cb_fila_refazer.pack(side='left', padx=3)
 
         self.btn_aplicar_sel = ttk.Button(controles, text="Aplicar nos Selecionados",
                                         bootstyle=SECONDARY, command=self.aplicar_nos_selecionados)
@@ -6005,6 +6028,16 @@ class RefazerTab(ttk.Frame):
         # NOTA: O botão "PROCESSAR" que estava aqui foi removido e será criado no status_frame abaixo.
 
         self.tree_edicao.bind("<Button-1>", self.edicao_inline)
+        # Ao selecionar um trabalho, mostrar no rodapé sua máquina e fila.
+        self.tree_edicao.bind('<<TreeviewSelect>>', self._sincronizar_selecao_refazer)
+
+        # Só manda para a impressora quando o operador marcar esta opção.
+        opcoes_envio = ttk.Frame(main_frame)
+        opcoes_envio.grid(row=4, column=0, sticky='ew', padx=12, pady=(0, 5))
+        ttk.Checkbutton(opcoes_envio, text='Enviar os PDFs preparados às impressoras após o refazer',
+                        variable=self.enviar_refazer_var, bootstyle='info-square-toggle').pack(side='left')
+        ttk.Label(opcoes_envio, text='(1 trabalho por PDF final; quantidade continua no relatório)',
+                  bootstyle=SECONDARY).pack(side='left', padx=12)
 
         # ================= ANDAMENTO (PROGRESSBAR) =================
         progress_frame = ttk.LabelFrame(main_frame, text="⏳ Andamento", bootstyle=SUCCESS)
@@ -6047,13 +6080,188 @@ class RefazerTab(ttk.Frame):
         )
         self.btn_processar.grid(row=0, column=1, sticky="e")
 
+    def atualizar_destinos_refazer(self):
+        """Lê cadastro em segundo plano ao entrar na aba; não bloqueia a abertura."""
+        if getattr(self, '_consulta_refazer_em_andamento', False):
+            return
+        self._consulta_refazer_em_andamento = True
+        def consultar():
+            try:
+                repo = self.app.repositorio_equipamentos
+                equipamentos = repo.listar_equipamentos()
+                filas = {e['id']: {f['nome']: f for f in repo.listar_filas(e['id'])}
+                         for e in equipamentos}
+                self.after(0, lambda: self._destinos_refazer_carregados(equipamentos, filas))
+            except Exception as exc:
+                logging.warning('Refazer: cadastro de equipamentos indisponível: %s', exc)
+                self.after(0, lambda: setattr(self, '_consulta_refazer_em_andamento', False))
+        threading.Thread(target=consultar, daemon=True).start()
+
+    def _destinos_refazer_carregados(self, equipamentos, filas):
+        self._consulta_refazer_em_andamento = False
+        self._equipamentos_refazer = {e['nome']: e for e in equipamentos}
+        self._filas_refazer = filas
+        nomes = list(self._equipamentos_refazer)
+        self.cb_maquina.configure(values=nomes)
+        if self.cb_maquina.get() not in nomes:
+            self.cb_maquina.set(nomes[0] if len(nomes) == 1 else '')
+        self._alterar_maquina_refazer()
+
+    def _filas_para_refazer(self, maquina, tipo=None):
+        e = self._equipamentos_refazer.get(maquina)
+        if not e or (tipo and e['tipo'] not in (tipo, 'AMBOS')):
+            return []
+        return list(self._filas_refazer.get(e['id'], {}))
+
+    def _alterar_maquina_refazer(self, _event=None):
+        # Usa exatamente as filas ATIVAS cadastradas para essa máquina.
+        # Não acrescenta/remove prefixos; não modifica argumentos LPR.
+        filas = self._filas_para_refazer(self.cb_maquina.get())
+        self.cb_fila_refazer.configure(values=filas)
+        if self.cb_fila_refazer.get() not in filas:
+            self.cb_fila_refazer.set('')
+
+    def _sincronizar_selecao_refazer(self, _event=None):
+        """Mostra os dados da linha selecionada nos controles inferiores."""
+        escolhidos = self.tree_edicao.selection()
+        if len(escolhidos) != 1:
+            return
+        dados = self.tree_edicao.item(escolhidos[0], 'values')
+        if len(dados) < 6:
+            return
+        self.cb_setor.set(dados[3])
+        self.cb_maquina.set(dados[4])
+        self._alterar_maquina_refazer()
+        filas = self._filas_para_refazer(dados[4], self._tipo_linha_refazer(escolhidos[0]))
+        self.cb_fila_refazer.set(dados[5] if dados[5] in filas else '')
+
+    def _tipo_linha_refazer(self, iid):
+        return self._tipos_por_linha.get(iid, '')
+
+    def _validar_destinos_refazer(self):
+        """Valida TODOS os destinos antes de modificar arquivos ou relatório."""
+        if not self.enviar_refazer_var.get():
+            return {}
+        if not self._equipamentos_refazer:
+            raise ValueError('O cadastro de equipamentos está indisponível. Abra a aba novamente.')
+        plano = {}
+        for iid in self.tree_edicao.get_children():
+            linha = self.tree_edicao.item(iid, 'values')
+            tipo = self._tipo_linha_refazer(iid)
+            if not tipo:
+                raise ValueError(f'Não foi possível identificar Capa/Miolo de {linha[0]}.')
+            try:
+                plano[iid] = gprint_validar_destino_refazer(
+                    self._equipamentos_refazer, self._filas_refazer,
+                    linha[4], linha[5], tipo)
+            except ValueError as exc:
+                raise ValueError(f"{linha[0]}: {exc}") from exc
+        return plano
+
+    @staticmethod
+    def _nome_trabalho_refazer(nome_pdf):
+        """Identificação curta e ASCII para compatibilidade com o LPR do Windows.
+
+        Não altera o nome do PDF final e não altera o nome da fila.
+        """
+        import hashlib
+        import unicodedata
+        base = os.path.splitext(os.path.basename(nome_pdf))[0]
+        ascii_nome = unicodedata.normalize('NFKD', base).encode('ascii', 'ignore').decode('ascii')
+        ascii_nome = re.sub(r'[^A-Za-z0-9_.-]+', '_', ascii_nome).strip('_.-')
+        sufixo = hashlib.sha1(base.encode('utf-8')).hexdigest()[:6]
+        return (ascii_nome[:32].rstrip('_.-') or 'GPrint') + '_' + sufixo
+
+    def _enviar_refazer_lpr(self, arquivo_pdf, destino):
+        """Envio exclusivo do Refazer com copia TEMPORARIA de nome curto.
+
+        A montagem e o PDF final NAO sao modificados. A fila/IP continuam exatos.
+        As outras rotinas LPR do programa permanecem inalteradas.
+        """
+        maquina = destino['maquina']
+        fila = destino['fila']
+        nome_trabalho = self._nome_trabalho_refazer(arquivo_pdf)
+        if not os.path.isfile(arquivo_pdf):
+            return False, 'PDF final não encontrado.'
+        try:
+            if os.path.getsize(arquivo_pdf) == 0:
+                return False, 'PDF final está vazio.'
+        except OSError as exc:
+            return False, f'Não foi possível acessar o PDF final: {exc}'
+
+        # Diferentemente da montagem, somente o arquivo TEMPORÁRIO recebe nome curto.
+        # Em especial, evita caminhos enormes/com acentos que o lpr.exe não consegue ler.
+        temp_dir = tempfile.mkdtemp(prefix='gpr_')
+        try:
+            nome_temp = 'job_' + uuid.uuid4().hex[:10] + '.pdf'
+            pdf_temp = os.path.join(temp_dir, nome_temp)
+            shutil.copy2(arquivo_pdf, pdf_temp)
+            if not os.path.isfile(pdf_temp) or os.path.getsize(pdf_temp) == 0:
+                return False, 'Não foi possível preparar o arquivo temporário para envio.'
+            # Confirma que a cópia temporária pode ser lida antes de chamar o LPR.
+            with open(pdf_temp, 'rb') as copia:
+                if not copia.read(5).startswith(b'%PDF-'):
+                    return False, 'Arquivo temporário não é um PDF válido.'
+            comando = ['lpr', '-S', maquina['ip'], '-P', fila, '-J', nome_trabalho, pdf_temp]
+            resultado = subprocess.run(comando, capture_output=True, text=True, timeout=120)
+            if resultado.returncode != 0:
+                return False, (resultado.stderr or resultado.stdout or
+                               f'Código de saída {resultado.returncode}').strip()
+            return True, ''
+        except subprocess.TimeoutExpired:
+            return False, 'Tempo de resposta esgotado'
+        except Exception as exc:
+            return False, str(exc)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def _enviar_resultados_refazer(self, trabalhos):
+        if not trabalhos:
+            messagebox.showwarning('GPrint - Refazer',
+                'Nenhum PDF final ficou pronto para envio. Confira os registros de processamento.',
+                parent=self)
+            return
+        # Um envio para cada PDF preparado, sem mexer em quantidade ou modo de montagem.
+        total = len(trabalhos)
+        self.progress['maximum'] = total
+        self.progress['value'] = 0
+        enviados = 0
+        falhas = []
+        for idx, (arquivo, destino) in enumerate(trabalhos, 1):
+            self.progress_label.configure(text=f'Enviando: {idx}/{total}')
+            self.update_idletasks()
+            if not os.path.isfile(arquivo):
+                falhas.append(f'{os.path.basename(arquivo)}: arquivo final não encontrado')
+            else:
+                ok, detalhe = self._enviar_refazer_lpr(arquivo, destino)
+                if ok:
+                    enviados += 1
+                    logging.info('Refazer: trabalho aceito via LPR (%s / %s / %s)',
+                                 os.path.basename(arquivo), destino['maquina']['nome'], destino['fila'])
+                else:
+                    falhas.append(f"{os.path.basename(arquivo)} ({destino['maquina']['nome']} / "
+                                  f"{destino['fila']}): {detalhe}")
+                    logging.error('Refazer - falha LPR: %s', falhas[-1])
+            self.progress['value'] = idx
+        if falhas:
+            messagebox.showwarning('GPrint - Refazer: envios concluídos com falhas',
+                f'{enviados}/{total} trabalhos aceitos pelo LPR.\n\n'
+                + '\n'.join(falhas[:8])
+                + ('\n... e outros erros. Consulte o console.' if len(falhas) > 8 else ''),
+                parent=self)
+        else:
+            messagebox.showinfo('GPrint - Refazer: envio finalizado',
+                f'{enviados} trabalho(s) aceitos pelo LPR.', parent=self)
+
     # ---------- HANDLERS E LÓGICA ----------
     def _limpar_tudo_exceto_cliente_lote(self):
+        self._finalizar_editor_refazer(cancelar=True)
         for i in self.tree_selecao.get_children():
             self.tree_selecao.delete(i)
         for i in self.tree_edicao.get_children():
             self.tree_edicao.delete(i)
         self.lista_completa = []
+        self._tipos_por_linha.clear()
 
     def on_cliente_change(self, event=None):
         self._limpar_tudo_exceto_cliente_lote()
@@ -6138,8 +6346,10 @@ class RefazerTab(ttk.Frame):
         if not selecionados:
             messagebox.showinfo("Aviso", "Selecione arquivos.", parent=self)
             return
+        self._finalizar_editor_refazer(cancelar=True)
         for item in self.tree_edicao.get_children():
             self.tree_edicao.delete(item)
+        self._tipos_por_linha.clear()
         cliente = self.pasta_var.get()
         coluna_codigo = 8 if cliente == "uiclap" else 3
         for iid in selecionados:
@@ -6151,92 +6361,203 @@ class RefazerTab(ttk.Frame):
             codigo = "N/A"
             if coluna_codigo < len(linha):
                 codigo = linha[coluna_codigo]
-            self.tree_edicao.insert("", "end", values=(nome, codigo, "1", self.SETORES_PERDA[0], self.MAQUINAS_REF[0]))
+            tipo = item['tipo']
+            opcoes = [e['nome'] for e in self._equipamentos_refazer.values()
+                      if e['tipo'] in (tipo, 'AMBOS')]
+            maquina_padrao = (opcoes[0] if len(opcoes) == 1 else
+                              ('' if self.enviar_refazer_var.get() else self.MAQUINAS_REF[0]))
+            linha_id = self.tree_edicao.insert("", "end", values=(
+                nome, codigo, "1", self.SETORES_PERDA[0], maquina_padrao, ''))
+            self._tipos_por_linha[linha_id] = tipo
 
     def limpar(self):
         self._limpar_tudo_exceto_cliente_lote()
         self.filtro_var.set("")
         self.operador_var.set(self.OPERADORES[0])
 
-    def aplicar_nos_selecionados(self):
-        itens = self.tree_edicao.selection()
-        if not itens:
-            messagebox.showinfo("Aviso", "Selecione linhas na tabela de edição.", parent=self)
+    def _aplicar_edicao_em_linhas(self, iids):
+        """Atualiza setor/máquina/fila sem misturar filas de equipamentos distintos."""
+        self._finalizar_editor_refazer()
+        if not iids:
+            messagebox.showinfo('GPrint - Refazer', 'Selecione pelo menos uma linha.', parent=self)
             return
         setor = self.cb_setor.get()
         maquina = self.cb_maquina.get()
-        for item in itens:
-            valores = list(self.tree_edicao.item(item, "values"))
+        fila = self.cb_fila_refazer.get()
+        enviar = self.enviar_refazer_var.get()
+
+        # Validação atômica: não aplica somente parte de um conjunto misto.
+        if enviar:
+            for item in iids:
+                tipo = self._tipo_linha_refazer(item)
+                try:
+                    gprint_validar_destino_refazer(
+                        self._equipamentos_refazer, self._filas_refazer,
+                        maquina, fila, tipo)
+                except ValueError as exc:
+                    messagebox.showwarning(
+                        'GPrint - Refazer: equipamento e fila',
+                        f'{exc}\n\nConfira a máquina e a fila antes de aplicar.', parent=self)
+                    return
+
+        for item in iids:
+            valores = list(self.tree_edicao.item(item, 'values'))
             valores[3] = setor
             valores[4] = maquina
+            # Se o envio estiver desativado, mantém o relatório editável sem
+            # exigir cadastro de fila. Não transporta fila de outra máquina.
+            filas = self._filas_para_refazer(maquina, self._tipo_linha_refazer(item))
+            valores[5] = fila if fila in filas else ''
             self.tree_edicao.item(item, values=valores)
+
+    def aplicar_nos_selecionados(self):
+        self._aplicar_edicao_em_linhas(list(self.tree_edicao.selection()))
 
     def aplicar_em_todos(self):
-        setor = self.cb_setor.get()
-        maquina = self.cb_maquina.get()
-        for item in self.tree_edicao.get_children():
-            valores = list(self.tree_edicao.item(item, "values"))
-            valores[3] = setor
-            valores[4] = maquina
-            self.tree_edicao.item(item, values=valores)
+        self._aplicar_edicao_em_linhas(list(self.tree_edicao.get_children()))
+
+    def _finalizar_editor_refazer(self, cancelar=False, editor_esperado=None):
+        """Finaliza a edicao no Treeview com seguranca, inclusive apos trocar de lote.
+
+        As alteracoes de linha acontecem na thread principal do Tkinter.
+        Eventos de FocusOut atrasados nao devem recriar nem alterar linhas apagadas.
+        """
+        estado = getattr(self, '_editor_refazer_ativo', None)
+        if not estado:
+            return
+        widget, iid, indice = estado
+        if editor_esperado is not None and widget is not editor_esperado:
+            return  # Evento atrasado de outro editor.
+
+        # Desativa a edicao ANTES de destruir o widget (destroy pode gerar FocusOut).
+        self._editor_refazer_ativo = None
+        try:
+            if not cancelar and self.tree_edicao.winfo_exists() and self.tree_edicao.exists(iid):
+                # Captura somente a coluna editada. Nao escreve valores antigos de
+                # outras colunas, que podem ter mudado com os controles inferiores.
+                novo = widget.get()
+                atual = list(self.tree_edicao.item(iid, 'values'))
+                if len(atual) >= 6:
+                    if indice == 2:
+                        novo = novo.strip() or '1'
+                    if indice == 4 and novo != atual[4]:
+                        atual[5] = ''  # Fila da maquina anterior nao e reaproveitada.
+                    atual[indice] = novo
+                    self.tree_edicao.item(iid, values=atual)
+        except tk.TclError:
+            # A janela ou a linha pode ter sido removida durante a troca de lote.
+            logging.debug('Refazer: editor antigo descartado; linha nao existe mais.')
+        finally:
+            try:
+                if widget.winfo_exists():
+                    widget.destroy()
+            except tk.TclError:
+                pass
+
+        if not cancelar and indice in (4, 5):
+            try:
+                if self.tree_edicao.winfo_exists():
+                    self.after_idle(self._sincronizar_selecao_refazer)
+            except tk.TclError:
+                pass
 
     def edicao_inline(self, event):
-        region = self.tree_edicao.identify_region(event.x, event.y)
-        if region != "cell":
+        """Edicao inteligente com callbacks de salvamento de uso unico."""
+        if self.tree_edicao.identify_region(event.x, event.y) != 'cell':
             return
-        item = self.tree_edicao.identify_row(event.y)
+        iid = self.tree_edicao.identify_row(event.y)
         coluna = self.tree_edicao.identify_column(event.x)
-        if not item:
+        if not iid or not self.tree_edicao.exists(iid):
             return
-        col = int(coluna.replace("#", ""))
-        if col not in [3, 4, 5]:
+        try:
+            indice = int(coluna.lstrip('#')) - 1
+        except ValueError:
             return
-        valores = list(self.tree_edicao.item(item, "values"))
-        bbox = self.tree_edicao.bbox(item, coluna)
+        if indice not in (2, 3, 4, 5):
+            return
+
+        # Ao abrir outro editor, consolida o anterior ANTES de criar o novo.
+        self._finalizar_editor_refazer()
+        if not self.tree_edicao.exists(iid):
+            return
+        valores = list(self.tree_edicao.item(iid, 'values'))
+        if len(valores) < 6:
+            return
+        bbox = self.tree_edicao.bbox(iid, coluna)
         if not bbox:
             return
-        x, y, w, h = bbox
-        for child in self.tree_edicao.winfo_children():
-            if isinstance(child, (tk.Entry, ttk.Combobox)):
-                child.destroy()
-        if col == 3:
-            entry = tk.Entry(self.tree_edicao, justify="center", font=("Arial", 10, "bold"))
-            entry.place(x=x, y=y, width=w, height=h)
-            entry.insert(0, valores[2])
-            entry.focus()
-            def salvar(event=None):
-                novo = entry.get().strip()
-                if not novo:
-                    novo = "1"
-                valores[2] = novo
-                self.tree_edicao.item(item, values=valores)
-                entry.destroy()
-            entry.bind("<Return>", salvar)
-            entry.bind("<FocusOut>", salvar)
-        elif col == 4:
-            cb = ttk.Combobox(self.tree_edicao, values=self.SETORES_PERDA, state="readonly")
-            cb.place(x=x, y=y, width=w, height=h)
-            cb.set(valores[3])
-            cb.focus()
-            def salvar(event=None):
-                valores[3] = cb.get()
-                self.tree_edicao.item(item, values=valores)
-                cb.destroy()
-            cb.bind("<<ComboboxSelected>>", salvar)
-            cb.bind("<FocusOut>", salvar)
-        elif col == 5:
-            cb = ttk.Combobox(self.tree_edicao, values=self.MAQUINAS_REF, state="readonly")
-            cb.place(x=x, y=y, width=w, height=h)
-            cb.set(valores[4])
-            cb.focus()
-            def salvar(event=None):
-                valores[4] = cb.get()
-                self.tree_edicao.item(item, values=valores)
-                cb.destroy()
-            cb.bind("<<ComboboxSelected>>", salvar)
-            cb.bind("<FocusOut>", salvar)
+        x, y, largura, altura = bbox
+
+        if indice == 2:
+            widget = tk.Entry(self.tree_edicao, justify='center', font=('Arial', 10, 'bold'))
+        else:
+            if indice == 3:
+                opcoes = list(self.SETORES_PERDA)
+            elif indice == 4:
+                tipo = self._tipo_linha_refazer(iid)
+                opcoes = [e['nome'] for e in self._equipamentos_refazer.values()
+                          if e['tipo'] in (tipo, 'AMBOS')]
+                if not opcoes and not self.enviar_refazer_var.get():
+                    opcoes = list(self.MAQUINAS_REF)
+            else:
+                opcoes = self._filas_para_refazer(valores[4], self._tipo_linha_refazer(iid))
+                if not opcoes:
+                    messagebox.showinfo('GPrint - Refazer',
+                        'Selecione primeiro uma maquina compativel com filas cadastradas.', parent=self)
+                    return
+            widget = ttk.Combobox(self.tree_edicao, values=opcoes, state='readonly')
+
+        widget.place(x=x, y=y, width=largura, height=altura)
+        if indice == 2:
+            widget.insert(0, valores[indice])
+        else:
+            widget.set(valores[indice])
+        self._editor_refazer_ativo = (widget, iid, indice)
+        widget.focus_set()
+
+        # O editor pode emitir <<ComboboxSelected>> e FocusOut na mesma edicao.
+        # Apenas o primeiro evento salva. Os demais sao ignorados pela identidade.
+        finalizar = lambda _event=None, w=widget: self._finalizar_editor_refazer(editor_esperado=w)
+        if indice == 2:
+            widget.bind('<Return>', finalizar)
+        else:
+            widget.bind('<<ComboboxSelected>>', finalizar)
+        widget.bind('<FocusOut>', finalizar)
+        widget.bind('<Escape>', lambda _event=None, w=widget:
+                    self._finalizar_editor_refazer(cancelar=True, editor_esperado=w))
 
     def executar(self):
+        """Bloqueia execução duplicada; sempre restaura o botão, mesmo após falha."""
+        if self._refazer_em_execucao:
+            return
+        self._refazer_em_execucao = True
+        self.btn_processar.configure(state='disabled')
+        try:
+            self._executar_refazer_impl()
+        except Exception as exc:
+            logging.exception('Falha ao preparar o Refazer')
+            messagebox.showerror('GPrint - Refazer',
+                                 'Não foi possível concluir o processamento.\n' + str(exc),
+                                 parent=self)
+        finally:
+            self._refazer_em_execucao = False
+            self.btn_processar.configure(state='normal')
+
+    def _executar_refazer_impl(self):
+        self._finalizar_editor_refazer()
+        try:
+            plano_destinos = self._validar_destinos_refazer()
+        except ValueError as exc:
+            messagebox.showwarning('GPrint - Refazer: destino de impressão', str(exc), parent=self)
+            return
+        if plano_destinos:
+            if not messagebox.askyesno('GPrint - Confirmar envio do Refazer',
+                    f'Serão preparados e enviados {len(plano_destinos)} arquivo(s), '
+                    'um trabalho LPR por PDF final.\n\n'
+                    'Confirme se máquina e fila estão corretas.\n'
+                    'A quantidade informada no Refazer continua sendo usada no relatório, '
+                    'não como multiplicador do envio.', parent=self):
+                return
         cliente = self.pasta_var.get()
         lote = self.subpasta_var.get()
         operador = self.operador_var.get()
@@ -6258,6 +6579,7 @@ class RefazerTab(ttk.Frame):
 
         copias_capas = []
         miolos_info = []
+        arquivos_para_envio = []
         processados = 0
 
         total_itens = len(self.tree_edicao.get_children())
@@ -6286,14 +6608,15 @@ class RefazerTab(ttk.Frame):
             destino = self.copiar_para_refazer(caminho_fisico, cliente, lote, tipo_atual)
 
             if tipo_atual == "CAPA" and destino and destino.lower().endswith('.pdf'):
-                copias_capas.append((destino, os.path.splitext(nome)[0], setor))
+                copias_capas.append((destino, os.path.splitext(nome)[0], setor, plano_destinos.get(iid)))
             elif tipo_atual == "MIOLO" and destino and destino.lower().endswith('.pdf'):
                 miolos_info.append((
                     destino,
                     os.path.splitext(nome)[0],
                     item_original.get("acabamento"),
                     item_original.get("formato_miolo"),
-                    setor
+                    setor,
+                    plano_destinos.get(iid)
                 ))
 
             # Copia o outro tipo (miolo/capa) se existir
@@ -6327,13 +6650,15 @@ class RefazerTab(ttk.Frame):
             self.progress["value"] = 0
             self.progress_label.config(text=f"Capas: 0/{total_capas}")
             self.update_idletasks()
-            for idx, (destino, nome_base, setor_capa) in enumerate(copias_capas, start=1):
+            for idx, (destino, nome_base, setor_capa, destino_impressao) in enumerate(copias_capas, start=1):
                 try:
                     self.adicionar_marca_dagua(destino, nome_base)
                     if setor_capa == "PROBLEMA DE FONTE":
                         temp_outlines = destino.replace('.pdf', '_TEMP_OUTLINES.pdf')
                         self.converter_em_contornos(destino, temp_outlines)
                         os.replace(temp_outlines, destino)
+                    if destino_impressao and os.path.isfile(destino):
+                        arquivos_para_envio.append((destino, destino_impressao))
                 except Exception as e:
                     print(f"Erro na marca d'água/contornos de {nome_base}: {e}")
                 self.progress["value"] = idx
@@ -6348,10 +6673,11 @@ class RefazerTab(ttk.Frame):
             self.progress_label.config(text=f"Miolos: 0/{total_miolos}")
             self.update_idletasks()
 
-            for idx, (copia_dest, nome_base, acab, fmt_miolo, setor_item) in enumerate(miolos_info, start=1):
+            for idx, (copia_dest, nome_base, acab, fmt_miolo, setor_item, destino_impressao) in enumerate(miolos_info, start=1):
                 self.progress_label.config(text=f"Miolo {idx}/{total_miolos}: {nome_base}")
                 self.update_idletasks()
                 try:
+                    arquivo_final_refazer = copia_dest
                     tipo_montagem = None
                     acab_upper = acab.upper() if acab else ""
                     if "BROCHURA" in acab_upper:
@@ -6388,19 +6714,24 @@ class RefazerTab(ttk.Frame):
 
                         if os.path.exists(copia_dest):
                             os.remove(copia_dest)
+                        arquivo_final_refazer = nome_final
                     else:
                         if setor_item == "PROBLEMA DE FONTE":
                             nome_final = copia_dest.replace('.pdf', '_CURVAS.pdf')
                             self.converter_em_contornos(copia_dest, nome_final)
                             if os.path.exists(copia_dest): os.remove(copia_dest)
+                            arquivo_final_refazer = nome_final
                         print(f"Miolo {nome_base}: sem tipo de montagem definido (acabamento: {acab}), mantido como cópia simples.")
+                    if destino_impressao and os.path.isfile(arquivo_final_refazer):
+                        arquivos_para_envio.append((arquivo_final_refazer, destino_impressao))
                 except Exception as e:
                     print(f"Erro ao processar miolo {nome_base}: {e}")
 
                 self.progress["value"] = idx
                 self.update_idletasks()
 
-        # Limpeza final da interface
+        # Limpeza final da interface: cancelar editor antes de apagar linhas.
+        self._finalizar_editor_refazer(cancelar=True)
         for item in self.tree_edicao.get_children():
             self.tree_edicao.delete(item)
         for item in self.tree_selecao.get_children():
@@ -6408,7 +6739,10 @@ class RefazerTab(ttk.Frame):
         self.lista_completa = []
         self.progress["value"] = 0
         self.progress_label.config(text="")
-        messagebox.showinfo("Concluído", f"{processados} arquivos processados.", parent=self)
+        if plano_destinos:
+            self._enviar_resultados_refazer(arquivos_para_envio)
+        else:
+            messagebox.showinfo("Concluído", f"{processados} arquivos processados.", parent=self)
 
 import os
 import csv
