@@ -33,6 +33,23 @@ import uuid
 from openpyxl.utils import get_column_letter
 import random
 import ctypes
+import ipaddress
+import hmac
+from tkinter import simpledialog
+
+# ============================================================================
+# GPRINT - CONFIGURACAO CENTRAL DA PRODUCAO
+# Ajuste SOMENTE este diretorio para localizar ambos os bancos.
+# Nao crie a pasta da rede automaticamente se o servidor estiver offline.
+# ============================================================================
+GPRINT_DIRETORIO_DADOS = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\UICLAP\LOGS"
+GPRINT_BANCO_HISTORICO = os.path.join(GPRINT_DIRETORIO_DADOS, "impressoes.db")
+GPRINT_BANCO_EQUIPAMENTOS = os.path.join(GPRINT_DIRETORIO_DADOS, "equipamentos.db")
+
+# Senha de acesso a Configuracoes > Equipamentos.
+# ALTERE antes de compilar o EXE. Nunca use a senha real em um GitHub publico.
+# Protege a interface do cadastro; nao substitui permissoes da pasta de rede.
+GPRINT_SENHA_ADMIN_EQUIPAMENTOS = "ALTERE_ESTA_SENHA_ANTES_DE_USAR"
 
 
 # ============================================================================
@@ -587,17 +604,589 @@ class GPrintIndicadoresAndamento:
                 setattr(self, nome, None)
 
 
+
+# ============================================================================
+# CADASTRO CENTRAL DE EQUIPAMENTOS E FILAS (SQLite independente do historico)
+# ============================================================================
+class GPrintCadastroErro(Exception):
+    pass
+
+
+class GPrintEquipamentosRepository:
+    '''Cadastro central compartilhado pelas estacoes. Sem acesso a impressoras.'''
+    def __init__(self, db_path=GPRINT_BANCO_EQUIPAMENTOS):
+        self.db_path = db_path
+
+    @contextmanager
+    def _conectar(self):
+        pasta = os.path.dirname(self.db_path)
+        if not os.path.isdir(pasta):
+            raise GPrintCadastroErro('A pasta producao esta indisponivel na rede.')
+        conexao = None
+        try:
+            conexao = sqlite3.connect(self.db_path, timeout=15)
+            conexao.row_factory = sqlite3.Row
+            conexao.execute('PRAGMA foreign_keys = ON')
+            conexao.execute('PRAGMA busy_timeout = 15000')
+            yield conexao
+        except (sqlite3.Error, OSError) as exc:
+            raise GPrintCadastroErro('Nao foi possivel acessar equipamentos.db: ' + str(exc)) from exc
+        finally:
+            if conexao is not None:
+                conexao.close()
+
+    def preparar_banco(self):
+        '''Cria apenas equipamentos.db se a pasta central ja estiver online.'''
+        with self._conectar() as conn:
+            with conn:
+                conn.execute('''CREATE TABLE IF NOT EXISTS equipamentos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    nome TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    ip TEXT NOT NULL,
+                    tipo TEXT NOT NULL CHECK(tipo IN ('CAPA', 'MIOLO', 'AMBOS')),
+                    ativo INTEGER NOT NULL DEFAULT 1,
+                    criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )''')
+                conn.execute('''CREATE TABLE IF NOT EXISTS filas (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    equipamento_id INTEGER NOT NULL REFERENCES equipamentos(id) ON DELETE CASCADE,
+                    nome TEXT NOT NULL,
+                    descricao TEXT NOT NULL DEFAULT '',
+                    ignorar_folha_obra INTEGER NOT NULL DEFAULT 0,
+                    ativo INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE(equipamento_id, nome)
+                )''')
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_filas_equipamento ON filas(equipamento_id, ativo)')
+
+    def listar_equipamentos(self, tipo=None, incluir_inativos=False):
+        sql = 'SELECT id,nome,ip,tipo,ativo FROM equipamentos WHERE 1=1'
+        args = []
+        if not incluir_inativos:
+            sql += ' AND ativo=1'
+        if tipo:
+            sql += ' AND tipo IN (?,\'AMBOS\')'
+            args.append(tipo)
+        sql += ' ORDER BY nome COLLATE NOCASE'
+        with self._conectar() as conn:
+            return [dict(r) for r in conn.execute(sql, args)]
+
+    def listar_filas(self, equipamento_id, incluir_inativas=False):
+        sql = '''SELECT id,equipamento_id,nome,descricao,ignorar_folha_obra,ativo
+                 FROM filas WHERE equipamento_id=?'''
+        if not incluir_inativas:
+            sql += ' AND ativo=1'
+        sql += ' ORDER BY nome COLLATE NOCASE'
+        with self._conectar() as conn:
+            return [dict(r) for r in conn.execute(sql, (equipamento_id,))]
+
+    def salvar_equipamento(self, nome, ip, tipo, equipamento_id=None):
+        nome, ip, tipo = nome.strip(), ip.strip(), tipo.strip().upper()
+        if not nome or tipo not in ('CAPA', 'MIOLO', 'AMBOS'):
+            raise ValueError('Informe nome e tipo (CAPA, MIOLO ou AMBOS).')
+        if any(ch in nome for ch in '<>:"/\\|?*') or nome.endswith('.'):
+            raise ValueError('O nome do equipamento contem caracteres invalidos para o Windows.')
+        try:
+            ipaddress.IPv4Address(ip)
+        except ValueError as exc:
+            raise ValueError('Informe um endereco IP valido para o equipamento.') from exc
+        try:
+            with self._conectar() as conn:
+                with conn:
+                    if equipamento_id:
+                        conn.execute('UPDATE equipamentos SET nome=?,ip=?,tipo=? WHERE id=?',
+                                     (nome,ip,tipo,equipamento_id))
+                        return equipamento_id
+                    cur = conn.execute('INSERT INTO equipamentos(nome,ip,tipo) VALUES(?,?,?)',
+                                       (nome,ip,tipo))
+                    return cur.lastrowid
+        except GPrintCadastroErro:
+            raise
+
+    def alterar_ativo_equipamento(self, equipamento_id, ativo):
+        with self._conectar() as conn:
+            with conn:
+                conn.execute('UPDATE equipamentos SET ativo=? WHERE id=?', (int(bool(ativo)),equipamento_id))
+
+    def salvar_fila(self, equipamento_id, nome, descricao='', ignorar_folha_obra=False, fila_id=None):
+        nome = nome.strip()
+        if not nome:
+            raise ValueError('Informe o nome EXATO da fila de impressao.')
+        # A flag e armazenada como metadado; NAO acrescenta comandos LPR.
+        try:
+            with self._conectar() as conn:
+                with conn:
+                    if fila_id:
+                        conn.execute('''UPDATE filas SET nome=?, descricao=?, ignorar_folha_obra=?
+                                        WHERE id=? AND equipamento_id=?''',
+                                     (nome,descricao.strip(),int(bool(ignorar_folha_obra)),fila_id,equipamento_id))
+                        return fila_id
+                    cur = conn.execute('''INSERT INTO filas(equipamento_id,nome,descricao,ignorar_folha_obra)
+                                          VALUES(?,?,?,?)''',
+                                       (equipamento_id,nome,descricao.strip(),int(bool(ignorar_folha_obra))))
+                    return cur.lastrowid
+        except GPrintCadastroErro:
+            raise
+
+    def alterar_ativo_fila(self, fila_id, ativo):
+        with self._conectar() as conn:
+            with conn:
+                conn.execute('UPDATE filas SET ativo=? WHERE id=?', (int(bool(ativo)),fila_id))
+
+    def cadastrar_filas_em_lote(self, equipamento_id, nomes):
+        """Cadastra filas novas numa unica transacao. Nao altera filas preexistentes."""
+        unicos = list(dict.fromkeys(nome.strip() for nome in nomes if nome.strip()))
+        if not unicos:
+            raise ValueError('Cole ao menos um nome de fila.')
+        if len(unicos) > 500:
+            raise ValueError('Cadastre no maximo 500 filas por operacao.')
+        with self._conectar() as conn:
+            with conn:
+                existe = conn.execute('SELECT 1 FROM equipamentos WHERE id=?',
+                                      (equipamento_id,)).fetchone()
+                if not existe:
+                    raise ValueError('Equipamento nao encontrado no banco.')
+                inseridos = 0
+                for nome in unicos:
+                    resultado = conn.execute("INSERT OR IGNORE INTO filas (equipamento_id, nome, descricao, ignorar_folha_obra) VALUES (?, ?, '', 0)", (equipamento_id, nome))
+                    inseridos += max(resultado.rowcount, 0)
+                return inseridos, len(unicos) - inseridos
+
+    def excluir_fila(self, equipamento_id, fila_id):
+        """Remove apenas uma fila do equipamento selecionado, nunca historico."""
+        with self._conectar() as conn:
+            with conn:
+                return conn.execute('DELETE FROM filas WHERE id=? AND equipamento_id=?',
+                                    (fila_id, equipamento_id)).rowcount
+
+    def validar_filas(self, equipamento_id, filas):
+        '''TXT determina nome da fila; cadastro apenas valida, nunca renomeia.'''
+        disponiveis = {r['nome'] for r in self.listar_filas(equipamento_id)}
+        return sorted({x for x in filas if x and x not in disponiveis})
+
+
+def gprint_nome_maquina(equipamento):
+    return f"{equipamento['nome']} - {equipamento['ip']}"
+
+
+class GPrintGerenciadorFilas(tk.Toplevel):
+    """Janela de filas de UMA maquina, visivel somente apos senha administrativa."""
+    def __init__(self, cadastro, equipamento):
+        super().__init__(cadastro)
+        self.cadastro = cadastro
+        self.repo = cadastro.app.repositorio_equipamentos
+        self.equipamento = equipamento.copy()
+        self.filas = {}
+        self.fila_id = None
+        self.title('GPrint - Filas de ' + equipamento['nome'])
+        self.geometry('980x650')
+        self.minsize(730, 470)
+        self.transient(cadastro.winfo_toplevel())
+        self.protocol('WM_DELETE_WINDOW', self.fechar)
+        self._montar()
+        self.atualizar()
+        self.grab_set()
+        self.focus_set()
+
+    def _montar(self):
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
+        ttk.Label(self, text='Filas de impressao — ' + self.equipamento['nome'],
+                  font=('Segoe UI', 15, 'bold')).grid(row=0, column=0,
+                  sticky='w', padx=15, pady=(12, 3))
+        ttk.Label(self,
+                  text='Cadastro para uso futuro. Nao altera montagens, TXT, regras LPR ou a aba Refazer.',
+                  bootstyle=SECONDARY).grid(row=1, column=0, sticky='w', padx=15, pady=(0, 8))
+
+        abas = ttk.Notebook(self)
+        abas.grid(row=2, column=0, sticky='nsew', padx=12, pady=5)
+        tab_unica = ttk.Frame(abas, padding=10)
+        tab_lote = ttk.Frame(abas, padding=10)
+        abas.add(tab_unica, text='Consultar / Cadastrar / Editar')
+        abas.add(tab_lote, text='Cadastrar varias filas')
+        self._aba_unica(tab_unica)
+        self._aba_lote(tab_lote)
+
+        rodape=ttk.Frame(self, padding=(12, 5))
+        rodape.grid(row=3, column=0, sticky='ew')
+        self.contador=ttk.Label(rodape, text='', bootstyle=SECONDARY)
+        self.contador.pack(side=tk.LEFT)
+        ttk.Button(rodape, text='Fechar', command=self.fechar).pack(side=tk.RIGHT)
+
+    def _aba_unica(self, parent):
+        parent.columnconfigure(1, weight=1)
+        parent.rowconfigure(4, weight=1)
+        self.nome_var=tk.StringVar()
+        self.descricao_var=tk.StringVar()
+        self.ignorar_var=tk.BooleanVar(value=False)
+        ttk.Label(parent, text='Nome EXATO da fila LPR:').grid(row=0,column=0,sticky='w',padx=4,pady=5)
+        ttk.Entry(parent,textvariable=self.nome_var).grid(row=0,column=1,columnspan=3,
+                                                         sticky='ew',padx=4,pady=5)
+        ttk.Label(parent,text='Descricao:').grid(row=1,column=0,sticky='w',padx=4,pady=5)
+        ttk.Entry(parent,textvariable=self.descricao_var).grid(row=1,column=1,columnspan=3,
+                                                              sticky='ew',padx=4,pady=5)
+        ttk.Checkbutton(parent,text='Ignorar folha-de-obra (somente informativo)',
+                        variable=self.ignorar_var).grid(row=2,column=0,columnspan=4,
+                                                       sticky='w',pady=6)
+        acoes=ttk.Frame(parent)
+        acoes.grid(row=3,column=0,columnspan=4,sticky='ew',pady=(4,10))
+        ttk.Button(acoes,text='Nova fila',command=self.nova).pack(side=tk.LEFT,padx=3)
+        ttk.Button(acoes,text='Salvar fila',command=self.salvar,bootstyle=SUCCESS).pack(side=tk.LEFT,padx=3)
+        ttk.Button(acoes,text='Ativar / Desativar',command=self.alternar).pack(side=tk.LEFT,padx=3)
+        ttk.Button(acoes,text='Excluir fila',command=self.excluir,bootstyle=DANGER).pack(side=tk.LEFT,padx=3)
+        ttk.Button(acoes,text='Atualizar lista',command=self.atualizar).pack(side=tk.RIGHT,padx=3)
+
+        lista=ttk.Frame(parent)
+        lista.grid(row=4,column=0,columnspan=4,sticky='nsew')
+        lista.rowconfigure(0,weight=1)
+        lista.columnconfigure(0,weight=1)
+        self.tabela=ttk.Treeview(lista,columns=('nome','descricao','ignorar','ativo'),
+                                 show='headings',selectmode='browse')
+        for col,titulo,largura in [
+                ('nome','Nome da fila',270),('descricao','Descricao',260),
+                ('ignorar','Ignorar folha',110),('ativo','Situacao',90)]:
+            self.tabela.heading(col,text=titulo)
+            self.tabela.column(col,width=largura,anchor='w')
+        self.tabela.grid(row=0,column=0,sticky='nsew')
+        rolagem=ttk.Scrollbar(lista,orient=tk.VERTICAL,command=self.tabela.yview)
+        rolagem.grid(row=0,column=1,sticky='ns')
+        self.tabela.configure(yscrollcommand=rolagem.set)
+        self.tabela.bind('<<TreeviewSelect>>',self.selecionar)
+
+    def _aba_lote(self, parent):
+        parent.columnconfigure(0,weight=1)
+        parent.rowconfigure(1,weight=1)
+        ttk.Label(parent,text='Cole um nome de fila por linha. Filas que ja existem serao ignoradas.').grid(
+            row=0,column=0,sticky='w',pady=(4,10))
+        self.texto_lote=tk.Text(parent,wrap='none',height=14,font=('Consolas',10))
+        self.texto_lote.grid(row=1,column=0,sticky='nsew')
+        ttk.Button(parent,text='Cadastrar filas da lista',bootstyle=SUCCESS,
+                   command=self.importar).grid(row=2,column=0,sticky='e',pady=12)
+
+    def atualizar(self):
+        try:
+            resultados=self.repo.listar_filas(self.equipamento['id'],incluir_inativas=True)
+            self.filas={str(r['id']):r for r in resultados}
+            anterior=str(self.fila_id) if self.fila_id else None
+            antigos=self.tabela.get_children()
+            if antigos:self.tabela.delete(*antigos)
+            for r in resultados:
+                self.tabela.insert('','end',iid=str(r['id']),values=(
+                    r['nome'],r['descricao'],
+                    'Sim' if r['ignorar_folha_obra'] else 'Nao',
+                    'Ativa' if r['ativo'] else 'Inativa'))
+            self.contador.config(text=f'{len(resultados)} filas cadastradas neste equipamento')
+            if anterior in self.filas:
+                self.tabela.selection_set(anterior)
+                self.tabela.see(anterior)
+                self.selecionar()
+        except Exception as exc:
+            messagebox.showerror('GPrint - Filas', f'Nao foi possivel consultar as filas.\n{exc}',parent=self)
+
+    def nova(self):
+        self.fila_id=None
+        self.nome_var.set('')
+        self.descricao_var.set('')
+        self.ignorar_var.set(False)
+        self.tabela.selection_remove(self.tabela.selection())
+
+    def selecionar(self, _event=None):
+        selecionados=self.tabela.selection()
+        if not selecionados:return
+        fila=self.filas.get(selecionados[0])
+        if not fila:return
+        self.fila_id=fila['id']
+        self.nome_var.set(fila['nome'])
+        self.descricao_var.set(fila['descricao'])
+        self.ignorar_var.set(bool(fila['ignorar_folha_obra']))
+
+    def salvar(self):
+        try:
+            self.fila_id=self.repo.salvar_fila(
+                self.equipamento['id'],self.nome_var.get(),self.descricao_var.get(),
+                self.ignorar_var.get(),self.fila_id)
+            self.atualizar()
+            messagebox.showinfo('GPrint - Filas','Fila salva com sucesso.',parent=self)
+        except Exception as exc:
+            messagebox.showerror('GPrint - Filas',str(exc),parent=self)
+
+    def alternar(self):
+        fila=self.filas.get(str(self.fila_id))
+        if fila is None:
+            messagebox.showwarning('GPrint - Filas','Selecione uma fila.',parent=self)
+            return
+        try:
+            self.repo.alterar_ativo_fila(fila['id'],not bool(fila['ativo']))
+            self.atualizar()
+        except Exception as exc:
+            messagebox.showerror('GPrint - Filas',str(exc),parent=self)
+
+    def excluir(self):
+        fila=self.filas.get(str(self.fila_id))
+        if fila is None:
+            messagebox.showwarning('GPrint - Filas','Selecione uma fila.',parent=self)
+            return
+        if not messagebox.askyesno('Confirmar exclusao',
+                f"Excluir definitivamente a fila '{fila['nome']}' de {self.equipamento['nome']}?",
+                parent=self):return
+        try:
+            self.repo.excluir_fila(self.equipamento['id'],fila['id'])
+            self.nova()
+            self.atualizar()
+        except Exception as exc:
+            messagebox.showerror('GPrint - Filas',str(exc),parent=self)
+
+    def importar(self):
+        nomes=self.texto_lote.get('1.0','end').splitlines()
+        try:
+            inseridos,ignorados=self.repo.cadastrar_filas_em_lote(self.equipamento['id'],nomes)
+            self.atualizar()
+            messagebox.showinfo('GPrint - Filas',
+                f'{inseridos} fila(s) cadastrada(s).\n{ignorados} ja existente(s) ou duplicada(s).',parent=self)
+        except Exception as exc:
+            messagebox.showerror('GPrint - Filas',str(exc),parent=self)
+
+    def fechar(self):
+        try:self.grab_release()
+        except tk.TclError:pass
+        self.destroy()
+
+
+class GPrintCadastroEquipamentosTab(ttk.Frame):
+    """Equipamentos administrados dentro das Configuracoes protegidas por senha."""
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app=app
+        self.equipamento_id=None
+        self.equipamentos={}
+        self._janela_filas=None
+        self._montar_tela()
+
+    def _montar_tela(self):
+        self.columnconfigure(0,weight=1)
+        self.rowconfigure(1,weight=1)
+        formulario=ttk.LabelFrame(self,text='Cadastro central de equipamentos',padding=12)
+        formulario.grid(row=0,column=0,sticky='ew',padx=10,pady=8)
+        for coluna in (1,3,5):formulario.columnconfigure(coluna,weight=1)
+        self.nome_var=tk.StringVar()
+        self.ip_var=tk.StringVar()
+        self.tipo_var=tk.StringVar(value='MIOLO')
+        ttk.Label(formulario,text='Nome:').grid(row=0,column=0,sticky='w',padx=5)
+        ttk.Entry(formulario,textvariable=self.nome_var).grid(row=0,column=1,sticky='ew',padx=5)
+        ttk.Label(formulario,text='IP:').grid(row=0,column=2,sticky='w',padx=5)
+        ttk.Entry(formulario,textvariable=self.ip_var).grid(row=0,column=3,sticky='ew',padx=5)
+        ttk.Label(formulario,text='Uso:').grid(row=0,column=4,sticky='w',padx=5)
+        ttk.Combobox(formulario,textvariable=self.tipo_var,
+                     values=['MIOLO','CAPA','AMBOS'],state='readonly',width=12
+                     ).grid(row=0,column=5,sticky='ew',padx=5)
+        acoes=ttk.Frame(formulario)
+        acoes.grid(row=1,column=0,columnspan=6,sticky='ew',pady=(12,0))
+        ttk.Button(acoes,text='Novo equipamento',command=self.novo_equipamento).pack(side=tk.LEFT,padx=3)
+        ttk.Button(acoes,text='Salvar equipamento',command=self.salvar_equipamento,
+                   bootstyle=SUCCESS).pack(side=tk.LEFT,padx=3)
+        ttk.Button(acoes,text='Ativar / Desativar',command=self.alternar_equipamento).pack(side=tk.LEFT,padx=3)
+        ttk.Button(acoes,text='Gerenciar filas da maquina selecionada',
+                   command=self.gerenciar_filas,bootstyle=PRIMARY).pack(side=tk.LEFT,padx=12)
+        ttk.Button(acoes,text='Atualizar',command=self.atualizar).pack(side=tk.RIGHT,padx=3)
+
+        painel=ttk.LabelFrame(self,text='Equipamentos cadastrados (duplo clique para ver as filas)',padding=8)
+        painel.grid(row=1,column=0,sticky='nsew',padx=10,pady=5)
+        painel.columnconfigure(0,weight=1)
+        painel.rowconfigure(0,weight=1)
+        self.lista_equip=ttk.Treeview(painel,columns=('nome','ip','tipo','ativo'),
+                                      show='headings',selectmode='browse',height=15)
+        for col,titulo,largura in [('nome','Equipamento',250),('ip','Endereco IP',155),
+                                   ('tipo','Finalidade',130),('ativo','Situacao',100)]:
+            self.lista_equip.heading(col,text=titulo)
+            self.lista_equip.column(col,width=largura,anchor='w')
+        self.lista_equip.grid(row=0,column=0,sticky='nsew')
+        barra=ttk.Scrollbar(painel,orient=tk.VERTICAL,command=self.lista_equip.yview)
+        barra.grid(row=0,column=1,sticky='ns')
+        self.lista_equip.configure(yscrollcommand=barra.set)
+        self.lista_equip.bind('<<TreeviewSelect>>',self.selecionar_equipamento)
+        self.lista_equip.bind('<Double-1>',self._abrir_por_clique)
+        ttk.Label(self,
+                  text='As filas sao cadastradas separadamente por equipamento. '
+                       'Nao interferem no processamento atual de Capa, Miolo ou Refazer.',
+                  bootstyle=SECONDARY).grid(row=2,column=0,sticky='w',padx=15,pady=8)
+
+    def _erro(self, exc):
+        messagebox.showerror('GPrint - Equipamentos',
+                             f'Nao foi possivel concluir a operacao.\n{exc}',parent=self)
+
+    def atualizar(self):
+        try:
+            selecionado=str(self.equipamento_id) if self.equipamento_id else None
+            itens=self.app.repositorio_equipamentos.listar_equipamentos(incluir_inativos=True)
+            self.equipamentos={str(r['id']):r for r in itens}
+            antigos=self.lista_equip.get_children()
+            if antigos:self.lista_equip.delete(*antigos)
+            for r in itens:
+                self.lista_equip.insert('','end',iid=str(r['id']),values=(
+                    r['nome'],r['ip'],r['tipo'],
+                    'Ativo' if r['ativo'] else 'Inativo'))
+            if selecionado in self.equipamentos:
+                self.lista_equip.selection_set(selecionado)
+                self.selecionar_equipamento()
+            else:
+                self.equipamento_id=None
+            self.app.atualizar_listas_equipamentos()
+        except Exception as exc:self._erro(exc)
+
+    def novo_equipamento(self):
+        self.equipamento_id=None
+        self.nome_var.set('')
+        self.ip_var.set('')
+        self.tipo_var.set('MIOLO')
+        selecionados=self.lista_equip.selection()
+        if selecionados:self.lista_equip.selection_remove(*selecionados)
+
+    def selecionar_equipamento(self,_event=None):
+        selecao=self.lista_equip.selection()
+        if not selecao:return
+        row=self.equipamentos.get(selecao[0])
+        if row is None:return
+        self.equipamento_id=row['id']
+        self.nome_var.set(row['nome'])
+        self.ip_var.set(row['ip'])
+        self.tipo_var.set(row['tipo'])
+
+    def salvar_equipamento(self):
+        try:
+            self.equipamento_id=self.app.repositorio_equipamentos.salvar_equipamento(
+                self.nome_var.get(),self.ip_var.get(),self.tipo_var.get(),self.equipamento_id)
+            self.atualizar()
+            messagebox.showinfo('GPrint','Equipamento salvo no cadastro central.',parent=self)
+        except Exception as exc:self._erro(exc)
+
+    def alternar_equipamento(self):
+        row=self.equipamentos.get(str(self.equipamento_id))
+        if not row:return
+        ativo=not bool(row['ativo'])
+        if not messagebox.askyesno('Confirmar',
+                f"{'Ativar' if ativo else 'Desativar'} {row['nome']} em todas as estacoes?",
+                parent=self):return
+        try:
+            self.app.repositorio_equipamentos.alterar_ativo_equipamento(row['id'],ativo)
+            self.atualizar()
+        except Exception as exc:self._erro(exc)
+
+    def _abrir_por_clique(self,event):
+        linha=self.lista_equip.identify_row(event.y)
+        if linha:
+            self.lista_equip.selection_set(linha)
+            self.selecionar_equipamento()
+            self.gerenciar_filas()
+
+    def gerenciar_filas(self):
+        row=self.equipamentos.get(str(self.equipamento_id))
+        if row is None:
+            messagebox.showwarning('GPrint - Filas',
+                                   'Selecione um equipamento primeiro.',parent=self)
+            return
+        if self._janela_filas is not None and self._janela_filas.winfo_exists():
+            self._janela_filas.lift()
+            self._janela_filas.focus_set()
+            return
+        self._janela_filas=GPrintGerenciadorFilas(self,row)
+
 class ConfigTab(ttk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
-        self.setup_ui()       
-    def setup_ui(self):
-        # Frame principal com grid
+        self._admin_liberado = False
+        self._cadastro_widget = None
+        self._criar_configuracoes_internas()
+        self.setup_ui()
+
+    def _criar_configuracoes_internas(self):
+        """Preferencias locais abertas; edicao de equipamentos somente com senha."""
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
+        self.abas_config = ttk.Notebook(self)
+        self.abas_config.grid(row=0, column=0, sticky='nsew')
+        self.tab_preferencias = ttk.Frame(self.abas_config)
+        self.tab_equipamentos = ttk.Frame(self.abas_config)
+        self.abas_config.add(self.tab_preferencias, text='Preferencias pessoais')
+        self.abas_config.add(self.tab_equipamentos, text='Equipamentos e filas (restrito)')
+        self.tab_equipamentos.columnconfigure(0, weight=1)
+        self.tab_equipamentos.rowconfigure(1, weight=1)
 
-        main_frame = ttk.Frame(self)
+        self._acesso_equipamentos = ttk.Frame(self.tab_equipamentos, padding=22)
+        self._acesso_equipamentos.grid(row=1, column=0, sticky='nsew')
+        ttk.Label(self._acesso_equipamentos, text='Cadastro central de equipamentos',
+                  font=('Segoe UI', 15, 'bold')).pack(anchor='w', pady=(0, 10))
+        ttk.Label(self._acesso_equipamentos,
+                  text='Apenas pessoas autorizadas podem alterar impressoras, IPs e filas.\n'
+                       'As preferencias pessoais estao disponiveis sem senha.',
+                  justify='left').pack(anchor='w', pady=(0, 15))
+        ttk.Button(self._acesso_equipamentos, text='Desbloquear cadastro',
+                   command=self.solicitar_acesso_equipamentos,
+                   bootstyle=PRIMARY).pack(anchor='w')
+
+        self._barra_administrativa = ttk.Frame(self.tab_equipamentos, padding=(12, 6))
+        ttk.Label(self._barra_administrativa,
+                  text='Administracao central — alteracoes afetam todas as estacoes',
+                  bootstyle=SECONDARY).pack(side=tk.LEFT)
+        ttk.Button(self._barra_administrativa, text='Bloquear cadastro',
+                   command=self.bloquear_cadastro, bootstyle=WARNING).pack(side=tk.RIGHT)
+        self.abas_config.bind('<<NotebookTabChanged>>', self._ao_mudar_configuracao, add='+')
+
+    def _ao_mudar_configuracao(self, _event=None):
+        if self.abas_config.select() == str(self.tab_equipamentos):
+            if self._admin_liberado:
+                if self._cadastro_widget is not None:
+                    self._cadastro_widget.atualizar()
+            else:
+                self.after_idle(self.solicitar_acesso_equipamentos)
+
+    def mostrar_equipamentos(self):
+        """Abre a subaba; solicita senha antes de exibir dados editaveis."""
+        self.abas_config.select(self.tab_equipamentos)
+
+    def solicitar_acesso_equipamentos(self):
+        if self._admin_liberado:
+            return True
+        if (self.abas_config.select() != str(self.tab_equipamentos)
+                or self.app.notebook.select() != str(self)):
+            return False
+        if not GPRINT_SENHA_ADMIN_EQUIPAMENTOS.strip():
+            messagebox.showwarning('GPrint - Cadastro restrito',
+                 'Configure GPRINT_SENHA_ADMIN_EQUIPAMENTOS no codigo antes de usar.',
+                 parent=self)
+            return False
+        senha = simpledialog.askstring('GPrint - Acesso administrativo',
+                'Informe a senha para cadastrar ou editar equipamentos e filas:',
+                show='*', parent=self)
+        if senha is None:
+            return False
+        if not hmac.compare_digest(senha, GPRINT_SENHA_ADMIN_EQUIPAMENTOS):
+            messagebox.showerror('GPrint - Acesso negado',
+                 'Senha incorreta. O cadastro permanece bloqueado.', parent=self)
+            return False
+        self._admin_liberado = True
+        self._acesso_equipamentos.grid_remove()
+        self._barra_administrativa.grid(row=0, column=0, sticky='ew')
+        if self._cadastro_widget is None:
+            self._cadastro_widget = GPrintCadastroEquipamentosTab(self.tab_equipamentos, self.app)
+        self._cadastro_widget.grid(row=1, column=0, sticky='nsew')
+        self._cadastro_widget.atualizar()
+        return True
+
+    def bloquear_cadastro(self):
+        """Destroi o formulario, sem apagar dados do banco."""
+        self._admin_liberado = False
+        if self._cadastro_widget is not None:
+            self._cadastro_widget.destroy()
+            self._cadastro_widget = None
+        self._barra_administrativa.grid_remove()
+        self._acesso_equipamentos.grid(row=1, column=0, sticky='nsew')
+
+    def setup_ui(self):
+        # Preferencias continuam individuais em cada estacao.
+        self.tab_preferencias.columnconfigure(0, weight=1)
+        self.tab_preferencias.rowconfigure(0, weight=1)
+
+        main_frame = ttk.Frame(self.tab_preferencias)
         main_frame.grid(row=0, column=0, sticky="nsew")
         main_frame.columnconfigure(0, weight=1)
         main_frame.rowconfigure(0, weight=1)
@@ -859,7 +1448,7 @@ class MioloTab(ttk.Frame):
         self.status_var = tk.StringVar(value="✅ Pronto para processar")
         
         # Caminho do banco SQLite
-        self.log_db_path = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\UICLAP\LOGS\impressoes.db"
+        self.log_db_path = GPRINT_BANCO_HISTORICO
         self.log_db_local_path = os.path.join(os.path.expanduser("~"), "Desktop", "impressoes_fallback.db")
         
         self.setup_ui()
@@ -923,13 +1512,8 @@ class MioloTab(ttk.Frame):
 
         ttk.Label(config_frame, text="Impressora:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
 
-        impressoras = [
-            "ATEXCO - 192.168.200.121",
-            "BALTORO - 192.168.200.73",
-            "OCÉ 1 - 192.168.200.80",
-            "OCÉ 3 - 192.168.200.85",
-            "RICOH - 192.168.200.84"
-        ]
+        # Maquinas compativeis sao carregadas de equipamentos.db.
+        impressoras = []
 
         self.combo_impressora = ttk.Combobox(
             config_frame,
@@ -937,14 +1521,13 @@ class MioloTab(ttk.Frame):
             values=impressoras,
             state="readonly"
         )
-        self.combo_impressora.current(0)
         self.combo_impressora.grid(row=0, column=1, columnspan=2, padx=5, pady=5, sticky="ew")
 
         ttk.Label(config_frame, text="IP selecionado:").grid(row=1, column=0, padx=5, pady=2, sticky="w")
 
         self.ip_label = ttk.Label(
             config_frame,
-            text="192.168.200.80",
+            text="---",
             font=("Consolas", 10, "bold"),
             bootstyle=(PRIMARY)
         )
@@ -1140,13 +1723,22 @@ class MioloTab(ttk.Frame):
         )
         self.btn_processar.grid(row=0, column=1, sticky="e")
 
-    def atualizar_ip_label(self, event=None):
-        impressora = self.impressora_var.get()
-        if ' - ' in impressora:
-            ip = impressora.split(' - ')[1].strip()
-            self.ip_label.config(text=ip)
+    def atualizar_equipamentos(self, equipamentos):
+        anterior = self.impressora_var.get()
+        self.equipamentos_disponiveis = {gprint_nome_maquina(x): x for x in equipamentos}
+        nomes = list(self.equipamentos_disponiveis)
+        self.combo_impressora.configure(values=nomes)
+        if anterior in self.equipamentos_disponiveis:
+            self.impressora_var.set(anterior)
+        elif len(nomes) == 1:
+            self.impressora_var.set(nomes[0])
         else:
-            self.ip_label.config(text=impressora)
+            self.impressora_var.set('')
+        self.atualizar_ip_label()
+
+    def atualizar_ip_label(self, event=None):
+        equipamento = getattr(self, 'equipamentos_disponiveis', {}).get(self.impressora_var.get())
+        self.ip_label.config(text=equipamento['ip'] if equipamento else '---')
 
     def atualizar_log_queue(self):
         try:
@@ -1178,6 +1770,14 @@ class MioloTab(ttk.Frame):
             logging.info(mensagem)
 
     def iniciar_processamento(self):
+        equipamento = getattr(self, 'equipamentos_disponiveis', {}).get(self.impressora_var.get())
+        if not equipamento:
+            messagebox.showwarning('GPrint - Miolo', 'Selecione um equipamento de Miolo cadastrado em Configuracoes > Equipamentos.')
+            return
+        # Congela o destino desta execucao; mudancas no cadastro nao desviam envios em curso.
+        self.equipamento_execucao = equipamento.copy()
+        # As filas do cadastro sao informativas para Capa/Miolo.
+        # O TXT determina a fila LPR como na logica operacional original.
         if not self.processos:
             messagebox.showwarning("Aviso", "Carregue um arquivo TXT primeiro.")
             return
@@ -1289,7 +1889,14 @@ class MioloTab(ttk.Frame):
         sessao_temp = tempfile.mkdtemp(prefix="sessao_miolo_", dir=PASTA_TRABALHO)
 
         impressora_selecionada = self.impressora_var.get()
-        ip_extraido = impressora_selecionada.split(' - ')[1].strip() if ' - ' in impressora_selecionada else impressora_selecionada
+        # IP vem do cadastro; nome da maquina pode conter hifens.
+        equipamento_execucao = getattr(self, 'equipamento_execucao', None)
+        if not equipamento_execucao:
+            self.log('Equipamento nao encontrado no cadastro; processamento cancelado.', 'ERRO')
+            self.processando = False
+            self.after(0, lambda: self.btn_processar.configure(state='normal', text='▶ Processar e Enviar'))
+            return
+        ip_extraido = equipamento_execucao['ip']
         
         # ===== EXTRAÇÃO DE LOTE (CAMINHO COMPLETO) E PILHA (NOME DO TXT) =====
         if hasattr(self, 'arquivo_txt') and self.arquivo_txt:
@@ -3115,6 +3722,8 @@ class Application:
         self.imprimir_automaticamente = tk.BooleanVar(value=True)
         self.tema_atual = tk.StringVar(value=CONFIG.get('tema', 'darkly'))
         self.style = Style(theme=self.tema_atual.get())
+        self.repositorio_equipamentos = GPrintEquipamentosRepository()
+        self.equipamentos_cache = []
         # Ícone do aplicativo
         # "Q:\___LISTA DE PRIORIDADES\GUILHERME\GPrint.ico"
         # Caminhos dos arquivos visuais
@@ -3134,6 +3743,7 @@ class Application:
         self.log_queue = queue.Queue()
         
         self.setup_ui()
+        self.root.after(600, self.iniciar_cadastro_equipamentos)
         self.setup_drag_and_drop()
         self.atualizar_log_queue()
 
@@ -3142,7 +3752,7 @@ class Application:
         os.makedirs(self.pasta_envio_curto, exist_ok=True)
 
         # Caminhos do banco SQLite (mesmo usado pelo Miolo)
-        self.log_db_path = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\UICLAP\LOGS\impressoes.db"
+        self.log_db_path = GPRINT_BANCO_HISTORICO
         self.log_db_local_path = os.path.join(os.path.expanduser("~"), "Desktop", "impressoes_fallback.db")
 
         # Alertar ao abrir, sem travar a interface quando a rede estiver lenta.
@@ -3202,7 +3812,7 @@ class Application:
         
         # Aba ENVIO
         self.aba_hotfolder = HotfolderTab(self.notebook, self)
-        self.notebook.add(self.aba_hotfolder, text="Equipamentos")
+        self.notebook.add(self.aba_hotfolder, text="Hotfolder")
 
         # Aba Refazer
         self.aba_refazer = RefazerTab(self.notebook, self)
@@ -3211,7 +3821,79 @@ class Application:
         # Aba Configurações
         self.aba_config = ConfigTab(self.notebook, self)
         self.notebook.add(self.aba_config, text="Configurações")
+        self.notebook.bind('<<NotebookTabChanged>>', self._ao_mudar_aba_configuracoes, add='+')
  
+    def iniciar_cadastro_equipamentos(self):
+        """Inicializacao em thread para nao prender a janela se a rede cair."""
+        def tarefa():
+            try:
+                self.repositorio_equipamentos.preparar_banco()
+                equipamentos = self.repositorio_equipamentos.listar_equipamentos()
+                self.root.after(0, lambda: self._cadastro_carregado(equipamentos))
+            except Exception as exc:
+                logging.warning('Cadastro central indisponivel: %s', exc)
+                self.root.after(0, lambda: messagebox.showwarning(
+                    'GPrint - Equipamentos indisponiveis',
+                    'Nao foi possivel acessar o cadastro central de equipamentos.\n'
+                    'Verifique se a pasta producao esta online.\n'
+                    'Se persistir, informe o Guilherme.'))
+        threading.Thread(target=tarefa, daemon=True).start()
+
+    def _cadastro_carregado(self, equipamentos):
+        """Cadastro inicial pede acesso restrito; uso normal nao pede senha."""
+        self.equipamentos_cache = equipamentos
+        self.atualizar_listas_equipamentos()
+        if not equipamentos:
+            self.notebook.select(self.aba_config)
+            messagebox.showinfo('Configuracao inicial do GPrint',
+                'Nenhum equipamento ativo foi encontrado.\n\n'
+                'Acesse Configuracoes > Equipamentos e filas, entre com a senha '
+                'administrativa e cadastre as impressoras e suas filas.\n'
+                'O cadastro sera compartilhado pelas estacoes.', parent=self.root)
+            self.aba_config.mostrar_equipamentos()
+
+    def _ao_mudar_aba_configuracoes(self, _event=None):
+        aba_atual = self.notebook.select()
+        if aba_atual != str(self.aba_config):
+            # Sair de Configuracoes revoga o acesso; novo acesso pede senha.
+            self.aba_config.bloquear_cadastro()
+        if aba_atual in (str(self.aba_principal),str(self.aba_miolo),str(self.aba_hotfolder)):
+            try:
+                self.atualizar_listas_equipamentos()
+            except Exception:
+                pass
+
+    def atualizar_listas_equipamentos(self):
+        try:
+            todos = self.repositorio_equipamentos.listar_equipamentos()
+            self.equipamentos_cache = todos
+            capas = [x for x in todos if x['tipo'] in ('CAPA','AMBOS')]
+            miolos = [x for x in todos if x['tipo'] in ('MIOLO','AMBOS')]
+            self.equipamentos_capa = {gprint_nome_maquina(x):x for x in capas}
+            anterior = self.equipamento_capa_var.get()
+            nomes = list(self.equipamentos_capa)
+            self.combo_equipamento_capa.configure(values=nomes)
+            if anterior in nomes:
+                self.equipamento_capa_var.set(anterior)
+            elif len(nomes) == 1:
+                self.equipamento_capa_var.set(nomes[0])
+            else:
+                self.equipamento_capa_var.set('')
+            self.aba_miolo.atualizar_equipamentos(miolos)
+            self.aba_hotfolder.atualizar_equipamentos(todos)
+            if self.notebook.select() == str(self.aba_hotfolder) and self.aba_hotfolder.machine_var.get():
+                self.aba_hotfolder.on_machine_change()
+            if hasattr(self, 'aba_historico'):
+                anterior_maquina = self.aba_historico.maquina_combo.get()
+                maquinas_historico = ['Todas'] + [gprint_nome_maquina(x) for x in todos]
+                self.aba_historico.maquina_combo.configure(values=maquinas_historico)
+                self.aba_historico.maquina_combo.set(
+                    anterior_maquina if anterior_maquina in maquinas_historico else 'Todas')
+            return todos
+        except Exception as exc:
+            logging.warning('Cadastro de equipamentos indisponivel: %s', exc)
+            return []
+
     def criar_interface_principal(self, parent):
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=1)
@@ -3239,6 +3921,14 @@ class Application:
             bootstyle="success-round-toggle"
         )
         self.checkbox_imprimir.grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.equipamento_capa_var = tk.StringVar()
+        self.equipamentos_capa = {}
+        ttk.Label(config_frame,text='Equipamento de Capa:').grid(row=1,column=0,sticky='w',padx=5)
+        self.combo_equipamento_capa = ttk.Combobox(config_frame,
+            textvariable=self.equipamento_capa_var,values=[],state='readonly',width=40)
+        self.combo_equipamento_capa.grid(row=2,column=0,sticky='w',padx=5,pady=(0,6))
+        ttk.Label(config_frame,text='Fila de impressao: identificada automaticamente em cada TXT e validada no cadastro.',
+                  bootstyle=SECONDARY).grid(row=3,column=0,sticky='w',padx=5,pady=(0,6))
         
         # ================= SELEÇÃO DE ARQUIVOS =================
         file_frame = ttk.LabelFrame(main_frame, text="📂 Arquivos TXT (Capa)", bootstyle=PRIMARY)
@@ -3358,7 +4048,14 @@ class Application:
         if not self.arquivos_selecionados:
             messagebox.showwarning("Aviso", "Selecione pelo menos um arquivo para processar!")
             return
-        
+        equipamento = self.equipamentos_capa.get(self.equipamento_capa_var.get())
+        if not equipamento:
+            messagebox.showwarning('GPrint - Capa', 'Selecione um equipamento de Capa cadastrado em Configuracoes > Equipamentos.')
+            return
+        self.maquina_capa_execucao = gprint_nome_maquina(equipamento)
+        self.ip_capa_execucao = equipamento['ip']
+        # O cadastro de filas nao valida nem altera os envios de Capa.
+        # A FILACOLOR do TXT continua sendo usada sem alteracao.
         self.log_text.configure(state='normal')
         self.log_text.delete(1.0, tk.END)
         self.log_text.configure(state='disabled')
@@ -3422,8 +4119,8 @@ class Application:
                 usuario = 'desconhecido'
             
             # Constantes para a Capa
-            MAQUINA_CAPA = "RICOH - 192.168.200.84"
-            IP_CAPA = "192.168.200.84"
+            MAQUINA_CAPA = self.maquina_capa_execucao
+            IP_CAPA = self.ip_capa_execucao
             
             for arquivo_txt in self.arquivos_selecionados:
                 self.adicionar_log(f"Lendo arquivo: {os.path.basename(arquivo_txt)}")
@@ -3652,7 +4349,7 @@ class Application:
             
             titulo = nome_arquivo.replace(filacolor, "").strip()
             comando = [
-                "lpr", "-S", "192.168.200.84", "-P", filacolor,
+                "lpr", "-S", self.ip_capa_execucao, "-P", filacolor,
                 "-J", titulo,
                 temp_normalizado
             ]
@@ -4017,18 +4714,7 @@ def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific, filacolor)
         return None
 # --- INICIALIZAÇÃO ---
 CONFIG = carregar_configuracoes()
-COMMON_FORMATS_PB = ["A4", "A3", "SRA3", "22X32", "24X32","24X33", "25X36", "26X36", "32X45", "32X48"]
-COMMON_PAPERS_PB  = ["OFFSET 63G", "OFFSET 70G", "OFFSET 75G", "OFFSET 90G", "AVENA 70G", "AVENA 80G", "BOLD 90G"]
-COMMON_FORMATS_CL = ["22X32", "24X32", "25X36", "32X45", "32X48"]
-COMMON_PAPERS_CL  = ["COUCHE 90G", "OFFSET 63G", "OFFSET 70G", "OFFSET 75G", "OFFSET 90G", "AVENA 70G", "AVENA 80G", "BOLD 90G"]
-SPECIAL_FORMATS_RICOH = ["CAPADUPLEX", "Capas 28X56", "Capas 32X60"]
-NO_PAPER_FORMATS = SPECIAL_FORMATS_RICOH
-MACHINE_CONFIG = {
-    "OCÉ 1":   {"ip": "192.168.200.80", "group": "PB", "formats": COMMON_FORMATS_PB, "papers": COMMON_PAPERS_PB},
-    "OCÉ 3":   {"ip": "192.168.200.85", "group": "PB", "formats": COMMON_FORMATS_PB, "papers": COMMON_PAPERS_PB},
-    "RICOH":   {"ip": "192.168.200.84", "group": "CL", "formats": COMMON_FORMATS_CL + SPECIAL_FORMATS_RICOH, "papers": COMMON_PAPERS_CL},
-    "BALTORO": {"ip": "192.168.200.73", "group": "CL", "formats": COMMON_FORMATS_CL, "papers": COMMON_PAPERS_CL},
-}
+# Equipamentos e filas são administrados exclusivamente em equipamentos.db.
 class HotfolderTab(ttk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent)
@@ -4063,7 +4749,7 @@ class HotfolderTab(ttk.Frame):
         self.machine_combo = ttk.Combobox(
             machine_line,
             textvariable=self.machine_var,
-            values=list(MACHINE_CONFIG.keys()),
+            values=[],
             state="readonly",
             width=18,
             bootstyle=(PRIMARY)
@@ -4161,13 +4847,13 @@ class HotfolderTab(ttk.Frame):
         print_frame.columnconfigure(3, weight=1)
         print_frame.columnconfigure(5, weight=1)
 
-        ttk.Label(print_frame, text="Formato:", width=15).grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        ttk.Label(print_frame, text="Fila cadastrada:", width=15).grid(row=0, column=0, padx=5, pady=5, sticky="w")
         self.format_cb = ttk.Combobox(print_frame, state="readonly", width=25, bootstyle=(PRIMARY))
         self.format_cb.grid(row=0, column=1, padx=5, pady=5, sticky="w")
         self.format_cb.bind("<<ComboboxSelected>>", self.on_format_change)
 
-        ttk.Label(print_frame, text="Papel/Gramatura:", width=18).grid(row=0, column=2, padx=5, pady=5, sticky="w")
-        self.paper_cb = ttk.Combobox(print_frame, state="readonly", width=25, bootstyle=(PRIMARY))
+        ttk.Label(print_frame, text="Descricao:", width=18).grid(row=0, column=2, padx=5, pady=5, sticky="w")
+        self.paper_cb = ttk.Combobox(print_frame, state="disabled", width=25, bootstyle=(PRIMARY))
         self.paper_cb.grid(row=0, column=3, padx=5, pady=5, sticky="w")
 
         ttk.Label(print_frame, text="Identificação (opcional):", width=20).grid(row=0, column=4, padx=5, pady=5, sticky="w")
@@ -4222,9 +4908,7 @@ class HotfolderTab(ttk.Frame):
         self.percent_label.grid(row=0, column=1)
 
         # Inicializa
-        if MACHINE_CONFIG:
-            self.machine_combo.current(0)
-            self.on_machine_change()
+        # Aguarda o cadastro central; nao utiliza lista interna de IPs.
         self.reset_progress()
     
     def _add_tooltip(self, widget, text):
@@ -4282,38 +4966,41 @@ class HotfolderTab(ttk.Frame):
         self.percent_label.config(text="0%")
         self.current_file_label.config(text="Nenhum envio em andamento")
 
+    def atualizar_equipamentos(self, equipamentos):
+        anterior=self.machine_var.get()
+        self.equipamentos_disponiveis={r['nome']:r for r in equipamentos}
+        nomes=list(self.equipamentos_disponiveis)
+        self.machine_combo.configure(values=nomes)
+        self.machine_var.set(anterior if anterior in nomes else (nomes[0] if len(nomes)==1 else ''))
+        # A consulta das filas fica sob demanda, para evitar rede na abertura.
+        maquina=self.equipamentos_disponiveis.get(self.machine_var.get())
+        self.ip_label.configure(text=f"IP: {maquina['ip']}" if maquina else 'IP: ---')
+        self.format_cb.configure(values=[])
+        self.format_cb.set('')
+        self.paper_cb.set('')
+
     def on_machine_change(self, event=None):
-        machine = self.machine_var.get()
-        if not machine:
+        maquina=self.equipamentos_disponiveis.get(self.machine_var.get()) if hasattr(self,'equipamentos_disponiveis') else None
+        if not maquina:
+            self.ip_label.configure(text='IP: ---')
+            self.format_cb.configure(values=[])
+            self.format_cb.set('')
+            self.paper_cb.set('')
             return
-        config = MACHINE_CONFIG[machine]
-        self.ip_label.config(text=f"IP: {config['ip']}")
-        self.format_cb['values'] = config["formats"]
-        self.paper_cb['values'] = config["papers"]
-        self.format_cb.set("")
-        self.paper_cb.set("")
-        if config["formats"]:
-            self.format_cb.current(0)
-            self.on_format_change()
-        if config["papers"]:
-            self.paper_cb.current(0)
-        self.log(f"Máquina alterada: {machine} ({config['ip']})")
+        self.ip_label.configure(text=f"IP: {maquina['ip']}")
+        try:
+            filas=self.app.repositorio_equipamentos.listar_filas(maquina['id'])
+        except Exception as exc:
+            self.log(f'Cadastro de filas indisponivel: {exc}')
+            filas=[]
+        self.filas_disponiveis={r['nome']:r for r in filas}
+        self.format_cb.configure(values=list(self.filas_disponiveis))
+        self.format_cb.set('')
+        self.paper_cb.set('')
 
     def on_format_change(self, event=None):
-        machine = self.machine_var.get()
-        if not machine:
-            return
-        selected = self.format_cb.get()
-        if selected in NO_PAPER_FORMATS:
-            self.paper_cb.config(state=tk.DISABLED)
-            self.paper_cb.set("(sem papel)")
-            self.log(f"Formato especial: {selected} (não requer papel)")
-        else:
-            self.paper_cb.config(state="readonly")
-            if not self.paper_cb.get() or self.paper_cb.get() == "(sem papel)":
-                papers = MACHINE_CONFIG[machine]["papers"]
-                if papers:
-                    self.paper_cb.current(0)
+        fila=getattr(self,'filas_disponiveis',{}).get(self.format_cb.get())
+        self.paper_cb.set(fila['descricao'] if fila else '')
 
     def on_drop(self, event):
         files = re.findall(r'\{.*?\}|\S+', event.data)
@@ -4357,42 +5044,33 @@ class HotfolderTab(ttk.Frame):
         self.log("Lista limpa")
 
     def start_send(self):
-        machine = self.machine_var.get()
-        if not machine:
-            messagebox.showwarning("Aviso", "Selecione uma máquina.")
+        machine=self.machine_var.get()
+        maquina=getattr(self,'equipamentos_disponiveis',{}).get(machine)
+        if not maquina:
+            messagebox.showwarning('GPrint','Selecione um equipamento cadastrado.')
             return
-        formato = self.format_cb.get()
-        if not formato:
-            messagebox.showwarning("Aviso", "Selecione um formato.")
+        fila=self.format_cb.get()
+        if fila not in getattr(self,'filas_disponiveis',{}):
+            messagebox.showwarning('GPrint','Selecione uma fila cadastrada para este equipamento.')
             return
-        if formato not in NO_PAPER_FORMATS:
-            papel = self.paper_cb.get()
-            if not papel or papel == "(sem papel)":
-                messagebox.showwarning("Aviso", "Selecione o papel/gramatura.")
-                return
-        else:
-            papel = None
-
         if not self.file_paths:
-            messagebox.showwarning("Aviso", "Nenhum arquivo para enviar.")
+            messagebox.showwarning('Aviso','Nenhum arquivo para enviar.')
             return
         if self.sending:
-            messagebox.showinfo("Aguarde", "Envio já em andamento.")
+            messagebox.showinfo('Aguarde','Envio ja em andamento.')
             return
-
-        total = len(self.file_paths)
-        self.progress['maximum'] = total
-        self.progress['value'] = 0
-        self.percent_label.config(text="0%")
-        self.current_file_label.config(text="Preparando envio...")
-
-        self.sending = True
-        self.cancel_send = False
+        total=len(self.file_paths)
+        self.progress['maximum']=total
+        self.progress['value']=0
+        self.percent_label.config(text='0%')
+        self.current_file_label.config(text='Preparando envio...')
+        self.sending=True
+        self.cancel_send=False
         self.send_btn.config(state=tk.DISABLED)
         self.cancel_btn.config(state=tk.NORMAL)
-
-        thread = threading.Thread(target=self._send_thread, args=(machine, formato, papel))
-        thread.daemon = True
+        # O envio usa o nome EXATO de fila cadastrado, sem alterar os argumentos LPR.
+        self.equipamento_envio_atual=maquina.copy()
+        thread=threading.Thread(target=self._send_thread,args=(machine,fila,None),daemon=True)
         thread.start()
 
     def cancel(self):
@@ -4400,22 +5078,15 @@ class HotfolderTab(ttk.Frame):
         self.log("Cancelamento solicitado...")
 
     def _send_thread(self, machine, formato, papel):
-        config = MACHINE_CONFIG[machine]
+        config = self.equipamento_envio_atual
         ip = config["ip"]
-        group = config["group"]
         optional = self._get_optional()
         current_date = datetime.now().strftime("%d-%m-%Y")
         total = len(self.file_paths)
         success = 0
 
-        if formato in NO_PAPER_FORMATS:
-            queue_name = formato
-        else:
-            if group == "PB":
-                queue_name = f"{formato} {papel}"
-            else:
-                queue_name = f"{formato}_{papel}".replace(" ", "_")
-        self.log(f"Fila gerada: {queue_name} (grupo {group})")
+        queue_name = formato  # Nome exato cadastrado na tabela filas.
+        self.log(f"Fila selecionada: {queue_name}")
 
         for idx, orig_path in enumerate(self.file_paths, 1):
             if self.cancel_send:
@@ -5937,8 +6608,7 @@ class HistoricoTab(ttk.Frame):
         self.operacao_combo.pack(side=tk.LEFT, padx=5)
         self.operacao_combo.current(0)
         ttk.Label(row3, text="Máquina:").pack(side=tk.LEFT, padx=(12, 0))
-        maquinas = ["Todas", "ATEXCO - 192.168.200.121", "BALTORO - 192.168.200.73",
-                    "OCÉ 1 - 192.168.200.80", "OCÉ 3 - 192.168.200.85", "RICOH - 192.168.200.84"]
+        maquinas = ["Todas"]
         self.maquina_combo = ttk.Combobox(row3, values=maquinas, width=27, state="readonly")
         self.maquina_combo.pack(side=tk.LEFT, padx=5)
         self.maquina_combo.current(0)
