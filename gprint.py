@@ -255,7 +255,7 @@ class GPrintRefazerRepositorio:
 # Senha de acesso a Configuracoes > Equipamentos.
 # ALTERE antes de compilar o EXE. Nunca use a senha real em um GitHub publico.
 # Protege a interface do cadastro; nao substitui permissoes da pasta de rede.
-GPRINT_SENHA_ADMIN_EQUIPAMENTOS = "aaa"
+GPRINT_SENHA_ADMIN_EQUIPAMENTOS = "ADMINISTRADOR123"
 
 
 # ============================================================================
@@ -1251,7 +1251,6 @@ class GPrintCadastroEquipamentosTab(ttk.Frame):
         self.equipamento_id=None
         self.equipamentos={}
         self._janela_filas=None
-        self._janela_operadores=None
         self._montar_tela()
 
     def _montar_tela(self):
@@ -1279,8 +1278,6 @@ class GPrintCadastroEquipamentosTab(ttk.Frame):
         ttk.Button(acoes,text='Ativar / Desativar',command=self.alternar_equipamento).pack(side=tk.LEFT,padx=3)
         ttk.Button(acoes,text='Gerenciar filas da maquina selecionada',
                    command=self.gerenciar_filas,bootstyle=PRIMARY).pack(side=tk.LEFT,padx=12)
-        ttk.Button(acoes,text='Gerenciar operadores',
-                   command=self.gerenciar_operadores,bootstyle=INFO).pack(side=tk.LEFT,padx=5)
         ttk.Button(acoes,text='Atualizar',command=self.atualizar).pack(side=tk.RIGHT,padx=3)
 
         painel=ttk.LabelFrame(self,text='Equipamentos cadastrados (duplo clique para ver as filas)',padding=8)
@@ -1384,132 +1381,183 @@ class GPrintCadastroEquipamentosTab(ttk.Frame):
             return
         self._janela_filas=GPrintGerenciadorFilas(self,row)
 
-    def gerenciar_operadores(self):
-        if self._janela_operadores is not None and self._janela_operadores.winfo_exists():
-            self._janela_operadores.lift()
-            return
-        self._janela_operadores = GPrintGerenciadorOperadores(self)
+class GPrintCadastroOperadoresTab(ttk.Frame):
+    """Cadastro e edicao dos operadores do Refazer na subaba restrita de Configuracoes.
 
-class GPrintGerenciadorOperadores(tk.Toplevel):
-    """Cadastro de operadores protegido pela mesma senha de Equipamentos."""
-    def __init__(self, parent):
+    Os nomes continuam em equipamentos.db. A exclusao nunca apaga o historico
+    de retrabalhos no refazer.db, que guarda o nome usado em cada registro.
+    """
+    def __init__(self, parent, app):
         super().__init__(parent)
-        self.painel = parent
-        self.repo = parent.app.repositorio_equipamentos
-        self.title('GPrint - Operadores do Refazer')
-        self.withdraw()
-        self.geometry('680x470')
-        self.transient(parent.winfo_toplevel())
+        self.app = app
+        self.repo = app.repositorio_equipamentos
         self.nome_var = tk.StringVar()
+        self.estado_var = tk.StringVar(value='Selecione um operador para editar, ou clique em Novo.')
         self.operador_id = None
-        frame = ttk.Frame(self, padding=14)
-        frame.pack(fill='both', expand=True)
-        ttk.Label(frame, text='Operadores - cadastro central',
-                  font=('Segoe UI', 13, 'bold')).pack(anchor='w', pady=(0, 10))
-        linha = ttk.Frame(frame)
-        linha.pack(fill='x', pady=4)
-        ttk.Label(linha, text='Nome:').pack(side='left')
-        ttk.Entry(linha, textvariable=self.nome_var, width=36).pack(side='left', padx=8)
-        ttk.Button(linha, text='Salvar', command=self.salvar, bootstyle=SUCCESS).pack(side='left', padx=4)
-        ttk.Button(linha, text='Novo', command=self.novo).pack(side='left', padx=4)
-        cols = ('nome', 'situacao')
-        self.lista = ttk.Treeview(frame, columns=cols, show='headings', selectmode='browse')
-        self.lista.heading('nome', text='Operador')
-        self.lista.heading('situacao', text='Situação')
-        self.lista.column('nome', width=350)
-        self.lista.column('situacao', width=120, anchor='center')
-        self.lista.pack(fill='both', expand=True, pady=10)
-        self.lista.bind('<<TreeviewSelect>>', self.selecionar)
-        botoes = ttk.Frame(frame)
-        botoes.pack(fill='x')
-        ttk.Button(botoes, text='Ativar / Desativar', command=self.alternar,
-                   bootstyle=WARNING).pack(side='left')
-        ttk.Button(botoes, text='Excluir operador', command=self.excluir,
-                   bootstyle=DANGER).pack(side='left', padx=8)
-        ttk.Button(botoes, text='Atualizar', command=self.atualizar).pack(side='right')
         self.dados = {}
-        self.atualizar()
-        gprint_centralizar_janela(self, parent, 680, 470)
-        self.protocol('WM_DELETE_WINDOW', self.fechar)
-        self.grab_set()
-        self.focus_set()
+        self._montar_tela()
 
-    def fechar(self):
-        try:
-            self.grab_release()
-        except tk.TclError:
-            pass
-        self.destroy()
+    def _montar_tela(self):
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+        formulario = ttk.LabelFrame(self, text='Operadores do Refazer — cadastro central', padding=12)
+        formulario.grid(row=0, column=0, sticky='ew', padx=10, pady=8)
+        formulario.columnconfigure(1, weight=1)
+        ttk.Label(formulario, text='Nome:').grid(row=0, column=0, sticky='w', padx=(0, 8))
+        self.entry_nome = ttk.Entry(formulario, textvariable=self.nome_var)
+        self.entry_nome.grid(row=0, column=1, sticky='ew', padx=5)
+        self.entry_nome.bind('<Return>', lambda _event: self.salvar())
+        botoes = ttk.Frame(formulario)
+        botoes.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(12, 4))
+        ttk.Button(botoes, text='Novo operador', command=self.novo).pack(side=tk.LEFT, padx=3)
+        ttk.Button(botoes, text='Editar selecionado', command=self.editar,
+                   bootstyle=INFO).pack(side=tk.LEFT, padx=3)
+        ttk.Button(botoes, text='Salvar cadastro / edicao', command=self.salvar,
+                   bootstyle=SUCCESS).pack(side=tk.LEFT, padx=3)
+        ttk.Label(formulario, textvariable=self.estado_var, bootstyle=SECONDARY).grid(
+            row=2, column=0, columnspan=2, sticky='w', pady=(6, 0))
+
+        painel = ttk.LabelFrame(self, text='Operadores cadastrados', padding=8)
+        painel.grid(row=1, column=0, sticky='nsew', padx=10, pady=5)
+        painel.columnconfigure(0, weight=1)
+        painel.rowconfigure(0, weight=1)
+        self.lista = ttk.Treeview(painel, columns=('nome', 'situacao'),
+                                  show='headings', selectmode='browse', height=12)
+        self.lista.heading('nome', text='Operador')
+        self.lista.heading('situacao', text='Situacao')
+        self.lista.column('nome', width=400, anchor='w')
+        self.lista.column('situacao', width=125, anchor='center')
+        self.lista.grid(row=0, column=0, sticky='nsew')
+        barra = ttk.Scrollbar(painel, orient=tk.VERTICAL, command=self.lista.yview)
+        barra.grid(row=0, column=1, sticky='ns')
+        self.lista.configure(yscrollcommand=barra.set)
+        self.lista.bind('<<TreeviewSelect>>', self.selecionar)
+        self.lista.bind('<Double-1>', self._editar_por_duplo_clique)
+
+        acoes = ttk.Frame(self, padding=(10, 4))
+        acoes.grid(row=2, column=0, sticky='ew')
+        ttk.Button(acoes, text='Ativar / Desativar', command=self.alternar,
+                   bootstyle=WARNING).pack(side=tk.LEFT, padx=3)
+        ttk.Button(acoes, text='Excluir operador', command=self.excluir,
+                   bootstyle=DANGER).pack(side=tk.LEFT, padx=3)
+        ttk.Button(acoes, text='Atualizar lista', command=self.atualizar).pack(side=tk.RIGHT, padx=3)
+        ttk.Label(self,
+                  text='Alteracoes afetam os operadores disponiveis no Refazer. '
+                       'Registros antigos de perdas permanecem preservados.',
+                  bootstyle=SECONDARY).grid(row=3, column=0, sticky='w', padx=15, pady=8)
+
+    def _erro(self, exc):
+        messagebox.showerror('GPrint - Operadores',
+                             f'Nao foi possivel concluir a operacao.\n{exc}', parent=self)
 
     def novo(self):
         self.operador_id = None
         self.nome_var.set('')
-        for iid in self.lista.selection():
-            self.lista.selection_remove(iid)
+        selecionados = self.lista.selection()
+        if selecionados:
+            self.lista.selection_remove(*selecionados)
+        self.estado_var.set('Novo operador: digite o nome e clique em Salvar.')
+        self.entry_nome.focus_set()
 
-    def atualizar(self):
+    def atualizar(self, selecionar_id=None):
+        """Recarrega somente sob demanda, sem consultar o banco na abertura geral."""
         try:
+            anterior = str(selecionar_id or self.operador_id or '')
             linhas = self.repo.listar_operadores(incluir_inativos=True)
             self.dados = {str(r['id']): r for r in linhas}
-            self.lista.delete(*self.lista.get_children())
+            antigos = self.lista.get_children()
+            if antigos:
+                self.lista.delete(*antigos)
             for r in linhas:
                 self.lista.insert('', 'end', iid=str(r['id']),
                                   values=(r['nome'], 'Ativo' if r['ativo'] else 'Inativo'))
+            if anterior and anterior in self.dados:
+                self.lista.selection_set(anterior)
+                self.lista.see(anterior)
+                self.selecionar()
+            else:
+                self.operador_id = None
+                self.nome_var.set('')
+                self.estado_var.set('Selecione um operador para editar, ou clique em Novo.')
         except Exception as exc:
-            messagebox.showerror('GPrint - Operadores', str(exc), parent=self)
+            self._erro(exc)
 
     def selecionar(self, _event=None):
         selecionado = self.lista.selection()
-        if selecionado:
-            linha = self.dados.get(selecionado[0])
-            if linha:
-                self.operador_id = linha['id']
-                self.nome_var.set(linha['nome'])
+        if not selecionado:
+            return
+        linha = self.dados.get(selecionado[0])
+        if linha:
+            self.operador_id = linha['id']
+            self.nome_var.set(linha['nome'])
+            self.estado_var.set(f"Operador selecionado: {linha['nome']}. Pode editar e salvar.")
+
+    def _editar_por_duplo_clique(self, event):
+        item = self.lista.identify_row(event.y)
+        if item and item in self.dados:
+            self.lista.selection_set(item)
+            self.selecionar()
+            self.editar()
+
+    def editar(self):
+        if self.operador_id is None or str(self.operador_id) not in self.dados:
+            messagebox.showwarning('GPrint - Operadores',
+                                   'Selecione um operador na tabela para editar.', parent=self)
+            return
+        self.entry_nome.focus_set()
+        self.entry_nome.selection_range(0, tk.END)
 
     def salvar(self):
+        nome = self.nome_var.get().strip()
+        if not nome:
+            messagebox.showwarning('GPrint - Operadores',
+                                   'Informe o nome do operador.', parent=self)
+            return
         try:
-            self.repo.salvar_operador(self.nome_var.get(), self.operador_id)
-            self.atualizar()
-            self.painel.app.aba_refazer.atualizar_operadores_refazer()
+            operador_id = self.repo.salvar_operador(nome, self.operador_id)
+            self.atualizar(selecionar_id=operador_id)
+            self.app.aba_refazer.atualizar_operadores_refazer()
+            self.estado_var.set('Cadastro salvo com sucesso. Alteracoes disponiveis no Refazer.')
         except Exception as exc:
-            messagebox.showerror('GPrint - Operadores', str(exc), parent=self)
+            self._erro(exc)
 
     def alternar(self):
-        if self.operador_id is None:
-            return
         linha = self.dados.get(str(self.operador_id))
-        if not linha:
+        if linha is None:
+            messagebox.showwarning('GPrint - Operadores',
+                                   'Selecione um operador para ativar ou desativar.', parent=self)
+            return
+        novo_ativo = not bool(linha['ativo'])
+        acao = 'Ativar' if novo_ativo else 'Desativar'
+        if not messagebox.askyesno('GPrint - Operadores',
+                                   f"{acao} o operador '{linha['nome']}'?", parent=self):
             return
         try:
-            self.repo.alterar_ativo_operador(self.operador_id, not linha['ativo'])
-            self.atualizar()
-            self.painel.app.aba_refazer.atualizar_operadores_refazer()
+            self.repo.alterar_ativo_operador(linha['id'], novo_ativo)
+            self.atualizar(selecionar_id=linha['id'])
+            self.app.aba_refazer.atualizar_operadores_refazer()
         except Exception as exc:
-            messagebox.showerror('GPrint - Operadores', str(exc), parent=self)
-
+            self._erro(exc)
 
     def excluir(self):
-        if self.operador_id is None:
-            messagebox.showwarning('GPrint - Operadores',
-                'Selecione um operador para excluir.', parent=self)
-            return
         linha = self.dados.get(str(self.operador_id))
-        if not linha:
+        if linha is None:
+            messagebox.showwarning('GPrint - Operadores',
+                                   'Selecione um operador para excluir.', parent=self)
             return
         if not messagebox.askyesno('GPrint - Excluir operador',
-                f"Excluir definitivamente o cadastro de '{linha['nome']}'?\n\n"
-                'Essa pessoa deixara de aparecer nas novas selecoes do Refazer.\n'
-                'Os retrabalhos ja registrados permanecerao no historico.',
-                parent=self):
+                f"Excluir o cadastro de '{linha['nome']}'?\n\n"
+                'Ele deixara de aparecer para novos retrabalhos.\n'
+                'O historico de perdas ja registrado sera preservado.', parent=self):
             return
         try:
-            if not self.repo.excluir_operador(self.operador_id):
-                raise ValueError('O operador selecionado nao foi encontrado.')
+            if not self.repo.excluir_operador(linha['id']):
+                raise ValueError('Operador nao encontrado no cadastro central.')
             self.novo()
             self.atualizar()
-            self.painel.app.aba_refazer.atualizar_operadores_refazer()
+            self.app.aba_refazer.atualizar_operadores_refazer()
         except Exception as exc:
-            messagebox.showerror('GPrint - Operadores', str(exc), parent=self)
+            self._erro(exc)
 
 
 class ConfigTab(ttk.Frame):
@@ -1522,88 +1570,132 @@ class ConfigTab(ttk.Frame):
         self.setup_ui()
 
     def _criar_configuracoes_internas(self):
-        """Preferencias locais abertas; edicao de equipamentos somente com senha."""
+        """Preferencias livres; equipamentos e operadores em abas restritas por senha."""
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
         self.abas_config = ttk.Notebook(self)
         self.abas_config.grid(row=0, column=0, sticky='nsew')
         self.tab_preferencias = ttk.Frame(self.abas_config)
         self.tab_equipamentos = ttk.Frame(self.abas_config)
+        self.tab_operadores = ttk.Frame(self.abas_config)
         self.abas_config.add(self.tab_preferencias, text='Preferencias pessoais')
         self.abas_config.add(self.tab_equipamentos, text='Equipamentos e filas (restrito)')
-        self.tab_equipamentos.columnconfigure(0, weight=1)
-        self.tab_equipamentos.rowconfigure(1, weight=1)
+        self.abas_config.add(self.tab_operadores, text='Operadores do Refazer (restrito)')
+        self._operadores_widget = None
 
-        self._acesso_equipamentos = ttk.Frame(self.tab_equipamentos, padding=22)
-        self._acesso_equipamentos.grid(row=1, column=0, sticky='nsew')
-        ttk.Label(self._acesso_equipamentos, text='Cadastro central de equipamentos',
-                  font=('Segoe UI', 15, 'bold')).pack(anchor='w', pady=(0, 10))
-        ttk.Label(self._acesso_equipamentos,
-                  text='Apenas pessoas autorizadas podem alterar impressoras, IPs e filas.\n'
-                       'As preferencias pessoais estao disponiveis sem senha.',
-                  justify='left').pack(anchor='w', pady=(0, 15))
-        ttk.Button(self._acesso_equipamentos, text='Desbloquear cadastro',
-                   command=self.solicitar_acesso_equipamentos,
-                   bootstyle=PRIMARY).pack(anchor='w')
+        for aba, titulo, descricao, desbloquear in (
+            (self.tab_equipamentos, 'Cadastro central de equipamentos',
+             'Cadastre equipamentos, seus IPs e filas de impressao.',
+             self.solicitar_acesso_equipamentos),
+            (self.tab_operadores, 'Cadastro central de operadores',
+             'Cadastre, edite, ative, desative ou exclua operadores do Refazer.',
+             self.solicitar_acesso_operadores),
+        ):
+            aba.columnconfigure(0, weight=1)
+            aba.rowconfigure(1, weight=1)
+            bloqueio = ttk.Frame(aba, padding=22)
+            bloqueio.grid(row=1, column=0, sticky='nsew')
+            ttk.Label(bloqueio, text=titulo,
+                      font=('Segoe UI', 15, 'bold')).pack(anchor='w', pady=(0, 10))
+            ttk.Label(bloqueio,
+                      text=descricao + '\nAcesso protegido pela senha administrativa.',
+                      justify='left').pack(anchor='w', pady=(0, 15))
+            ttk.Button(bloqueio, text='Desbloquear cadastro',
+                       command=desbloquear, bootstyle=PRIMARY).pack(anchor='w')
+            barra = ttk.Frame(aba, padding=(12, 6))
+            ttk.Label(barra,
+                      text='Administracao central — alteracoes afetam todas as estacoes',
+                      bootstyle=SECONDARY).pack(side=tk.LEFT)
+            ttk.Button(barra, text='Bloquear cadastros',
+                       command=self.bloquear_cadastro, bootstyle=WARNING).pack(side=tk.RIGHT)
+            if aba is self.tab_equipamentos:
+                self._acesso_equipamentos = bloqueio
+                self._barra_administrativa = barra
+            else:
+                self._acesso_operadores = bloqueio
+                self._barra_operadores = barra
 
-        self._barra_administrativa = ttk.Frame(self.tab_equipamentos, padding=(12, 6))
-        ttk.Label(self._barra_administrativa,
-                  text='Administracao central — alteracoes afetam todas as estacoes',
-                  bootstyle=SECONDARY).pack(side=tk.LEFT)
-        ttk.Button(self._barra_administrativa, text='Bloquear cadastro',
-                   command=self.bloquear_cadastro, bootstyle=WARNING).pack(side=tk.RIGHT)
         self.abas_config.bind('<<NotebookTabChanged>>', self._ao_mudar_configuracao, add='+')
 
     def _ao_mudar_configuracao(self, _event=None):
-        if self.abas_config.select() == str(self.tab_equipamentos):
-            if self._admin_liberado:
-                if self._cadastro_widget is not None:
-                    self._cadastro_widget.atualizar()
-            else:
-                self.after_idle(self.solicitar_acesso_equipamentos)
+        aba = self.abas_config.select()
+        if aba not in (str(self.tab_equipamentos), str(self.tab_operadores)):
+            return
+        if self._admin_liberado:
+            self._mostrar_cadastro_liberado(aba)
+        else:
+            self.after_idle(lambda: self._solicitar_acesso_aba(aba))
+
+    def _solicitar_acesso_aba(self, aba):
+        if aba == str(self.tab_equipamentos):
+            self.solicitar_acesso_equipamentos()
+        elif aba == str(self.tab_operadores):
+            self.solicitar_acesso_operadores()
 
     def mostrar_equipamentos(self):
-        """Abre a subaba; solicita senha antes de exibir dados editaveis."""
+        """Usado durante a configuracao inicial quando nao ha equipamentos."""
         self.abas_config.select(self.tab_equipamentos)
 
+    def _mostrar_cadastro_liberado(self, aba):
+        if not self._admin_liberado:
+            return
+        if aba == str(self.tab_equipamentos):
+            self._acesso_equipamentos.grid_remove()
+            self._barra_administrativa.grid(row=0, column=0, sticky='ew')
+            if self._cadastro_widget is None:
+                self._cadastro_widget = GPrintCadastroEquipamentosTab(self.tab_equipamentos, self.app)
+            self._cadastro_widget.grid(row=1, column=0, sticky='nsew')
+            self._cadastro_widget.atualizar()
+        elif aba == str(self.tab_operadores):
+            self._acesso_operadores.grid_remove()
+            self._barra_operadores.grid(row=0, column=0, sticky='ew')
+            if self._operadores_widget is None:
+                self._operadores_widget = GPrintCadastroOperadoresTab(self.tab_operadores, self.app)
+            self._operadores_widget.grid(row=1, column=0, sticky='nsew')
+            self._operadores_widget.atualizar()
+
     def solicitar_acesso_equipamentos(self):
-        if self._admin_liberado:
-            return True
-        if (self.abas_config.select() != str(self.tab_equipamentos)
+        return self.solicitar_acesso_administrativo(self.tab_equipamentos)
+
+    def solicitar_acesso_operadores(self):
+        return self.solicitar_acesso_administrativo(self.tab_operadores)
+
+    def solicitar_acesso_administrativo(self, aba):
+        if (self.abas_config.select() != str(aba)
                 or self.app.notebook.select() != str(self)):
             return False
-        if not GPRINT_SENHA_ADMIN_EQUIPAMENTOS.strip():
-            messagebox.showwarning('GPrint - Cadastro restrito',
-                 'Configure GPRINT_SENHA_ADMIN_EQUIPAMENTOS no codigo antes de usar.',
-                 parent=self)
-            return False
-        senha = simpledialog.askstring('GPrint - Acesso administrativo',
-                'Informe a senha para cadastrar ou editar equipamentos e filas:',
-                show='*', parent=self)
-        if senha is None:
-            return False
-        if not hmac.compare_digest(senha, GPRINT_SENHA_ADMIN_EQUIPAMENTOS):
-            messagebox.showerror('GPrint - Acesso negado',
-                 'Senha incorreta. O cadastro permanece bloqueado.', parent=self)
-            return False
-        self._admin_liberado = True
-        self._acesso_equipamentos.grid_remove()
-        self._barra_administrativa.grid(row=0, column=0, sticky='ew')
-        if self._cadastro_widget is None:
-            self._cadastro_widget = GPrintCadastroEquipamentosTab(self.tab_equipamentos, self.app)
-        self._cadastro_widget.grid(row=1, column=0, sticky='nsew')
-        self._cadastro_widget.atualizar()
+        if not self._admin_liberado:
+            senha_configurada = GPRINT_SENHA_ADMIN_EQUIPAMENTOS
+            if not senha_configurada.strip():
+                messagebox.showwarning('GPrint - Cadastro restrito',
+                     'Configure a senha administrativa antes de utilizar os cadastros.',
+                     parent=self)
+                return False
+            senha = simpledialog.askstring('GPrint - Acesso administrativo',
+                    'Informe a senha para acessar o cadastro central:',
+                    show='*', parent=self)
+            if senha is None:
+                return False
+            if not hmac.compare_digest(senha, senha_configurada):
+                messagebox.showerror('GPrint - Acesso negado',
+                     'Senha incorreta. O cadastro permanece bloqueado.', parent=self)
+                return False
+            self._admin_liberado = True
+        self._mostrar_cadastro_liberado(str(aba))
         return True
 
     def bloquear_cadastro(self):
-        """Destroi o formulario, sem apagar dados do banco."""
+        """Ao sair de Configuracoes, revoga acesso a ambas as abas administrativas."""
         self._admin_liberado = False
-        if self._cadastro_widget is not None:
-            self._cadastro_widget.destroy()
-            self._cadastro_widget = None
+        for nome in ('_cadastro_widget', '_operadores_widget'):
+            widget = getattr(self, nome, None)
+            if widget is not None:
+                widget.destroy()
+                setattr(self, nome, None)
         self._barra_administrativa.grid_remove()
+        self._barra_operadores.grid_remove()
         self._acesso_equipamentos.grid(row=1, column=0, sticky='nsew')
-
+        self._acesso_operadores.grid(row=1, column=0, sticky='nsew')
     def setup_ui(self):
         # Preferencias continuam individuais em cada estacao.
         self.tab_preferencias.columnconfigure(0, weight=1)
@@ -7199,8 +7291,7 @@ class RefazerTab(ttk.Frame):
 
         if not operador:
             messagebox.showwarning('GPrint - Refazer',
-                'Selecione um operador cadastrado em Configuracoes > Equipamentos e filas '
-                '> Gerenciar operadores.', parent=self)
+                'Selecione um operador cadastrado em Configuracoes > Operadores do Refazer.', parent=self)
             return
         # Inicializa a fila DURAVEL antes de copiar ou montar qualquer PDF.
         try:
