@@ -584,7 +584,7 @@ def gprint_verificar_banco_no_inicio(caminho, root):
 # LIMITE DE ARQUIVOS TXT NA ABA MIOLO:
 # 0 = sem limite (quantos arquivos TXT desejar)
 # 1, 2, 3... = quantidade maxima de TXT por processamento
-MAX_ARQUIVOS_TXT_MIOLO = 2
+MAX_ARQUIVOS_TXT_MIOLO = 4
 
 DATA_LIMITE = "29/07/2027"
 PASTA_BASE = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\UICLAP\LOTES"
