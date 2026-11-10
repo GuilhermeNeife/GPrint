@@ -5860,6 +5860,7 @@ class RefazerTab(ttk.Frame):
     # ---------- CONFIGURAÇÕES (agora atributos da classe) ----------
     CAMINHO_CAPAS_POD_AGRUPADAS = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\_CAPAS DE POD AGRUPADAS"
     CAMINHO_UICLAP_LOTES = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\UICLAP\LOTES"
+    CAMINHO_UICLAP_LOTES_NOVO= r"\\Sp-dek-srvap-07\api_docuprint"
     CAMINHO_RELATORIOS_PERDA = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\_CAPAS DE POD AGRUPADAS\Z_RELATÓRIOS\RELATÓRIOS DE PERDA.xlsx"
     GS_PATH = r"C:\Ghostscript\gswin64c.exe"
 
@@ -6105,247 +6106,51 @@ class RefazerTab(ttk.Frame):
         s.finish(width=0.5, color=(0,0,0))
         s.commit()
 
-    def montar_pdf(self, entrada, saida, tipo):
-        doc = fitz.open(entrada)
-        out = fitz.open()
-        w_ref = h_ref = 595
-        if len(doc) > 0:
-            w_ref, h_ref = doc[0].rect.width, doc[0].rect.height
-
-        largura_pt = self.LARGURA_PT
-        altura_pt = self.ALTURA_PT
-        sangria_pt = self.SANGRIA_PT
-        espaco_pt = 0
-        paginas_vazias = []
-
+    @staticmethod
+    def _modo_miolo_refazer(tipo, quantidade):
+        """A quantidade é a editada no Refazer, não a original da planilha."""
         if tipo == 'brochura':
-            total_original = len(doc)
-            if total_original % 4 != 0:
-                faltam = 4 - (total_original % 4)
-                for _ in range(faltam):
-                    doc.new_page(width=w_ref, height=h_ref)
-            total = len(doc)
-            metade = total // 2
-            num_faces = total // 2
+            return 'dois_na_folha' if int(quantidade) > 10 else 'Corta_empilha'
+        if tipo == 'grampo':
+            return 'grampo'
+        if tipo == '1up':
+            return 'um_na_folha'
+        raise ValueError(f'Tipo de montagem do Refazer desconhecido: {tipo}')
 
-            for i in range(num_faces):
-                if i % 2 == 0:
-                    idx_esq = metade + i
-                    idx_dir = i
-                else:
-                    idx_esq = i
-                    idx_dir = metade + i
-                idx_esq = idx_esq if idx_esq < total else None
-                idx_dir = idx_dir if idx_dir < total else None
+    def montar_pdf(self, entrada, saida, tipo, quantidade=1, lote='', nome_original=None,
+                   sangria_mm=None):
+        """Reutiliza montagem, marcas e identificação da aba Miolo.
 
-                page_esq = doc[idx_esq] if idx_esq is not None else None
-                page_dir = doc[idx_dir] if idx_dir is not None else None
-                rot_esq = (idx_esq is not None and idx_esq >= metade)
-                rot_dir = (idx_dir is not None and idx_dir >= metade)
-
-                trim_esq = self.obter_area_corte_segura(page_esq, w_ref, h_ref) if page_esq else None
-                w_esq = trim_esq.width if trim_esq else w_ref
-                h_esq = trim_esq.height if trim_esq else h_ref
-                trim_dir = self.obter_area_corte_segura(page_dir, w_ref, h_ref) if page_dir else None
-                w_dir = trim_dir.width if trim_dir else w_ref
-                h_dir = trim_dir.height if trim_dir else h_ref
-
-                nova = out.new_page(width=largura_pt, height=altura_pt)
-
-                if sangria_pt > 0:
-                    y_esq, cabe_esq = self.calcular_y_com_sangria(altura_pt, h_esq, sangria_pt)
-                    y_dir, cabe_dir = self.calcular_y_com_sangria(altura_pt, h_dir, sangria_pt)
-                    sangria_aplicar_esq = cabe_esq and page_esq is not None
-                    sangria_aplicar_dir = cabe_dir and page_dir is not None
-                else:
-                    y_esq = (altura_pt - h_esq) / 2
-                    y_dir = (altura_pt - h_dir) / 2
-                    sangria_aplicar_esq = sangria_aplicar_dir = False
-
-                largura_total = w_esq + w_dir + espaco_pt + 2 * sangria_pt
-                x_inicio = (largura_pt - largura_total) / 2
-                x1 = x_inicio + sangria_pt
-                destino1 = fitz.Rect(x1, y_esq, x1 + w_esq, y_esq + h_esq)
-                destino1 = self.ajustar_para_media_box(destino1, largura_pt, altura_pt)
-                x2 = x1 + w_esq + espaco_pt
-                destino2 = fitz.Rect(x2, y_dir, x2 + w_dir, y_dir + h_dir)
-                destino2 = self.ajustar_para_media_box(destino2, largura_pt, altura_pt)
-
-                if page_esq and self.pagina_tem_conteudo(page_esq):
-                    try:
-                        nova.show_pdf_page(destino1, doc, idx_esq, clip=trim_esq, rotate=180 if rot_esq else 0)
-                    except Exception:
-                        paginas_vazias.append(str(idx_esq+1))
-                elif page_esq is not None:
-                    paginas_vazias.append(str(idx_esq+1))
-
-                if page_dir and self.pagina_tem_conteudo(page_dir):
-                    try:
-                        nova.show_pdf_page(destino2, doc, idx_dir, clip=trim_dir, rotate=180 if rot_dir else 0)
-                    except Exception:
-                        paginas_vazias.append(str(idx_dir+1))
-                elif page_dir is not None:
-                    paginas_vazias.append(str(idx_dir+1))
-
-                if sangria_pt > 0:
-                    if page_esq and self.pagina_tem_conteudo(page_esq) and sangria_aplicar_esq:
-                        self.aplicar_sangria_espelhada_externa(page_esq, nova, trim_esq, destino1, sangria_pt,
-                                                               bordas=['top','bottom','left'],
-                                                               rotate=180 if rot_esq else 0)
-                    if page_dir and self.pagina_tem_conteudo(page_dir) and sangria_aplicar_dir:
-                        self.aplicar_sangria_espelhada_externa(page_dir, nova, trim_dir, destino2, sangria_pt,
-                                                               bordas=['top','bottom','right'],
-                                                               rotate=180 if rot_dir else 0)
-                    bleed_total = fitz.Rect(
-                        destino1.x0 - sangria_pt,
-                        min(destino1.y0, destino2.y0) - sangria_pt,
-                        destino2.x1 + sangria_pt,
-                        max(destino1.y1, destino2.y1) + sangria_pt
-                    )
-                    bleed_total = self.ajustar_para_media_box(bleed_total, largura_pt, altura_pt)
-                    if bleed_total.width > 0 and bleed_total.height > 0:
-                        nova.set_bleedbox(bleed_total)
-                nova.set_trimbox(destino1)
-                if espaco_pt == 0:
-                    self.desenhar_marcas(nova, destino1, lado='esquerda')
-                    self.desenhar_marcas(nova, destino2, lado='direita')
-                    x_centro = destino1.x1
-                    self.desenhar_marca_central_vertical(nova, x_centro, destino1.y0, destino1.y1)
-
-        elif tipo == 'grampo':
-            total = len(doc)
-            num_folhas = (total + 1) // 2
-            for i in range(num_folhas):
-                if i % 2 == 0:
-                    idx_esq = total - i if total - i >= 1 else None
-                    idx_dir = i + 1 if i + 1 <= total else None
-                else:
-                    idx_esq = i + 1 if i + 1 <= total else None
-                    idx_dir = total - i if total - i >= 1 else None
-                page_esq = doc[idx_esq - 1] if idx_esq is not None else None
-                page_dir = doc[idx_dir - 1] if idx_dir is not None else None
-
-                trim_esq = self.obter_area_corte_segura(page_esq, w_ref, h_ref) if page_esq else None
-                w_esq = trim_esq.width if trim_esq else w_ref
-                h_esq = trim_esq.height if trim_esq else h_ref
-                trim_dir = self.obter_area_corte_segura(page_dir, w_ref, h_ref) if page_dir else None
-                w_dir = trim_dir.width if trim_dir else w_ref
-                h_dir = trim_dir.height if trim_dir else h_ref
-
-                nova = out.new_page(width=largura_pt, height=altura_pt)
-
-                if sangria_pt > 0:
-                    y_esq, cabe_esq = self.calcular_y_com_sangria(altura_pt, h_esq, sangria_pt)
-                    y_dir, cabe_dir = self.calcular_y_com_sangria(altura_pt, h_dir, sangria_pt)
-                    sangria_aplicar_esq = cabe_esq and page_esq is not None
-                    sangria_aplicar_dir = cabe_dir and page_dir is not None
-                else:
-                    y_esq = (altura_pt - h_esq) / 2
-                    y_dir = (altura_pt - h_dir) / 2
-                    sangria_aplicar_esq = sangria_aplicar_dir = False
-
-                largura_total = w_esq + w_dir + espaco_pt + 2 * sangria_pt
-                x_inicio = (largura_pt - largura_total) / 2
-                x1 = x_inicio + sangria_pt
-                destino1 = fitz.Rect(x1, y_esq, x1 + w_esq, y_esq + h_esq)
-                destino1 = self.ajustar_para_media_box(destino1, largura_pt, altura_pt)
-                x2 = x1 + w_esq + espaco_pt
-                destino2 = fitz.Rect(x2, y_dir, x2 + w_dir, y_dir + h_dir)
-                destino2 = self.ajustar_para_media_box(destino2, largura_pt, altura_pt)
-
-                if page_esq and self.pagina_tem_conteudo(page_esq):
-                    try:
-                        nova.show_pdf_page(destino1, doc, idx_esq - 1, clip=trim_esq)
-                    except Exception:
-                        paginas_vazias.append(str(idx_esq))
-                elif page_esq is not None:
-                    paginas_vazias.append(str(idx_esq))
-
-                if page_dir and self.pagina_tem_conteudo(page_dir):
-                    try:
-                        nova.show_pdf_page(destino2, doc, idx_dir - 1, clip=trim_dir)
-                    except Exception:
-                        paginas_vazias.append(str(idx_dir))
-                elif page_dir is not None:
-                    paginas_vazias.append(str(idx_dir))
-
-                if sangria_pt > 0:
-                    if page_esq and self.pagina_tem_conteudo(page_esq) and sangria_aplicar_esq:
-                        self.aplicar_sangria_espelhada_externa(page_esq, nova, trim_esq, destino1, sangria_pt,
-                                                               bordas=['top','bottom','left'])
-                    if page_dir and self.pagina_tem_conteudo(page_dir) and sangria_aplicar_dir:
-                        self.aplicar_sangria_espelhada_externa(page_dir, nova, trim_dir, destino2, sangria_pt,
-                                                               bordas=['top','bottom','right'])
-                    bleed_total = fitz.Rect(
-                        destino1.x0 - sangria_pt,
-                        min(destino1.y0, destino2.y0) - sangria_pt,
-                        destino2.x1 + sangria_pt,
-                        max(destino1.y1, destino2.y1) + sangria_pt
-                    )
-                    bleed_total = self.ajustar_para_media_box(bleed_total, largura_pt, altura_pt)
-                    if bleed_total.width > 0 and bleed_total.height > 0:
-                        nova.set_bleedbox(bleed_total)
-                nova.set_trimbox(destino1)
-                if espaco_pt == 0:
-                    self.desenhar_marcas(nova, destino1, lado='esquerda')
-                    self.desenhar_marcas(nova, destino2, lado='direita')
-                    x_centro = destino1.x1
-                    self.desenhar_marca_central_vertical(nova, x_centro, destino1.y0, destino1.y1)
-
-        elif tipo == '1up':
-            for idx, page in enumerate(doc):
-                trim_original = self.obter_area_corte_segura(page, w_ref, h_ref)
-                w = trim_original.width if trim_original else w_ref
-                h = trim_original.height if trim_original else h_ref
-
-                nova = out.new_page(width=largura_pt, height=altura_pt)
-
-                x = (largura_pt - w) / 2
-                if sangria_pt > 0:
-                    y, cabe = self.calcular_y_com_sangria(altura_pt, h, sangria_pt)
-                    sangria_aplicar = cabe
-                else:
-                    y = (altura_pt - h) / 2
-                    sangria_aplicar = False
-
-                destino = fitz.Rect(x, y, x + w, y + h)
-                destino = self.ajustar_para_media_box(destino, largura_pt, altura_pt)
-
-                if not self.pagina_tem_conteudo(page):
-                    paginas_vazias.append(str(page.number + 1))
-                else:
-                    try:
-                        nova.show_pdf_page(destino, doc, page.number, clip=trim_original)
-                    except Exception:
-                        paginas_vazias.append(str(page.number + 1))
-
-                nova.set_trimbox(destino)
-
-                if sangria_pt > 0 and sangria_aplicar and self.pagina_tem_conteudo(page):
-                    bleed = fitz.Rect(
-                        destino.x0 - sangria_pt,
-                        destino.y0 - sangria_pt,
-                        destino.x1 + sangria_pt,
-                        destino.y1 + sangria_pt
-                    )
-                    bleed = self.ajustar_para_media_box(bleed, largura_pt, altura_pt)
-                    if bleed.width > 0 and bleed.height > 0:
-                        nova.set_bleedbox(bleed)
-                    self.aplicar_sangria_espelhada_externa(
-                        page, nova, trim_original, destino, sangria_pt,
-                        bordas=['top', 'bottom', 'left', 'right']
-                    )
-
-                if espaco_pt == 0:
-                    self.desenhar_marcas(nova, destino, lado='centro')  # adapte se necessário
-        
-
-
-        out.save(saida, garbage=4, deflate=True, clean=True)
-        doc.close()
-        out.close()
-        if paginas_vazias:
-            print(f"Páginas vazias (não incluídas): {', '.join(paginas_vazias)}")
+        A cópia de entrada mantém a identificação original mesmo após redução.
+        A quantidade escolhe o layout; o envio continua sendo um trabalho por PDF.
+        """
+        modo = self._modo_miolo_refazer(tipo, quantidade)
+        montadores = {
+            'Corta_empilha': Corta_empilha,
+            'dois_na_folha': dois_na_folha,
+            'grampo': grampo,
+            'um_na_folha': um_na_folha,
+        }
+        if sangria_mm is None:
+            sangria_mm = obter_sangria_padrao_miolo()
+        nome = os.path.splitext(os.path.basename(nome_original or entrada))[0]
+        identificacao = f'LOTE_{lote}_{nome}' if lote else nome
+        identificacao = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', identificacao).strip(' .')
+        # Limita somente a cópia temporária, preservando o lote no início.
+        identificacao = identificacao[:160].rstrip(' .') or 'GPrint'
+        with tempfile.TemporaryDirectory(prefix='gprint_ref_miolo_') as pasta_temp:
+            entrada_identificada = os.path.join(pasta_temp, identificacao + '.pdf')
+            shutil.copy2(entrada, entrada_identificada)
+            # A redução, quando solicitada, já ocorreu antes da montagem.
+            # Corta_empilha tem compressão ligada por padrão: desliga aqui
+            # para respeitar o setor escolhido e evitar uma segunda redução.
+            opcoes = {'comprimir_entrada': False} if modo == 'Corta_empilha' else {}
+            resultado = montadores[modo](
+                entrada_identificada, saida, self.LARGURA_PT, self.ALTURA_PT,
+                sangria_mm=sangria_mm, add_marcas=True, **opcoes)
+            if resultado is False or not os.path.isfile(saida) or os.path.getsize(saida) == 0:
+                raise RuntimeError('A montagem do miolo não gerou um PDF válido.')
+        return modo
 
     def adicionar_marca_dagua(self, caminho_pdf, texto, distancia_mm=3, caminho_saida=None):
         if not caminho_pdf.lower().endswith('.pdf'):
@@ -6490,6 +6295,8 @@ class RefazerTab(ttk.Frame):
             return None
         if cliente == "uiclap":
             destino_dir = os.path.join(self.CAMINHO_UICLAP_LOTES, lote, "REFAZER", tipo)
+        elif cliente == "uiclap_antigo":
+            destino_dir = os.path.join(self.CAMINHO_UICLAP_LOTES_NOVO, lote, "REFAZER", tipo)
         else:
             destino_dir = os.path.join(self.CAMINHO_CAPAS_POD_AGRUPADAS, cliente, lote, "REFAZER", tipo)
         os.makedirs(destino_dir, exist_ok=True)
@@ -6873,7 +6680,7 @@ class RefazerTab(ttk.Frame):
         return plano
 
     @staticmethod
-    def _nome_trabalho_refazer(nome_pdf):
+    def _nome_trabalho_refazer(nome_pdf, lote=''):
         """Identificação curta e ASCII para compatibilidade com o LPR do Windows.
 
         Não altera o nome do PDF final e não altera o nome da fila.
@@ -6883,8 +6690,12 @@ class RefazerTab(ttk.Frame):
         base = os.path.splitext(os.path.basename(nome_pdf))[0]
         ascii_nome = unicodedata.normalize('NFKD', base).encode('ascii', 'ignore').decode('ascii')
         ascii_nome = re.sub(r'[^A-Za-z0-9_.-]+', '_', ascii_nome).strip('_.-')
-        sufixo = hashlib.sha1(base.encode('utf-8')).hexdigest()[:6]
-        return (ascii_nome[:32].rstrip('_.-') or 'GPrint') + '_' + sufixo
+        lote_ascii = unicodedata.normalize('NFKD', str(lote)).encode('ascii', 'ignore').decode('ascii')
+        lote_ascii = re.sub(r'[^A-Za-z0-9_.-]+', '_', lote_ascii).strip('_.-')
+        identidade = f'{lote}|{base}' if lote else base
+        sufixo = hashlib.sha1(identidade.encode('utf-8')).hexdigest()[:6]
+        prefixo = f'LOTE_{lote_ascii[:32]}_' if lote_ascii else ''
+        return prefixo + (ascii_nome[:32].rstrip('_.-') or 'GPrint') + '_' + sufixo
 
     def _enviar_refazer_lpr(self, arquivo_pdf, destino):
         """Envio exclusivo do Refazer com copia TEMPORARIA de nome curto.
@@ -6894,7 +6705,7 @@ class RefazerTab(ttk.Frame):
         """
         maquina = destino['maquina']
         fila = destino['fila']
-        nome_trabalho = self._nome_trabalho_refazer(arquivo_pdf)
+        nome_trabalho = self._nome_trabalho_refazer(arquivo_pdf, destino.get('lote', ''))
         if not os.path.isfile(arquivo_pdf):
             return False, 'PDF final não encontrado.'
         try:
@@ -7001,6 +6812,7 @@ class RefazerTab(ttk.Frame):
     def carregar_clientes(self):
         clientes = self.listar_pastas(self.CAMINHO_CAPAS_POD_AGRUPADAS)
         clientes.append("uiclap")
+        clientes.append("uiclap_antigo")
         self.cb_cliente["values"] = clientes
         if clientes:
             self.cb_cliente.current(0)
@@ -7281,11 +7093,16 @@ class RefazerTab(ttk.Frame):
         cliente = self.pasta_var.get()
         lote = self.subpasta_var.get()
         operador = self.operador_var.get()
+        for destino_impressao in plano_destinos.values():
+            destino_impressao['lote'] = lote
+        sangria_miolo = obter_sangria_padrao_miolo()
         if not cliente or not lote:
             return
         data_hora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-        if cliente == "uiclap":
+        if cliente == "uiclap_antigo":
             pasta_lote = os.path.join(self.CAMINHO_UICLAP_LOTES, lote)
+        elif cliente == "uiclap":
+            pasta_lote = os.path.join(self.CAMINHO_UICLAP_LOTES_NOVO, lote)
         else:
             pasta_lote = os.path.join(self.CAMINHO_CAPAS_POD_AGRUPADAS, cliente, lote)
 
@@ -7356,7 +7173,8 @@ class RefazerTab(ttk.Frame):
                     item_original.get("formato_miolo"),
                     setor,
                     plano_destinos.get(iid),
-                    registro_id
+                    registro_id,
+                    int(qtd)
                 ))
 
             # Copia o outro tipo (miolo/capa) se existir
@@ -7388,7 +7206,7 @@ class RefazerTab(ttk.Frame):
             self.update_idletasks()
             for idx, (destino, nome_base, setor_capa, destino_impressao, registro_id) in enumerate(copias_capas, start=1):
                 try:
-                    self.adicionar_marca_dagua(destino, nome_base)
+                    self.adicionar_marca_dagua(destino, f'LOTE {lote} - {nome_base}')
                     if setor_capa == "PROBLEMA DE FONTE":
                         temp_outlines = destino.replace('.pdf', '_TEMP_OUTLINES.pdf')
                         self.converter_em_contornos(destino, temp_outlines)
@@ -7414,7 +7232,7 @@ class RefazerTab(ttk.Frame):
             self.progress_label.config(text=f"Miolos: 0/{total_miolos}")
             self.update_idletasks()
 
-            for idx, (copia_dest, nome_base, acab, fmt_miolo, setor_item, destino_impressao, registro_id) in enumerate(miolos_info, start=1):
+            for idx, (copia_dest, nome_base, acab, fmt_miolo, setor_item, destino_impressao, registro_id, quantidade) in enumerate(miolos_info, start=1):
                 self.progress_label.config(text=f"Miolo {idx}/{total_miolos}: {nome_base}")
                 self.update_idletasks()
                 try:
@@ -7441,17 +7259,23 @@ class RefazerTab(ttk.Frame):
                             nome_final = copia_dest.replace('.pdf', '_MONTADO_REDUZIDO.pdf')
                             reduzido_temp = copia_dest.replace('.pdf', '_TEMP_RED.pdf')
                             self.comprimir_pdf(copia_dest, reduzido_temp)
-                            self.montar_pdf(reduzido_temp, nome_final, tipo_montagem)
+                            self.montar_pdf(reduzido_temp, nome_final, tipo_montagem,
+                                            quantidade=quantidade, lote=lote, nome_original=nome_base + '.pdf',
+                                            sangria_mm=sangria_miolo)
                             if os.path.exists(reduzido_temp): os.remove(reduzido_temp)
                         elif setor_item == "PROBLEMA DE FONTE":
                             nome_final = copia_dest.replace('.pdf', '_MONTADO_CURVAS.pdf')
                             montado_temp = copia_dest.replace('.pdf', '_TEMP_MONT.pdf')
-                            self.montar_pdf(copia_dest, montado_temp, tipo_montagem)
+                            self.montar_pdf(copia_dest, montado_temp, tipo_montagem,
+                                            quantidade=quantidade, lote=lote, nome_original=nome_base + '.pdf',
+                                            sangria_mm=sangria_miolo)
                             self.converter_em_contornos(montado_temp, nome_final)
                             if os.path.exists(montado_temp): os.remove(montado_temp)
                         else:
                             nome_final = copia_dest.replace('.pdf', '_MONTADO.pdf')
-                            self.montar_pdf(copia_dest, nome_final, tipo_montagem)
+                            self.montar_pdf(copia_dest, nome_final, tipo_montagem,
+                                            quantidade=quantidade, lote=lote, nome_original=nome_base + '.pdf',
+                                            sangria_mm=sangria_miolo)
 
                         if os.path.exists(copia_dest):
                             os.remove(copia_dest)
