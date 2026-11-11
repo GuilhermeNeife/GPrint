@@ -2380,7 +2380,63 @@ class MioloTab(ttk.Frame):
             print(f"Erro detalhado: {e}")
             return False
 
+    @staticmethod
+    def _gerar_resumo_final_miolo(dados):
+        """O log e a janela final mostram os mesmos totais desta execução."""
+        d = dados
+        situacao = ('Cancelado' if d['cancelado'] else
+                    'Concluído com falhas' if d['falhas'] else 'Concluído')
+        horas, resto = divmod(d['duracao'], 3600)
+        minutos, segundos = divmod(resto, 60)
+        nao_iniciados = max(0, d['total'] - d['iniciados'])
+        tentativas = d['envios'] + d['erros_envio']
+        linhas = [
+            '=' * 56,
+            f"RESUMO FINAL DO MIOLO — {situacao.upper()}",
+            '=' * 56,
+            f"Início: {d['inicio']:%d/%m/%Y %H:%M:%S}",
+            f"Término: {d['fim']:%d/%m/%Y %H:%M:%S}",
+            f"Tempo total: {horas:02d}:{minutos:02d}:{segundos:02d}",
+            f"Operador Windows: {d['usuario']}",
+            f"Equipamento: {d['maquina']} | IP: {d['ip']}",
+            f"Modo: {'Envio automático' if d['automatico'] else 'Salvar cópias, sem envio'}",
+            f"Apenas uma cópia: {'Sim' if d['uma_copia'] else 'Não'} | Sangria: {d['sangria']:g} mm",
+            '-' * 56,
+            'ARQUIVOS E MONTAGENS',
+            f"TXT utilizados: {d['txt']}",
+            f"Arquivos na lista: {d['total']} | Iniciados: {d['iniciados']}",
+            f"Arquivos não iniciados: {nao_iniciados}",
+            f"PDFs montados com sucesso: {d['montados']}",
+            f"Arquivos que chegaram ao fim do fluxo: {d['concluidos']}",
+            f"Arquivos com erro no processamento: {d['erros']}",
+            'Montagens dos arquivos iniciados: ' + (', '.join(
+                f'{modo}: {qtd}' for modo, qtd in sorted(d['modos'].items())) or 'Nenhuma'),
+            'Filas dos arquivos iniciados: ' + (', '.join(d['filas']) or 'Nenhuma'),
+            '-' * 56,
+            'ENVIO E SALVAMENTO',
+            f"Tentativas de envio LPR: {tentativas}",
+            f"Envios aceitos pelo LPR: {d['envios']} | Falhas de envio: {d['erros_envio']}",
+            f"Cópias salvas: {d['salvos']} | Falhas ao salvar: {d['erros_salvar']}",
+            'Aceite pelo LPR não confirma a impressão física.',
+            '-' * 56,
+            f"Pasta dos PDFs montados: {d['pasta']}",
+        ]
+        if d['pastas_salvas']:
+            linhas.append('Pastas das cópias salvas:')
+            linhas.extend(f'  {pasta}' for pasta in d['pastas_salvas'])
+        if d['cancelado']:
+            linhas.append('Processamento interrompido; o último arquivo pode ter envios pendentes.')
+        if d['falhas']:
+            linhas.extend(['-' * 56, f"FALHAS REGISTRADAS: {len(d['falhas'])}"])
+            linhas.extend(f'  {falha}' for falha in d['falhas'][:10])
+            if len(d['falhas']) > 10:
+                linhas.append(f"  Mais {len(d['falhas']) - 10} falha(s); consulte o log detalhado acima.")
+        linhas.append('=' * 56)
+        return '\n'.join(linhas), situacao
+
     def _executar(self):
+        inicio_execucao = datetime.now()
+        inicio_cronometro = time.monotonic()
         desktop = os.path.join(os.path.expanduser("~"), "Desktop")
         output_dir = os.path.join(desktop, "PDFs_PROCESSADOS")
         os.makedirs(output_dir, exist_ok=True)
@@ -2399,6 +2455,16 @@ class MioloTab(ttk.Frame):
         envio_count = 0
         envio_erro_count = 0
         salvos_count = 0
+        salvos_erro_count = 0
+        montados_count = 0
+        iniciados_count = 0
+        falhas_resumo = []
+        pastas_salvas = set()
+        txt_processados = set()
+        filas_processadas = set()
+        modos_processados = {}
+        envio_automatico = bool(self.impressao_auto_var.get())
+        somente_uma_copia = bool(self.enviar_uma_copia_var.get())
         # Arquivos de entrada ficam no TEMP do usuário, jamais na pasta dos
         # PDFs finalizados. O nome exclusivo também evita colisão de sessões.
         sessao_temp = tempfile.mkdtemp(prefix="sessao_miolo_", dir=PASTA_TRABALHO)
@@ -2465,6 +2531,8 @@ class MioloTab(ttk.Frame):
                     self.log("⚠️ Processamento cancelado pelo usuário", "INFO")
                     break
                 
+                iniciados_count += 1
+                etapa_atual = 'Preparação'
                 try:
                     # Cada processo mantem a origem para log, historico e saida.
                     # A imposicao e o LPR abaixo nao sao modificados.
@@ -2472,6 +2540,9 @@ class MioloTab(ttk.Frame):
                     lote = os.path.dirname(origem_txt) if origem_txt else "desconhecido"
                     pilha = os.path.splitext(os.path.basename(origem_txt))[0] if origem_txt else "desconhecido"
                     numero_txt = p.get("TXT_NUMERO", 1)
+                    txt_processados.add(origem_txt or 'TXT não informado')
+                    filas_processadas.add(p['FORMATO'])
+                    modos_processados[p['MODO']] = modos_processados.get(p['MODO'], 0) + 1
                     # Com varios TXT, isola os PDFs por arquivo de entrada:
                     # nomes NOMEFIC iguais nao se sobrescrevem.
                     pasta_saida_txt = os.path.join(pasta_lote, f"TXT_{numero_txt:02d}") if varios_txt else pasta_lote
@@ -2489,6 +2560,7 @@ class MioloTab(ttk.Frame):
                     if not os.path.exists(origem):
                         self.log(f"Arquivo não encontrado: {origem}", "ERRO")
                         error_count += 1
+                        falhas_resumo.append(f"TXT {numero_txt} | {p['ARQUIVO']}: arquivo não encontrado")
                         continue
                 
                     local = os.path.join(sessao_temp, f"TXT{numero_txt:02d}_L{p['LINHA']}_{p['ARQUIVO']}")
@@ -2498,6 +2570,7 @@ class MioloTab(ttk.Frame):
                     output_path = os.path.join(pasta_saida_txt, f"{p['NOMEFIC']}.pdf")
                     w_pt, h_pt = p["LARGURA_MM"] * MM, p["ALTURA_MM"] * MM
                 
+                    etapa_atual = 'Montagem'
                     self.log(f"⚙️ Gerando PDF montado...", "INFO")
                 
                     if p["MODO"] == "dois_na_folha":
@@ -2515,6 +2588,10 @@ class MioloTab(ttk.Frame):
                     else:
                         um_na_folha(local, output_path, w_pt, h_pt, sangria_mm=sangria_mm)
                 
+                    if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+                        raise RuntimeError('A montagem não gerou um PDF válido.')
+                    montados_count += 1
+                    etapa_atual = 'Finalização/envio'
                     self.log(f"✅ PDF gerado: {os.path.basename(output_path)}", "SUCESSO")
                 
                     # Quantidade de envios conforme o modo de montagem
@@ -2526,7 +2603,7 @@ class MioloTab(ttk.Frame):
                         self.log(f"🔢 Modo {p['MODO']}: {p['QTD']} exemplares -> {qtd_envios} envios", "INFO")
 
                     # Forçar apenas uma cópia caso a opção esteja marcada
-                    if self.enviar_uma_copia_var.get():
+                    if somente_uma_copia:
                         self.log("📌 Opção 'Enviar apenas uma cópia' ativada. Enviando 1 cópia.", "INFO")
                         qtd_envios = 1
                     
@@ -2583,7 +2660,7 @@ class MioloTab(ttk.Frame):
                                     raise Exception("Arquivo não liberou para leitura")
                                 time.sleep(0.5)
 
-                        if self.impressao_auto_var.get():
+                        if envio_automatico:
                             self.log("🖨️ Impressão automática ativada", "INFO")
                             sucesso = self.enviar_por_lpr(
                                 output_path,
@@ -2602,6 +2679,8 @@ class MioloTab(ttk.Frame):
                                 envio_erro_count += 1
                                 status = "Falha no envio"
                                 erro = "Falha no envio via LPR"
+                                falhas_resumo.append(
+                                    f"TXT {numero_txt} | {p['ARQUIVO']} | envio {copia_num}/{qtd_envios}: {erro}")
                                 envio_ok_val = 0
                         else:
                             # MODO DESLIGADO: SALVA O PDF
@@ -2614,6 +2693,7 @@ class MioloTab(ttk.Frame):
                                 shutil.copy2(output_path, destino)
                                 self.log(f"✅ PDF salvo: {destino}", "SUCESSO")
                                 salvos_count += 1
+                                pastas_salvas.add(pasta_salvos)
                                 sucesso = True
                                 status = "Salvo"
                                 erro = ""
@@ -2622,6 +2702,9 @@ class MioloTab(ttk.Frame):
                                 sucesso = False
                                 status = "Falha ao salvar"
                                 erro = str(e)
+                                salvos_erro_count += 1
+                                falhas_resumo.append(
+                                    f"TXT {numero_txt} | {p['ARQUIVO']} | cópia {copia_num}: {erro}")
                             envio_ok_val = 0   # salvar não conta como envio real
 
                         # ===== REGISTRO DE ENVIO/SALVAMENTO =====
@@ -2649,11 +2732,14 @@ class MioloTab(ttk.Frame):
 
                         time.sleep(1.5)
                 
-                    success_count += 1
+                    if self.processando:
+                        success_count += 1
                
                 except Exception as e:
                     self.log(f"❌ Erro: {str(e)}", "ERRO")
                     error_count += 1
+                    falhas_resumo.append(
+                        f"TXT {p.get('TXT_NUMERO', 1)} | {p.get('ARQUIVO', '?')} | {etapa_atual}: {e}")
                     logging.error(f"Erro detalhado: {e}", exc_info=True)
                 
                     # ===== REGISTRO DE FALHA NA MONTAGEM =====
@@ -2691,25 +2777,38 @@ class MioloTab(ttk.Frame):
             emitir_log=lambda msg: self.log(msg, "INFO")
         )
 
-        self.log(f"\n{'='*50}", "INFO")
-        self.log(f"📊 RESUMO FINAL", "INFO")
-        self.log(f"{'='*50}", "INFO")
-        self.log(f"✅ Montagens com sucesso: {success_count}", "SUCESSO")
-        self.log(f"❌ Montagens com erro: {error_count}", "ERRO" if error_count > 0 else "INFO")
-        self.log(f"🚀 Envios com sucesso: {envio_count}", "SUCESSO")
-        self.log(f"❌ Envios com erro: {envio_erro_count}", "ERRO" if envio_erro_count > 0 else "INFO")
-        self.log(f"💾 PDFs salvos (envio desligado): {salvos_count}", "INFO")
-        self.log(f"{'='*50}", "INFO")
-        
-        self.status_var.set(f"Concluído: {success_count} OK, {error_count} Erros | Enviados: {envio_count} | Salvos: {salvos_count}")
-        
+        cancelado = not self.processando
+        fim_execucao = datetime.now()
+        duracao = max(0, int(time.monotonic() - inicio_cronometro))
+        resumo_dados = {
+            'cancelado': cancelado, 'inicio': inicio_execucao, 'fim': fim_execucao,
+            'duracao': duracao, 'total': len(self.processos), 'iniciados': iniciados_count,
+            'montados': montados_count, 'concluidos': success_count, 'erros': error_count,
+            'envios': envio_count, 'erros_envio': envio_erro_count,
+            'salvos': salvos_count, 'erros_salvar': salvos_erro_count,
+            'txt': len(txt_processados), 'filas': sorted(filas_processadas),
+            'modos': modos_processados, 'maquina': impressora_selecionada,
+            'ip': ip_extraido, 'usuario': usuario, 'sangria': sangria_mm,
+            'automatico': envio_automatico, 'uma_copia': somente_uma_copia,
+            'pasta': pasta_lote, 'pastas_salvas': sorted(pastas_salvas),
+            'falhas': falhas_resumo,
+        }
+        resumo_final, situacao = self._gerar_resumo_final_miolo(resumo_dados)
+        nivel = 'ERRO' if falhas_resumo else 'INFO'
+        for linha_resumo in resumo_final.splitlines():
+            self.log(linha_resumo, nivel)
+        self.status_var.set(
+            f"{situacao}: {montados_count}/{len(self.processos)} montados | "
+            f"LPR: {envio_count} OK / {envio_erro_count} falhas | "
+            f"Salvos: {salvos_count} | Tempo: {duracao // 60:02d}:{duracao % 60:02d}")
+
         self.processando = False
         self.after(0, self.indicadores_miolo.finalizar)
         self.btn_processar.config(state='normal', text='▶ Processar e Enviar')
         self.btn_select.config(state='normal')
         # Exibe o andamento concluido ate a proxima execucao.
-        self.progress['value'] = len(self.processos)
-        self.progress_label.config(text=f"{len(self.processos)}/{len(self.processos)}")
+        self.progress['value'] = iniciados_count
+        self.progress_label.config(text=f"{iniciados_count}/{len(self.processos)}")
         
         for child in self.winfo_children():
             if isinstance(child, ttk.Frame):
@@ -2719,14 +2818,8 @@ class MioloTab(ttk.Frame):
                             if isinstance(btn, ttk.Button) and btn['text'] == '🔄 Cancelar':
                                 btn.config(state='disabled')
         
-        messagebox.showinfo("Concluído", 
-                        f"Processamento Finalizado!\n\n"
-                        f"✅ Montagens: {success_count}\n"
-                        f"❌ Erros: {error_count}\n"
-                        f"🚀 Envios: {envio_count}\n"
-                        f"💾 PDFs salvos: {salvos_count}\n"
-                        f"📁 Pasta: {pasta_lote}\n"
-                        f"📂 Salvos em: {(pasta_lote if varios_txt else pasta_salvos) if salvos_count else 'Nenhuma cópia manual'}")
+        exibir_resumo = messagebox.showwarning if cancelado or falhas_resumo else messagebox.showinfo
+        exibir_resumo(f'GPrint - Miolo: {situacao}', resumo_final)
 
 
     def selecionar_txt(self):
@@ -5860,7 +5953,7 @@ class RefazerTab(ttk.Frame):
     # ---------- CONFIGURAÇÕES (agora atributos da classe) ----------
     CAMINHO_CAPAS_POD_AGRUPADAS = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\_CAPAS DE POD AGRUPADAS"
     CAMINHO_UICLAP_LOTES = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\UICLAP\LOTES"
-    CAMINHO_UICLAP_LOTES_NOVO= r"\\Sp-dek-srvap-07\api_docuprint"
+    CAMINHO_UICLAP_LOTES_NOVO = r"\\Sp-dek-srvap-07\api_docuprint"
     CAMINHO_RELATORIOS_PERDA = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\_CAPAS DE POD AGRUPADAS\Z_RELATÓRIOS\RELATÓRIOS DE PERDA.xlsx"
     GS_PATH = r"C:\Ghostscript\gswin64c.exe"
 
@@ -5890,6 +5983,8 @@ class RefazerTab(ttk.Frame):
         self.lista_completa = []
         self.pasta_var = tk.StringVar()
         self.subpasta_var = tk.StringVar()
+        self.busca_lote_var = tk.StringVar()
+        self.lotes_disponiveis = []
         self.operador_var = tk.StringVar()
         self.filtro_var = tk.StringVar()
         self.idx_capa = -1
@@ -6134,7 +6229,8 @@ class RefazerTab(ttk.Frame):
         if sangria_mm is None:
             sangria_mm = obter_sangria_padrao_miolo()
         nome = os.path.splitext(os.path.basename(nome_original or entrada))[0]
-        identificacao = f'LOTE_{lote}_{nome}' if lote else nome
+        lote_curto = self._identificacao_lote(lote)
+        identificacao = f'LOTE_{lote_curto}_{nome}' if lote_curto else nome
         identificacao = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', identificacao).strip(' .')
         # Limita somente a cópia temporária, preservando o lote no início.
         identificacao = identificacao[:160].rstrip(' .') or 'GPrint'
@@ -6253,6 +6349,61 @@ class RefazerTab(ttk.Frame):
                 return i
         return -1
 
+    @staticmethod
+    def _cliente_uiclap(cliente):
+        return str(cliente).strip().lower().replace('_', ' ') in ('uiclap', 'uiclap antigo')
+
+    def _pasta_cliente_refazer(self, cliente):
+        """Uma única regra de caminho para listar, buscar, copiar e processar."""
+        chave = str(cliente).strip().lower().replace('_', ' ')
+        if chave == 'uiclap':
+            return self.CAMINHO_UICLAP_LOTES_NOVO
+        if chave == 'uiclap antigo':
+            return self.CAMINHO_UICLAP_LOTES
+        return os.path.join(self.CAMINHO_CAPAS_POD_AGRUPADAS, cliente)
+
+    def obter_lista_arquivos_da_pasta(self, pasta):
+        """UICLAP novo: PDFs na raiz do lote, sem depender de planilha."""
+        lista = []
+        with os.scandir(pasta) as entradas:
+            nomes = sorted((e.name for e in entradas
+                            if e.is_file() and e.name.lower().endswith('.pdf')),
+                           key=str.casefold)
+        for nome in nomes:
+            tipo_match = re.search(r'(?:^|[\s_()\-])(capa|miolo)(?=$|[\s_()\-])',
+                                   os.path.splitext(nome)[0], re.IGNORECASE)
+            if not tipo_match:
+                continue
+            tipo = tipo_match.group(1).upper()
+            prefixo = nome[:tipo_match.start(1)].strip(' -_').casefold()
+            restante = nome[tipo_match.end(1):].lstrip(' -_')
+            codigo_match = re.match(r'(\d+)(?:v\d+)?(?=$|[\s_\-])', restante, re.IGNORECASE)
+            codigo = codigo_match.group(1) if codigo_match else 'N/A'
+            formato = re.search(r'(\d+(?:[.,]\d+)?)\s*[xX]\s*(\d+(?:[.,]\d+)?)', restante)
+            # Sem Excel, brochura é o padrão do retrabalho. Grampo explícito
+            # no nome mantém sua montagem própria.
+            acabamento = 'Grampo' if re.search(r'\b(?:grampo|grampeado)\b', nome, re.IGNORECASE) else 'Brochura'
+            lista.append({
+                'nome': nome, 'tipo': tipo, 'linha': (), 'codigo': codigo,
+                'caminho_fisico': os.path.join(pasta, nome),
+                'acabamento': acabamento,
+                'formato_miolo': formato.group(0) if formato else None,
+                '_chave_par': (prefixo, codigo),
+            })
+        # Pareia somente quando há um único arquivo do outro tipo no lote.
+        # A lista é completa antes de aplicar o filtro digitado pelo operador.
+        pares = {}
+        for item in lista:
+            if item['codigo'] != 'N/A':
+                pares.setdefault((item['_chave_par'], item['tipo']), []).append(item)
+        for item in lista:
+            outro_tipo = 'MIOLO' if item['tipo'] == 'CAPA' else 'CAPA'
+            candidatos = pares.get((item['_chave_par'], outro_tipo), [])
+            if len(candidatos) == 1:
+                item['arquivo_relacionado'] = candidatos[0]['caminho_fisico']
+            item.pop('_chave_par', None)
+        return lista
+
     def obter_lista_arquivos_da_planilha(self, caminho_excel, cliente):
         wb = openpyxl.load_workbook(caminho_excel, data_only=True)
         ws = wb.active
@@ -6260,7 +6411,7 @@ class RefazerTab(ttk.Frame):
         idx_miolo = self.obter_indice_coluna(ws, "ARQUIVO MIOLO")
         idx_caminho = self.obter_indice_coluna(ws, "CAMINHO DO ARQUIVO")
 
-        if cliente == "uiclap":
+        if self._cliente_uiclap(cliente):
             idx_acabamento = self.obter_indice_coluna(ws, "Acabamento")
             idx_formato_miolo = self.obter_indice_coluna(ws, "FORMATO MIOLO")
         else:
@@ -6293,12 +6444,7 @@ class RefazerTab(ttk.Frame):
     def copiar_para_refazer(self, origem, cliente, lote, tipo):
         if not os.path.exists(origem):
             return None
-        if cliente == "uiclap":
-            destino_dir = os.path.join(self.CAMINHO_UICLAP_LOTES, lote, "REFAZER", tipo)
-        elif cliente == "uiclap_antigo":
-            destino_dir = os.path.join(self.CAMINHO_UICLAP_LOTES_NOVO, lote, "REFAZER", tipo)
-        else:
-            destino_dir = os.path.join(self.CAMINHO_CAPAS_POD_AGRUPADAS, cliente, lote, "REFAZER", tipo)
+        destino_dir = os.path.join(self._pasta_cliente_refazer(cliente), lote, "REFAZER", tipo)
         os.makedirs(destino_dir, exist_ok=True)
         destino = os.path.join(destino_dir, os.path.basename(origem))
         try:
@@ -6386,9 +6532,17 @@ class RefazerTab(ttk.Frame):
         self.cb_cliente.bind("<<ComboboxSelected>>", self.on_cliente_change)
 
         ttk.Label(top, text="Lote").grid(row=0, column=2, padx=5, pady=5, sticky="w")
-        self.cb_lote = ttk.Combobox(top, textvariable=self.subpasta_var)
-        self.cb_lote.grid(row=0, column=3, padx=5, pady=5, sticky="ew")
+        campo_lote = ttk.Frame(top)
+        campo_lote.grid(row=0, column=3, padx=5, pady=5, sticky="ew")
+        campo_lote.columnconfigure(2, weight=1)
+        ttk.Label(campo_lote, text="Buscar nº").grid(row=0, column=0, padx=(0, 4))
+        busca_lote = ttk.Entry(campo_lote, textvariable=self.busca_lote_var, width=10)
+        busca_lote.grid(row=0, column=1, padx=(0, 6))
+        busca_lote.bind("<Return>", self._confirmar_busca_lote)
+        self.cb_lote = ttk.Combobox(campo_lote, textvariable=self.subpasta_var, state="readonly")
+        self.cb_lote.grid(row=0, column=2, sticky="ew")
         self.cb_lote.bind("<<ComboboxSelected>>", self.on_lote_change)
+        self.busca_lote_var.trace_add("write", self._filtrar_lotes)
 
         ttk.Label(top, text="Operador").grid(row=1, column=0, padx=5, pady=5, sticky="w")
         self.cb_operador = ttk.Combobox(top, values=[], textvariable=self.operador_var, state='readonly')
@@ -6680,6 +6834,12 @@ class RefazerTab(ttk.Frame):
         return plano
 
     @staticmethod
+    def _identificacao_lote(lote):
+        texto = str(lote or '').strip()
+        numero = re.match(r'^([0-9]+)(?=$|[\s_\-\[])', texto)
+        return numero.group(1) if numero else texto
+
+    @staticmethod
     def _nome_trabalho_refazer(nome_pdf, lote=''):
         """Identificação curta e ASCII para compatibilidade com o LPR do Windows.
 
@@ -6690,7 +6850,8 @@ class RefazerTab(ttk.Frame):
         base = os.path.splitext(os.path.basename(nome_pdf))[0]
         ascii_nome = unicodedata.normalize('NFKD', base).encode('ascii', 'ignore').decode('ascii')
         ascii_nome = re.sub(r'[^A-Za-z0-9_.-]+', '_', ascii_nome).strip('_.-')
-        lote_ascii = unicodedata.normalize('NFKD', str(lote)).encode('ascii', 'ignore').decode('ascii')
+        lote_curto = RefazerTab._identificacao_lote(lote)
+        lote_ascii = unicodedata.normalize('NFKD', lote_curto).encode('ascii', 'ignore').decode('ascii')
         lote_ascii = re.sub(r'[^A-Za-z0-9_.-]+', '_', lote_ascii).strip('_.-')
         identidade = f'{lote}|{base}' if lote else base
         sufixo = hashlib.sha1(identidade.encode('utf-8')).hexdigest()[:6]
@@ -6798,21 +6959,45 @@ class RefazerTab(ttk.Frame):
 
     def atualizar_subpastas(self, event=None):
         cliente = self.pasta_var.get()
-        if cliente == "uiclap":
-            base = self.CAMINHO_UICLAP_LOTES
-        else:
-            base = os.path.join(self.CAMINHO_CAPAS_POD_AGRUPADAS, cliente)
-        lotes = self.listar_pastas(base, reverse=True)
-        self.cb_lote["values"] = lotes
-        if lotes:
+        base = self._pasta_cliente_refazer(cliente)
+        self.lotes_disponiveis = self.listar_pastas(base, reverse=True)
+        self.busca_lote_var.set("")
+        if self.lotes_disponiveis:
             self.cb_lote.current(0)
         else:
             self.cb_lote.set("")
 
+    def _filtrar_lotes(self, *_):
+        termo = self.busca_lote_var.get().strip().casefold()
+        if not termo:
+            lotes = self.lotes_disponiveis
+        elif termo.isdecimal():
+            lotes = [lote for lote in self.lotes_disponiveis
+                     if self._identificacao_lote(lote).startswith(termo)]
+            lotes.sort(key=lambda lote: self._identificacao_lote(lote) != termo)
+        else:
+            lotes = [lote for lote in self.lotes_disponiveis if termo in lote.casefold()]
+        self.cb_lote["values"] = lotes
+
+    def _confirmar_busca_lote(self, event=None):
+        termo = self.busca_lote_var.get().strip()
+        lotes = self.cb_lote["values"]
+        exatos = [lote for lote in lotes if self._identificacao_lote(lote) == termo]
+        if len(exatos) == 1 or len(lotes) == 1:
+            self.cb_lote.set(exatos[0] if len(exatos) == 1 else lotes[0])
+            self.on_lote_change()
+        elif lotes:
+            self.cb_lote.focus_set()
+            self.cb_lote.event_generate("<Down>")
+        else:
+            messagebox.showinfo('GPrint - Refazer', 'Nenhum lote corresponde à busca.', parent=self)
+        return "break"
+
     def carregar_clientes(self):
         clientes = self.listar_pastas(self.CAMINHO_CAPAS_POD_AGRUPADAS)
-        clientes.append("uiclap")
-        clientes.append("uiclap_antigo")
+        # Evita duplicar os atalhos caso exista uma pasta com o mesmo nome.
+        clientes = [c for c in clientes if not self._cliente_uiclap(c)]
+        clientes.extend(["uiclap", "uiclap antigo"])
         self.cb_cliente["values"] = clientes
         if clientes:
             self.cb_cliente.current(0)
@@ -6823,36 +7008,46 @@ class RefazerTab(ttk.Frame):
         lote = self.subpasta_var.get()
         if not cliente or not lote:
             return
-        if cliente == "uiclap":
-            pasta = os.path.join(self.CAMINHO_UICLAP_LOTES, lote)
-        else:
-            pasta = os.path.join(self.CAMINHO_CAPAS_POD_AGRUPADAS, cliente, lote)
-        arquivos_excel = [f for f in os.listdir(pasta) if f.lower().endswith(".xlsx")]
-        planilha = None
-        for arq in arquivos_excel:
-            caminho = os.path.join(pasta, arq)
+        pasta = os.path.join(self._pasta_cliente_refazer(cliente), lote)
+        if str(cliente).strip().lower() == 'uiclap':
+            # Não reutiliza índices de uma planilha carregada anteriormente.
+            self.idx_capa = self.idx_miolo = self.idx_caminho = -1
             try:
-                wb = openpyxl.load_workbook(caminho, data_only=True)
-                ws = wb.active
-                if self.obter_indice_coluna(ws, "ARQUIVO CAPA") != -1 or self.obter_indice_coluna(ws, "ARQUIVO MIOLO") != -1:
-                    planilha = caminho
+                self.lista_completa = self.obter_lista_arquivos_da_pasta(pasta)
+            except OSError as exc:
+                self.lista_completa = []
+                for iid in self.tree_selecao.get_children():
+                    self.tree_selecao.delete(iid)
+                messagebox.showerror('GPrint - Refazer',
+                                     f'Não foi possível acessar a pasta do lote:\n{exc}', parent=self)
+                return
+        else:
+            arquivos_excel = [f for f in os.listdir(pasta) if f.lower().endswith(".xlsx")]
+            planilha = None
+            for arq in arquivos_excel:
+                caminho = os.path.join(pasta, arq)
+                try:
+                    wb = openpyxl.load_workbook(caminho, data_only=True)
+                    ws = wb.active
+                    if self.obter_indice_coluna(ws, "ARQUIVO CAPA") != -1 or self.obter_indice_coluna(ws, "ARQUIVO MIOLO") != -1:
+                        planilha = caminho
+                        wb.close()
+                        break
                     wb.close()
-                    break
-                wb.close()
-            except:
-                pass
-        if not planilha:
-            messagebox.showerror("Erro", "Planilha não encontrada.", parent=self)
-            return
+                except:
+                    pass
+            if not planilha:
+                messagebox.showerror("Erro", "Planilha não encontrada.", parent=self)
+                return
 
-        wb = openpyxl.load_workbook(planilha, data_only=True)
-        ws = wb.active
-        self.idx_capa = self.obter_indice_coluna(ws, "ARQUIVO CAPA")
-        self.idx_miolo = self.obter_indice_coluna(ws, "ARQUIVO MIOLO")
-        self.idx_caminho = self.obter_indice_coluna(ws, "CAMINHO DO ARQUIVO")
-        wb.close()
+            wb = openpyxl.load_workbook(planilha, data_only=True)
+            ws = wb.active
+            self.idx_capa = self.obter_indice_coluna(ws, "ARQUIVO CAPA")
+            self.idx_miolo = self.obter_indice_coluna(ws, "ARQUIVO MIOLO")
+            self.idx_caminho = self.obter_indice_coluna(ws, "CAMINHO DO ARQUIVO")
+            wb.close()
 
-        self.lista_completa = self.obter_lista_arquivos_da_planilha(planilha, cliente)
+            self.lista_completa = self.obter_lista_arquivos_da_planilha(planilha, cliente)
         filtro = self.filtro_var.get().strip().lower()
         if filtro:
             filtros = [x.strip() for x in filtro.split(",")]
@@ -6874,14 +7069,14 @@ class RefazerTab(ttk.Frame):
             self.tree_edicao.delete(item)
         self._tipos_por_linha.clear()
         cliente = self.pasta_var.get()
-        coluna_codigo = 8 if cliente == "uiclap" else 3
+        coluna_codigo = 8 if self._cliente_uiclap(cliente) else 3
         for iid in selecionados:
             nome = self.tree_selecao.item(iid, "values")[0]
             item = next((x for x in self.lista_completa if x["nome"] == nome), None)
             if not item:
                 continue
             linha = item["linha"]
-            codigo = "N/A"
+            codigo = item.get("codigo", "N/A")
             if coluna_codigo < len(linha):
                 codigo = linha[coluna_codigo]
             tipo = item['tipo']
@@ -7099,12 +7294,7 @@ class RefazerTab(ttk.Frame):
         if not cliente or not lote:
             return
         data_hora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-        if cliente == "uiclap_antigo":
-            pasta_lote = os.path.join(self.CAMINHO_UICLAP_LOTES, lote)
-        elif cliente == "uiclap":
-            pasta_lote = os.path.join(self.CAMINHO_UICLAP_LOTES_NOVO, lote)
-        else:
-            pasta_lote = os.path.join(self.CAMINHO_CAPAS_POD_AGRUPADAS, cliente, lote)
+        pasta_lote = os.path.join(self._pasta_cliente_refazer(cliente), lote)
 
         if not operador:
             messagebox.showwarning('GPrint - Refazer',
@@ -7179,16 +7369,20 @@ class RefazerTab(ttk.Frame):
 
             # Copia o outro tipo (miolo/capa) se existir
             tipo_outro = "MIOLO" if tipo_atual == "CAPA" else "CAPA"
-            idx_nome_outro = self.idx_miolo if tipo_atual == "CAPA" else self.idx_capa
-            if idx_nome_outro != -1 and idx_nome_outro < len(linha):
-                nome_outro = str(linha[idx_nome_outro]).strip() if linha[idx_nome_outro] else None
-                if nome_outro:
-                    caminho_outro = None
-                    if self.idx_caminho != -1 and self.idx_caminho < len(linha) and linha[self.idx_caminho]:
-                        caminho_outro = os.path.join(str(linha[self.idx_caminho]).strip(), nome_outro)
-                    else:
-                        caminho_outro = os.path.join(pasta_lote, nome_outro)
-                    self.copiar_para_refazer(caminho_outro, cliente, lote, tipo_outro)
+            caminho_relacionado = item_original.get('arquivo_relacionado')
+            if caminho_relacionado:
+                self.copiar_para_refazer(caminho_relacionado, cliente, lote, tipo_outro)
+            else:
+                idx_nome_outro = self.idx_miolo if tipo_atual == "CAPA" else self.idx_capa
+                if idx_nome_outro != -1 and idx_nome_outro < len(linha):
+                    nome_outro = str(linha[idx_nome_outro]).strip() if linha[idx_nome_outro] else None
+                    if nome_outro:
+                        caminho_outro = None
+                        if self.idx_caminho != -1 and self.idx_caminho < len(linha) and linha[self.idx_caminho]:
+                            caminho_outro = os.path.join(str(linha[self.idx_caminho]).strip(), nome_outro)
+                        else:
+                            caminho_outro = os.path.join(pasta_lote, nome_outro)
+                        self.copiar_para_refazer(caminho_outro, cliente, lote, tipo_outro)
 
             # Registros gravados no refazer.db. Excel de perdas nao e mais atualizado.
             # Sera contado somente apos a preparacao final da capa/miolo.
@@ -7206,9 +7400,9 @@ class RefazerTab(ttk.Frame):
             self.update_idletasks()
             for idx, (destino, nome_base, setor_capa, destino_impressao, registro_id) in enumerate(copias_capas, start=1):
                 try:
-                    self.adicionar_marca_dagua(destino, f'LOTE {lote} - {nome_base}')
+                    self.adicionar_marca_dagua(destino, f'LOTE {self._identificacao_lote(lote)} - {nome_base}')
                     if setor_capa == "PROBLEMA DE FONTE":
-                        temp_outlines = destino.replace('.pdf', '_TEMP_OUTLINES.pdf')
+                        temp_outlines = os.path.splitext(destino)[0] + '_TEMP_OUTLINES.pdf'
                         self.converter_em_contornos(destino, temp_outlines)
                         os.replace(temp_outlines, destino)
                     self.repositorio_refazer.registrar(
@@ -7256,23 +7450,23 @@ class RefazerTab(ttk.Frame):
 
                     if tipo_montagem:
                         if setor_item == "PRE-IMPRESSÃO":
-                            nome_final = copia_dest.replace('.pdf', '_MONTADO_REDUZIDO.pdf')
-                            reduzido_temp = copia_dest.replace('.pdf', '_TEMP_RED.pdf')
+                            nome_final = os.path.splitext(copia_dest)[0] + '_MONTADO_REDUZIDO.pdf'
+                            reduzido_temp = os.path.splitext(copia_dest)[0] + '_TEMP_RED.pdf'
                             self.comprimir_pdf(copia_dest, reduzido_temp)
                             self.montar_pdf(reduzido_temp, nome_final, tipo_montagem,
                                             quantidade=quantidade, lote=lote, nome_original=nome_base + '.pdf',
                                             sangria_mm=sangria_miolo)
                             if os.path.exists(reduzido_temp): os.remove(reduzido_temp)
                         elif setor_item == "PROBLEMA DE FONTE":
-                            nome_final = copia_dest.replace('.pdf', '_MONTADO_CURVAS.pdf')
-                            montado_temp = copia_dest.replace('.pdf', '_TEMP_MONT.pdf')
+                            nome_final = os.path.splitext(copia_dest)[0] + '_MONTADO_CURVAS.pdf'
+                            montado_temp = os.path.splitext(copia_dest)[0] + '_TEMP_MONT.pdf'
                             self.montar_pdf(copia_dest, montado_temp, tipo_montagem,
                                             quantidade=quantidade, lote=lote, nome_original=nome_base + '.pdf',
                                             sangria_mm=sangria_miolo)
                             self.converter_em_contornos(montado_temp, nome_final)
                             if os.path.exists(montado_temp): os.remove(montado_temp)
                         else:
-                            nome_final = copia_dest.replace('.pdf', '_MONTADO.pdf')
+                            nome_final = os.path.splitext(copia_dest)[0] + '_MONTADO.pdf'
                             self.montar_pdf(copia_dest, nome_final, tipo_montagem,
                                             quantidade=quantidade, lote=lote, nome_original=nome_base + '.pdf',
                                             sangria_mm=sangria_miolo)
@@ -7282,7 +7476,7 @@ class RefazerTab(ttk.Frame):
                         arquivo_final_refazer = nome_final
                     else:
                         if setor_item == "PROBLEMA DE FONTE":
-                            nome_final = copia_dest.replace('.pdf', '_CURVAS.pdf')
+                            nome_final = os.path.splitext(copia_dest)[0] + '_CURVAS.pdf'
                             self.converter_em_contornos(copia_dest, nome_final)
                             if os.path.exists(copia_dest): os.remove(copia_dest)
                             arquivo_final_refazer = nome_final
