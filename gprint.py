@@ -4295,22 +4295,24 @@ def grampo(input_path, output_path, output_width, output_height,
             pass
 
     return True
-def gprint_reservar_destino_capa(pasta_destino, identific, arquivo_txt):
+def gprint_reservar_destino_capa(pasta_destino, identific, fila):
     """Reserva um nome para o PDF final sem sobrescrever arquivos existentes.
 
-    Mantem o nome original IDENTIFIC.pdf, acrescentando _1, _2, _3...
-    somente quando ja houver um PDF com o mesmo nome na pasta.
+    Usa IDENTIFIC_FILA.pdf e acrescenta _1, _2, _3... em caso de colisao.
     A reserva O_EXCL evita que duas estacoes escolham o mesmo destino.
-    O arquivo_txt permanece na assinatura para compatibilidade com o fluxo.
     """
     nome_base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', str(identific)).strip(' .') or 'sem_nome'
+    nome_fila = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', fila).strip(' .')
 
     # Guarda margem para extensao e sufixo, considerando caminhos do Windows.
     limite = min(190, max(32, 240 - len(os.path.abspath(pasta_destino))))
-    nome_base = nome_base[:limite]
+    # Mantem a fila legivel mesmo quando a identificacao precisa ser truncada.
+    sufixo_fila = f'_{nome_fila[:limite - 8]}' if nome_fila else ''
 
     for numero in range(0, 10001):
-        sufixo = '' if numero == 0 else f'_{numero}'
+        sufixo = sufixo_fila
+        if numero:
+            sufixo += f'_{numero}'
         nome = f"{nome_base[:limite-len(sufixo)]}{sufixo}.pdf"
         caminho = os.path.join(pasta_destino, nome)
         try:
@@ -4750,6 +4752,8 @@ class Application:
                         identific = linha["IDENTIFIC"]
                         nomefic = linha["NOMEFIC"]
                         filacolor = linha["FILACOLOR"]
+                        fila_frente_verso = filacolor.upper().endswith("_FV")
+                        formato_capa = filacolor[:-3] if fila_frente_verso else filacolor
                         
                         nome_arquivo, extensao = os.path.splitext(linha["ARQUIVO"])
                         # Subpasta exclusiva por item evita substituir PDFs de entrada
@@ -4759,13 +4763,22 @@ class Application:
                         shutil.copy(caminho_origem, temp_file)
                         
                         if temp_file.lower().endswith(".pdf"):
+                            # Conta cada PDF antes de multiplicar as cópias e agrupar as capas.
+                            with fitz.open(temp_file) as capa:
+                                paginas_capa = capa.page_count
+                            if paginas_capa > 1:
+                                filacolor = f"{formato_capa}_FV"
+                                self.adicionar_log(
+                                    f"↔️ Capa frente e verso ({paginas_capa} páginas): "
+                                    f"{linha['ARQUIVO']} → {filacolor}"
+                                )
                             self.adicionar_log(f"Adicionando marca d'água em {linha['ARQUIVO']}")
                             pdf_marcado = adicionar_marca_dagua(
                                 temp_file,
                                 linha["LAMINAÇÃO"], 
                                 linha["CODIGOACAB"], 
                                 identific,
-                                linha["FILACOLOR"]
+                                formato_capa
                             )
                             if pdf_marcado:
                                 chave = (os.path.abspath(arquivo_txt), identific, filacolor)
@@ -4812,6 +4825,13 @@ class Application:
                 pasta_destino = os.path.dirname(arquivo_txt)
                 pilha_txt = os.path.splitext(os.path.basename(arquivo_txt))[0]
                 total_montagens = totais_montagem.get(chave, 0)
+                frente_verso = filacolor.upper().endswith('_FV')
+                total_saida = f'TOTAL_{total_montagens}'
+                identific_saida, total_substituido = re.subn(
+                    r'(?<![A-Za-z0-9])TOTAL[ _-]+[0-9]+(?![A-Za-z0-9])',
+                    total_saida, identific, count=1, flags=re.IGNORECASE)
+                if not total_substituido:
+                    identific_saida = f'{identific}_{total_saida}' if identific else total_saida
                 
                 percentual = 80 + ((identifics_processados / total_identifics) * 20)
                 texto = f"Agrupando PDFs... ({identifics_processados + 1}/{total_identifics})"
@@ -4823,8 +4843,10 @@ class Application:
                 self.mesclar_pdfs(lista_pdfs, nome_temp, filacolor)
                 if not os.path.isfile(nome_temp) or os.path.getsize(nome_temp) == 0:
                     raise RuntimeError(f"Mesclagem nao gerou PDF valido para {pilha_txt}: {identific}")
+                with fitz.open(nome_temp) as pdf_mesclado:
+                    total_paginas = pdf_mesclado.page_count
 
-                nome_final = gprint_reservar_destino_capa(pasta_destino, identific, arquivo_txt)
+                nome_final = gprint_reservar_destino_capa(pasta_destino, identific_saida, filacolor)
                 try:
                     shutil.move(nome_temp, nome_final)
                 except Exception:
@@ -4835,6 +4857,9 @@ class Application:
                         pass
                     raise
                 self.adicionar_log(f"✅ Arquivo gerado para TXT {pilha_txt}: {nome_final}")
+                self.adicionar_log(
+                    f"   Fila: {filacolor} | Capas: {total_montagens} | Páginas: {total_paginas}"
+                )
 
                 # A mesclagem final e uma etapa separada do preparo das capas
                 # e do envio LPR. Nao altera o arquivo nem a rotina de envio.
@@ -4858,9 +4883,12 @@ class Application:
                 })
 
                 if self.imprimir_automaticamente.get():
+                    titulo_impressao = identific_saida
+                    if frente_verso and not titulo_impressao.upper().endswith('_FV'):
+                        titulo_impressao += '_FV'
                     sucesso = self.enviar_para_impressora(
                         nome_final,
-                        f"{identific}.pdf",  # Mantem o titulo do trabalho LPR original.
+                        f"{titulo_impressao}.pdf",
                         filacolor
                     )
                     
@@ -5191,6 +5219,26 @@ def ler_arquivo_txt(caminho_txt):
         logging.error(f"Erro ao ler arquivo {caminho_txt}: {e}")
         messagebox.showerror("Erro", f"Não foi possível ler o arquivo {os.path.basename(caminho_txt)}")
         return []
+def referencia_capa(pagina):
+    """Obtém a apara, a área de arte ou os limites dos elementos impressos."""
+    area = pagina.rect
+    origem = pagina.cropbox_position
+    para_area_visivel = fitz.Matrix(1, 0, 0, 1, -origem.x, -origem.y)
+    for chave, caixa in (("TrimBox", pagina.trimbox), ("ArtBox", pagina.artbox)):
+        if pagina.parent.xref_get_key(pagina.xref, chave)[0] != "null":
+            referencia = caixa * para_area_visivel
+            if not referencia.is_empty and area.contains(referencia):
+                return referencia
+
+    conteudo = fitz.Rect()
+    for tipo, coordenadas in pagina.get_bboxlog():
+        if tipo != "ignore-text":
+            elemento = fitz.Rect(coordenadas) & area
+            if not elemento.is_empty:
+                conteudo |= elemento
+    return area if conteudo.is_empty else conteudo
+
+
 def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific, filacolor):
     try:
         doc = fitz.open(pdf_path)
@@ -5221,96 +5269,85 @@ def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific, filacolor)
             "Capas_32X48": (48, 32)
         }
 
-        # Tolerância para considerar formato já pronto (em cm)
-        tolerancia_cm = 0.5
-
+        mm = 72 / 25.4
         novo_doc = fitz.open()
 
         for pagina in doc:
             largura_pt = pagina.rect.width
             altura_pt = pagina.rect.height
-            largura_cm = largura_pt / 28.3465
-            altura_cm = altura_pt / 28.3465
-
-            # ===== VERIFICA SE A PÁGINA JÁ ESTÁ EM UM FORMATO CONHECIDO =====
-            formato_atual = None
-            for nome, (larg_ref, alt_ref) in formatos_cm.items():
-                if (abs(largura_cm - larg_ref) <= tolerancia_cm and
-                    abs(altura_cm - alt_ref) <= tolerancia_cm):
-                    formato_atual = nome
-                    break
-
-            if formato_atual is not None:
-                # ========== CASO 1: PDF JÁ EM FORMATO FINAL ==========
+            # O fluxo de capa pronta é o original de 32 × 60, incluindo
+            # o recorte de 20 mm por lado e 40 mm no topo para a fila 28 × 56.
+            capa_pronta = (
+                filacolor in ("Capas_32X60", "Capas_28X56")
+                and abs(largura_pt / mm - 600) <= 5
+                and abs(altura_pt / mm - 320) <= 5
+            )
+            if capa_pronta:
                 nova_pagina = novo_doc.new_page(width=largura_pt, height=altura_pt)
-                nova_pagina.show_pdf_page(fitz.Rect(0, 0, largura_pt, altura_pt),
-                                          doc, pagina.number)
-
-                # Se for Capas_28X56 e a página não estiver já em 56x28, cortar para 56x28
-                if filacolor == "Capas_28X56" and formato_atual != "Capas_28X56":
-                    corte_lateral_cm = 2
-                    corte_topo_cm = 4
-                    corte_lateral_pt = corte_lateral_cm * 28.3465
-                    corte_topo_pt = corte_topo_cm * 28.3465
-                    crop_rect = fitz.Rect(corte_lateral_pt, corte_topo_pt,
-                                          largura_pt - corte_lateral_pt, altura_pt)
-                    nova_pagina.set_cropbox(crop_rect)
-
-                # Área visível após o corte (ou página inteira)
-                visivel = nova_pagina.rect
-
-                # Posição da marca: recuo padrão do topo da área visível
-                x_marca = visivel.x0 + 50 + CONFIG.get('deslocamento_x', 0)
-                largura_marca = visivel.width - 100
-                y0_marca = visivel.y0 + recuo_topo_pt
-                y1_marca = y0_marca + altura_caixa_texto
-
-                posicao_marca = fitz.Rect(x_marca, y0_marca, x_marca + largura_marca, y1_marca)
-                nova_pagina.insert_textbox(
-                    posicao_marca,
-                    f"{nome_arquivo} - {identific}",
-                    fontsize=CONFIG['tamanho_fonte'],
-                    color=cor_marca,
-                    fontname=CONFIG['fonte'],
-                    align=1
-                )
-
+                if filacolor == "Capas_28X56":
+                    nova_pagina.set_cropbox(fitz.Rect(
+                        20 * mm, 40 * mm, largura_pt - 20 * mm, altura_pt
+                    ))
             else:
-                # ========== CASO 2: PDF EM FORMATO ORIGINAL ==========
-                if filacolor in formatos_cm:
-                    largura_dest_cm, altura_dest_cm = formatos_cm[filacolor]
-                else:
-                    largura_dest_cm, altura_dest_cm = 60, 32  # fallback
-
-                largura_dest_pt = largura_dest_cm * 28.3465
-                altura_dest_pt = altura_dest_cm * 28.3465
-
-                nova_pagina = novo_doc.new_page(width=largura_dest_pt, height=altura_dest_pt)
-
-                # Conteúdo original centralizado na parte inferior
-                x0 = (largura_dest_pt - largura_pt) / 2
-                y0 = altura_dest_pt - altura_pt
-                ret_arte = fitz.Rect(x0, y0, x0 + largura_pt, y0 + altura_pt)
-                nova_pagina.show_pdf_page(ret_arte, doc, pagina.number)
-
-                # Marca d'água no topo da nova página, usando o mesmo recuo padrão
-                x_marca = 50 + CONFIG.get('deslocamento_x', 0)
-                largura_marca = largura_dest_pt - 100
-                y0_marca = recuo_topo_pt
-                y1_marca = y0_marca + altura_caixa_texto
-
-                posicao_marca = fitz.Rect(x_marca, y0_marca, x_marca + largura_marca, y1_marca)
-                nova_pagina.insert_textbox(
-                    posicao_marca,
-                    f"{nome_arquivo} - {identific}",
-                    fontsize=CONFIG['tamanho_fonte'],
-                    color=cor_marca,
-                    fontname=CONFIG['fonte'],
-                    align=1
+                largura_dest_cm, altura_dest_cm = formatos_cm.get(filacolor, (60, 32))
+                nova_pagina = novo_doc.new_page(
+                    width=largura_dest_cm * 10 * mm, height=altura_dest_cm * 10 * mm
                 )
+
+            visivel = nova_pagina.rect
+            rotacao = pagina.rotation
+            para_visual = pagina.rotation_matrix
+            # show_pdf_page recebe o recorte sem /Rotate. Repõe a orientação na montagem.
+            pagina.set_rotation(0)
+            area_original = pagina.rect * para_visual
+            x_original = (visivel.width - area_original.width) / 2
+            y_original = visivel.y1 - area_original.y1
+            x, y = x_original, y_original
+
+            if not capa_pronta:
+                referencia = referencia_capa(pagina) * para_visual
+                x = (visivel.width - referencia.x0 - referencia.x1) / 2
+                y_maximo = visivel.y1 - referencia.y1
+                y = y_maximo - 10 * mm
+                y_minimo = visivel.y0 - referencia.y0
+                if y < y_minimo - 0.01 * mm:
+                    if y_minimo - y_maximo > 0.01 * mm:
+                        raise ValueError(
+                            f"Página {pagina.number + 1}: a área da capa tem "
+                            f"{referencia.height / mm:.2f} mm de altura e excede "
+                            f"os {visivel.height / mm:.2f} mm da folha."
+                        )
+                    y = min(max(y_original, y_minimo), y_maximo)
+                    logging.info(
+                        "Capa %s, página %d: recuo inferior de %.2f mm para manter a área da capa inteira.",
+                        nome_arquivo, pagina.number + 1, (y_maximo - y) / mm
+                    )
+
+            deslocamento = fitz.Matrix(1, 0, 0, 1, x, y)
+            destino = (area_original * deslocamento) & visivel
+            if not destino.is_empty and pagina.get_contents():
+                origem = destino * ~deslocamento * ~para_visual
+                nova_pagina.show_pdf_page(
+                    destino, doc, pagina.number, clip=origem, rotate=-rotacao
+                )
+
+            x_marca = visivel.x0 + 50 + CONFIG.get('deslocamento_x', 0)
+            largura_marca = visivel.width - 100
+            y0_marca = visivel.y0 + recuo_topo_pt
+            posicao_marca = fitz.Rect(
+                x_marca, y0_marca, x_marca + largura_marca, y0_marca + altura_caixa_texto
+            )
+            nova_pagina.insert_textbox(
+                posicao_marca,
+                f"{nome_arquivo} - {identific}",
+                fontsize=CONFIG['tamanho_fonte'],
+                color=cor_marca,
+                fontname=CONFIG['fonte'],
+                align=1
+            )
 
         # Salva o documento final
-        novo_caminho = pdf_path.replace(".pdf", "_marcado.pdf")
+        novo_caminho = os.path.splitext(pdf_path)[0] + "_marcado.pdf"
         novo_doc.save(novo_caminho)
         novo_doc.close()
         doc.close()
@@ -5318,7 +5355,7 @@ def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific, filacolor)
 
     except Exception as e:
         logging.error(f"Erro ao adicionar marca d'água em {pdf_path}: {e}")
-        messagebox.showerror("Erro", f"Falha ao marcar o arquivo {os.path.basename(pdf_path)}")
+        messagebox.showerror("Erro", f"Falha ao montar {os.path.basename(pdf_path)}\n\n{e}")
         return None
 # --- INICIALIZAÇÃO ---
 CONFIG = carregar_configuracoes()
