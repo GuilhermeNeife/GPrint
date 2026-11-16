@@ -1,6 +1,12 @@
 from builtins import super
 import os
 import sys
+import multiprocessing
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+
+from concurrent.futures import ProcessPoolExecutor, TimeoutError as FutureTimeout
 import shutil
 import time
 import math
@@ -585,6 +591,9 @@ def gprint_verificar_banco_no_inicio(caminho, root):
 # 0 = sem limite (quantos arquivos TXT desejar)
 # 1, 2, 3... = quantidade maxima de TXT por processamento
 MAX_ARQUIVOS_TXT_MIOLO = 4
+MAX_MONTAGENS_SIMULTANEAS_MIOLO = 61  # Limite do ProcessPoolExecutor no Windows.
+
+TIMEOUT_LPR_MIOLO_SEGUNDOS = 300
 
 DATA_LIMITE = "29/07/2027"
 PASTA_BASE = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\UICLAP\LOTES"
@@ -634,8 +643,17 @@ DEFAULT_CONFIG = {
     'deslocamento_x': 70 * 2.83465,
     'tema': 'darkly',
         # NOVO
-    "sangria_padrao_miolo": 3
+    "sangria_padrao_miolo": 3,
+    "montagens_simultaneas_miolo": 1,
 }
+def obter_montagens_simultaneas_miolo():
+    try:
+        valor = int(str(CONFIG.get("montagens_simultaneas_miolo", 1)))
+        return valor if 1 <= valor <= MAX_MONTAGENS_SIMULTANEAS_MIOLO else 1
+    except ValueError:
+        return 1
+
+
 def obter_sangria_padrao_miolo():
     """Retorna o ajuste atual de sangria, em milímetros, para uma execução de miolo.
 
@@ -1746,6 +1764,14 @@ class ConfigTab(ttk.Frame):
         )
         self.sangria_padrao_spin.grid(row=0, column=1, padx=5, pady=5, sticky="w")
 
+        ttk.Label(miolo_frame, text="Montagens simultâneas:").grid(
+            row=1, column=0, padx=5, pady=5, sticky="w")
+        self.montagens_miolo_var = tk.StringVar()
+        ttk.Label(miolo_frame, textvariable=self.montagens_miolo_var).grid(
+            row=1, column=1, padx=5, pady=5, sticky="w")
+        ttk.Button(miolo_frame, text="Alterar com senha", command=self.alterar_montagens_miolo).grid(
+            row=1, column=2, padx=5, pady=5, sticky="w")
+
         # ================= SEÇÃO: Configurações de Cores =================
         colors_frame = ttk.LabelFrame(
             scrollable_frame,
@@ -1860,6 +1886,8 @@ class ConfigTab(ttk.Frame):
     def carregar_configuracoes(self):
         global CONFIG
         
+        self.montagens_miolo_var.set(str(obter_montagens_simultaneas_miolo()))
+
         # Cores
         self.atualizar_preview_cor('cor_fosco', CONFIG['cor_fosco'])
         self.atualizar_preview_cor('cor_brilho', CONFIG['cor_brilho'])
@@ -1939,17 +1967,76 @@ class ConfigTab(ttk.Frame):
                 
         except ValueError as e:
             messagebox.showerror("Erro", f"Valor inválido: {e}")   
+    def alterar_montagens_miolo(self):
+        senha_configurada = GPRINT_SENHA_ADMIN_EQUIPAMENTOS
+        if not senha_configurada.strip():
+            messagebox.showwarning("GPrint - Miolo", "Configure a senha administrativa.", parent=self)
+            return
+        senha = simpledialog.askstring(
+            "GPrint - Acesso administrativo", "Informe a senha para alterar as montagens simultâneas.",
+            show="*", parent=self)
+        if senha is None:
+            return
+        if not hmac.compare_digest(senha.encode("utf-8"), senha_configurada.encode("utf-8")):
+            messagebox.showerror("GPrint - Acesso negado", "Senha incorreta.", parent=self)
+            return
+        quantidade = simpledialog.askinteger(
+            "Montagens simultâneas", "Quantos PDFs de miolo podem ser montados ao mesmo tempo?",
+            initialvalue=obter_montagens_simultaneas_miolo(), minvalue=1,
+            maxvalue=MAX_MONTAGENS_SIMULTANEAS_MIOLO, parent=self)
+        if quantidade is None:
+            return
+        novas_preferencias = dict(CONFIG, montagens_simultaneas_miolo=quantidade)
+        if salvar_configuracoes(novas_preferencias):
+            CONFIG.update(novas_preferencias)
+            self.montagens_miolo_var.set(str(quantidade))
+        else:
+            messagebox.showerror("GPrint - Miolo", "Não foi possível salvar a preferência.", parent=self)
+
     def restaurar_padroes(self):
         global CONFIG
         
         if messagebox.askyesno(
             "Confirmar",
-            "Deseja restaurar TODAS as configurações para os valores padrão?"
+            "Deseja restaurar as preferências gerais para os valores padrão?"
         ):
-            CONFIG = DEFAULT_CONFIG.copy()
+            montagens = obter_montagens_simultaneas_miolo()
+            CONFIG = dict(DEFAULT_CONFIG, montagens_simultaneas_miolo=montagens)
             self.carregar_configuracoes()
             salvar_configuracoes(CONFIG)
             messagebox.showinfo("Sucesso", "Configurações padrão restauradas!")           
+def gprint_montar_item_miolo(processo, pasta_temporaria, sangria_mm, comprimir):
+    """Monta um PDF em pasta exclusiva, sem acessar Tkinter ou a impressora."""
+    p = processo
+    pasta_item = os.path.join(pasta_temporaria, f"TXT{p['TXT_NUMERO']:02d}_L{p['LINHA']}")
+    os.mkdir(pasta_item)
+    origem = os.path.normpath(os.path.join(p["CAMINHO"], p["ARQUIVO"]))
+    local = os.path.join(pasta_item, f"TXT{p['TXT_NUMERO']:02d}_L{p['LINHA']}_{os.path.basename(p['ARQUIVO'])}")
+    shutil.copy2(origem, local)
+    saida = os.path.join(pasta_item, "montado.pdf")
+    w_pt, h_pt = p["LARGURA_MM"] * MM, p["ALTURA_MM"] * MM
+    modo = p["MODO"]
+
+    if modo == "dois_na_folha":
+        dois_na_folha(local, saida, w_pt, h_pt, espacamento_mm=p["ESPACAMENTO"], sangria_mm=sangria_mm)
+    elif modo == "grampo":
+        grampo(local, saida, w_pt, h_pt, sangria_mm=sangria_mm)
+    elif modo == "Corta_empilha":
+        Corta_empilha(local, saida, w_pt, h_pt, sangria_mm=sangria_mm, comprimir_entrada=comprimir)
+    elif modo == "corta_empilha_rotacionado":
+        corta_empilha_rotacionado(local, saida, w_pt, h_pt, sangria_mm=sangria_mm, comprimir_entrada=comprimir)
+    elif modo == "dois_na_folha_rotacionado":
+        dois_na_folha_rotacionado(local, saida, w_pt, h_pt, espacamento_mm=p["ESPACAMENTO"], sangria_mm=sangria_mm)
+    elif modo == "um_na_folha_atexco":
+        um_na_folha_atexco(local, saida, w_pt, h_pt, sangria_mm=sangria_mm, comprimir_entrada=comprimir)
+    else:
+        um_na_folha(local, saida, w_pt, h_pt, sangria_mm=sangria_mm)
+
+    if not os.path.isfile(saida) or os.path.getsize(saida) == 0:
+        raise RuntimeError("A montagem não gerou um PDF válido.")
+    return saida
+
+
 class MioloTab(ttk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent)
@@ -1958,6 +2045,7 @@ class MioloTab(ttk.Frame):
         self.arquivos_txt = []  # arquivos selecionados para a proxima execucao
         self.processando = False
         self.thread = None
+        self.cancelamento = threading.Event()
         self.log_queue = queue.Queue()
         self.impressora_var = tk.StringVar()
         self.status_var = tk.StringVar(value="✅ Pronto para processar")
@@ -2237,6 +2325,11 @@ class MioloTab(ttk.Frame):
             width=22
         )
         self.btn_processar.grid(row=0, column=1, sticky="e")
+        self.btn_cancelar = ttk.Button(
+            status_frame, text="Cancelar", command=self.cancelar_processamento,
+            bootstyle="danger-outline", state="disabled"
+        )
+        self.btn_cancelar.grid(row=0, column=2, padx=(8, 0), sticky="e")
 
     def atualizar_equipamentos(self, equipamentos):
         anterior = self.impressora_var.get()
@@ -2289,96 +2382,83 @@ class MioloTab(ttk.Frame):
         if not equipamento:
             messagebox.showwarning('GPrint - Miolo', 'Selecione um equipamento de Miolo cadastrado em Configuracoes > Equipamentos.')
             return
-        # Congela o destino desta execucao; mudancas no cadastro nao desviam envios em curso.
-        self.equipamento_execucao = equipamento.copy()
-        # As filas do cadastro sao informativas para Capa/Miolo.
-        # O TXT determina a fila LPR como na logica operacional original.
         if not self.processos:
             messagebox.showwarning("Aviso", "Carregue um arquivo TXT primeiro.")
             return
-        
         if self.processando:
-            messagebox.showwarning("Aviso", "Já existe um processamento em andamento.")
             return
-        
+
+        # Captura os valores de Tkinter antes de iniciar o trabalho em segundo plano.
+        self.equipamento_execucao = equipamento.copy()
+        opcoes = {
+            'sangria': obter_sangria_padrao_miolo(),
+            'paralelo': obter_montagens_simultaneas_miolo(),
+            'comprimir': self.comprimir_pdf_var.get(),
+            'automatico': self.impressao_auto_var.get(),
+            'uma_copia': self.enviar_uma_copia_var.get(),
+            'impressora': self.impressora_var.get(),
+            'ip': self.equipamento_execucao['ip'],
+        }
+        self.cancelamento.clear()
         self.processando = True
         self.btn_processar.config(state='disabled', text='⏳ Processando...')
-        self.btn_select.config(state='disabled')  # nao alterar a fila durante o processamento
+        self.btn_select.config(state='disabled')
+        self.btn_cancelar.config(state='normal')
+        self.status_var.set(f"Processando miolo | até {opcoes['paralelo']} montagem(ns) simultânea(s)")
         self.progress['value'] = 0
         self.progress['maximum'] = len(self.processos)
+        self.progress_label.config(text=f"0/{len(self.processos)}")
         self.indicadores_miolo.iniciar()
 
-        for child in self.winfo_children():
-            if isinstance(child, ttk.Frame):
-                for frame in child.winfo_children():
-                    if isinstance(frame, ttk.LabelFrame):
-                        for btn in frame.winfo_children():
-                            if isinstance(btn, ttk.Button) and btn['text'] == '🔄 Cancelar':
-                                btn.config(state='normal')
-        
-        self.thread = threading.Thread(target=self._executar, daemon=True)
+        self.thread = threading.Thread(target=self._executar, args=(opcoes,), daemon=True)
         self.thread.start()
 
-    def enviar_por_lpr(self, caminho_arquivo, ip, formato, job_name, copia_numero, total_copias):
-        try:
-            self.log(f"📤 Enviando cópia {copia_numero}/{total_copias}...", "ENVIO")
-            self.log(f"   IP: {ip}, Fila: {formato}, Job: {job_name}", "ENVIO")
-            
-            pasta_temp = tempfile.gettempdir()
-            nome_temp = f"{uuid.uuid4()}.pdf"
-            arquivo_temp = os.path.join(pasta_temp, nome_temp)
+    def cancelar_processamento(self):
+        if self.processando and not self.cancelamento.is_set():
+            self.cancelamento.set()
+            self.btn_cancelar.config(state='disabled')
+            self.status_var.set("Cancelando… aguardando as operações em andamento")
+            self.log("Cancelamento solicitado. Aguardando as operações em andamento.")
 
+    def enviar_por_lpr(self, caminho_arquivo, ip, formato, job_name, copia_numero, total_copias):
+        arquivo_temp = None
+        try:
+            tamanho_mib = os.path.getsize(caminho_arquivo) / (1024 ** 2)
+            self.log(
+                f"Enviando cópia {copia_numero}/{total_copias} | {tamanho_mib:.1f} MiB | "
+                f"IP: {ip} | Fila: {formato} | Job: {job_name}", "ENVIO"
+            )
+            arquivo_temp = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.pdf")
             shutil.copy2(caminho_arquivo, arquivo_temp)
             time.sleep(1)
-
-            comando = [
-                "lpr",
-                "-S", ip,
-                "-P", formato,
-                "-J", job_name,
-                arquivo_temp
-            ]
-
             resultado = subprocess.run(
-                comando,
-                capture_output=True,
-                text=True,
-                timeout=120
+                ["lpr", "-S", ip, "-P", formato, "-J", job_name, arquivo_temp],
+                capture_output=True, text=True, timeout=TIMEOUT_LPR_MIOLO_SEGUNDOS,
+                errors="replace",
             )
-
-            try:
-                os.remove(arquivo_temp)
-            except:
-                pass
-
-            print(f"\n--- LPR DEBUG (cópia {copia_numero}) ---")
-            print(f"Arquivo original: {caminho_arquivo}")
-            print(f"Arquivo temp: {arquivo_temp}")
-            print(f"Comando: {resultado.args}")
-            print(f"Return code: {resultado.returncode}")
-            print(f"STDOUT: {resultado.stdout}")
-            print(f"STDERR: {resultado.stderr}")
-            print(f"-----------------\n")
-
-            if resultado.stdout:
-                self.log(f"   Saída: {resultado.stdout}", "ENVIO")
-            if resultado.stderr:
-                self.log(f"   Erro: {resultado.stderr}", "ERRO")
-
             if resultado.returncode == 0:
-                self.log(f"✅ Cópia {copia_numero} enviada com sucesso", "SUCESSO")
-                return True
-            else:
-                self.log(f"❌ Falha no envio da cópia {copia_numero} (código {resultado.returncode})", "ERRO")
-                return False
-
+                self.log(f"Cópia {copia_numero} aceita pelo LPR", "SUCESSO")
+                return True, "", False
+            detalhe = (resultado.stderr or resultado.stdout or "").strip()
+            erro = f"LPR retornou código {resultado.returncode}"
+            if detalhe:
+                erro += f": {detalhe}"
         except subprocess.TimeoutExpired:
-            self.log(f"❌ Timeout no envio da cópia {copia_numero} (120s)", "ERRO")
-            return False
-        except Exception as e:
-            self.log(f"❌ Exceção no envio: {str(e)}", "ERRO")
-            print(f"Erro detalhado: {e}")
-            return False
+            erro = f"Timeout LPR de {TIMEOUT_LPR_MIOLO_SEGUNDOS}s; aceite pela fila não confirmado"
+            self.log(erro, "ERRO")
+            return False, erro, True
+        except Exception as exc:
+            erro = str(exc)
+        finally:
+            if arquivo_temp:
+                try:
+                    os.remove(arquivo_temp)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    logging.warning("Não foi possível remover temporário LPR: %s", exc)
+        self.log(erro, "ERRO")
+        return False, erro, False
 
     @staticmethod
     def _gerar_resumo_final_miolo(dados):
@@ -2424,8 +2504,14 @@ class MioloTab(ttk.Frame):
         if d['pastas_salvas']:
             linhas.append('Pastas das cópias salvas:')
             linhas.extend(f'  {pasta}' for pasta in d['pastas_salvas'])
+        if d['pendencias_lpr']:
+            reenvios = sum(item['situacao'] == 'reenviar' for item in d['pendencias_lpr'])
+            linhas.append(
+                f"Envios para reenvio: {reenvios} | "
+                f"Envios para conferência: {len(d['pendencias_lpr']) - reenvios}"
+            )
         if d['cancelado']:
-            linhas.append('Processamento interrompido; o último arquivo pode ter envios pendentes.')
+            linhas.append(f"Linhas restantes para retomar: {d['pendentes']}")
         if d['falhas']:
             linhas.extend(['-' * 56, f"FALHAS REGISTRADAS: {len(d['falhas'])}"])
             linhas.extend(f'  {falha}' for falha in d['falhas'][:10])
@@ -2434,7 +2520,16 @@ class MioloTab(ttk.Frame):
         linhas.append('=' * 56)
         return '\n'.join(linhas), situacao
 
-    def _executar(self):
+    def _executar(self, opcoes):
+        try:
+            dados, pendentes = self._executar_lote_miolo(opcoes)
+        except Exception as erro:
+            logging.exception("Falha na execução de miolo")
+            self.after(0, self._finalizar_miolo, None, [], str(erro))
+        else:
+            self.after(0, self._finalizar_miolo, dados, pendentes)
+
+    def _executar_lote_miolo(self, opcoes):
         inicio_execucao = datetime.now()
         inicio_cronometro = time.monotonic()
         desktop = os.path.join(os.path.expanduser("~"), "Desktop")
@@ -2447,8 +2542,9 @@ class MioloTab(ttk.Frame):
         os.makedirs(pasta_lote, exist_ok=False)
         # Congela o parâmetro no começo do lote: mudar a configuração durante
         # a execução não produz PDFs com sangrias diferentes na mesma pilha.
-        sangria_mm = obter_sangria_padrao_miolo()
-        self.log(f"📐 Sangria padrão de miolo nesta execução: {sangria_mm:g} mm", "INFO")
+        sangria_mm = opcoes['sangria']
+        paralelo = min(opcoes['paralelo'], len(self.processos))
+        self.log(f"Sangria: {sangria_mm:g} mm | Montagens simultâneas: {paralelo}")
 
         success_count = 0
         error_count = 0
@@ -2463,22 +2559,11 @@ class MioloTab(ttk.Frame):
         txt_processados = set()
         filas_processadas = set()
         modos_processados = {}
-        envio_automatico = bool(self.impressao_auto_var.get())
-        somente_uma_copia = bool(self.enviar_uma_copia_var.get())
-        # Arquivos de entrada ficam no TEMP do usuário, jamais na pasta dos
-        # PDFs finalizados. O nome exclusivo também evita colisão de sessões.
-        sessao_temp = tempfile.mkdtemp(prefix="sessao_miolo_", dir=PASTA_TRABALHO)
+        envio_automatico = opcoes['automatico']
+        somente_uma_copia = opcoes['uma_copia']
+        impressora_selecionada = opcoes['impressora']
+        ip_extraido = opcoes['ip']
 
-        impressora_selecionada = self.impressora_var.get()
-        # IP vem do cadastro; nome da maquina pode conter hifens.
-        equipamento_execucao = getattr(self, 'equipamento_execucao', None)
-        if not equipamento_execucao:
-            self.log('Equipamento nao encontrado no cadastro; processamento cancelado.', 'ERRO')
-            self.processando = False
-            self.after(0, lambda: self.btn_processar.configure(state='normal', text='▶ Processar e Enviar'))
-            return
-        ip_extraido = equipamento_execucao['ip']
-        
         # ===== EXTRAÇÃO DE LOTE (CAMINHO COMPLETO) E PILHA (NOME DO TXT) =====
         if hasattr(self, 'arquivo_txt') and self.arquivo_txt:
             lote = os.path.dirname(self.arquivo_txt)
@@ -2503,39 +2588,24 @@ class MioloTab(ttk.Frame):
         self.log(f"📁 Pasta de saída: {pasta_lote}", "INFO")
         self.log(f"{'='*50}", "INFO")
 
-        # Pasta para salvamento (envio desligado)
-        nome_pasta_salvos = None
-        if hasattr(self, 'nome_base_txt') and self.nome_base_txt:
-            nome_pasta_salvos = self.nome_base_txt
-        elif hasattr(self, 'nome_arquivo_txt') and self.nome_arquivo_txt:
-            nome_pasta_salvos = os.path.splitext(self.nome_arquivo_txt)[0]
-        elif hasattr(self, 'file_path') and self.file_path:
-            nome_pasta_salvos = os.path.splitext(os.path.basename(self.file_path))[0]
-        else:
-            if self.processos:
-                primeiro_nome = self.processos[0].get('NOMEFIC', 'desconhecido')
-                nome_pasta_salvos = f"{primeiro_nome}_{timestamp}"
-            else:
-                nome_pasta_salvos = f"PDFs_SALVOS_{timestamp}"
-        
-        nome_pasta_salvos = re.sub(r'[<>:"/\\|?*]', '_', nome_pasta_salvos)
-        # A pasta COPIAS_SALVAS só é criada se houver salvamento manual.
-        # No modo de envio automático não cria diretórios vazios.
-        pasta_salvos = os.path.join(pasta_lote, "COPIAS_SALVAS")
-        self.log(f"📁 PDFs finalizados desta pilha ({nome_pasta_salvos}): {pasta_lote}", "INFO")
-
-        varios_txt = len(getattr(self, 'arquivos_txt', [])) > 1
+        varios_txt = len(self.arquivos_txt) > 1
+        retomada = 0
+        pendencias_lpr = []
+        sessao_temp = tempfile.mkdtemp(prefix="sessao_miolo_", dir=PASTA_TRABALHO)
+        executor = None
+        futuros = {}
+        proximo = 0
         try:
+            if paralelo > 1 and not self.cancelamento.is_set():
+                executor = ProcessPoolExecutor(
+                    max_workers=paralelo, mp_context=multiprocessing.get_context("spawn"))
             for i, p in enumerate(self.processos):
-                if not self.processando:
-                    self.log("⚠️ Processamento cancelado pelo usuário", "INFO")
+                if self.cancelamento.is_set():
                     break
-                
+
                 iniciados_count += 1
                 etapa_atual = 'Preparação'
                 try:
-                    # Cada processo mantem a origem para log, historico e saida.
-                    # A imposicao e o LPR abaixo nao sao modificados.
                     origem_txt = p.get("TXT_ORIGEM", getattr(self, "arquivo_txt", ""))
                     lote = os.path.dirname(origem_txt) if origem_txt else "desconhecido"
                     pilha = os.path.splitext(os.path.basename(origem_txt))[0] if origem_txt else "desconhecido"
@@ -2543,59 +2613,63 @@ class MioloTab(ttk.Frame):
                     txt_processados.add(origem_txt or 'TXT não informado')
                     filas_processadas.add(p['FORMATO'])
                     modos_processados[p['MODO']] = modos_processados.get(p['MODO'], 0) + 1
-                    # Com varios TXT, isola os PDFs por arquivo de entrada:
-                    # nomes NOMEFIC iguais nao se sobrescrevem.
-                    pasta_saida_txt = os.path.join(pasta_lote, f"TXT_{numero_txt:02d}") if varios_txt else pasta_lote
-                    os.makedirs(pasta_saida_txt, exist_ok=True)
-                    pasta_salvos = os.path.join(pasta_saida_txt, "COPIAS_SALVAS")
-                    self.progress['value'] = i
-                    self.progress_label.config(text=f"{i+1}/{len(self.processos)}")
+                    self.after(0, self._atualizar_progresso_miolo, i, len(self.processos))
                 
                     self.log(f"\n--- TXT {numero_txt}: {os.path.basename(origem_txt)} | L{p['LINHA']}: {p['ARQUIVO']} ---", "INFO")
                     self.log(f"📄 Formato: {p['FORMATO']}", "INFO")
                     self.log(f"🔧 Modo: {p['MODO']}", "INFO")
                     self.log(f"📊 QTD para envio: {p['QTD']}, QTD Total: {p['QTD_total']}", "INFO")
                 
-                    origem = os.path.normpath(os.path.join(p["CAMINHO"], p["ARQUIVO"]))
-                    if not os.path.exists(origem):
-                        self.log(f"Arquivo não encontrado: {origem}", "ERRO")
-                        error_count += 1
-                        falhas_resumo.append(f"TXT {numero_txt} | {p['ARQUIVO']}: arquivo não encontrado")
-                        continue
-                
-                    local = os.path.join(sessao_temp, f"TXT{numero_txt:02d}_L{p['LINHA']}_{p['ARQUIVO']}")
-                    shutil.copy2(origem, local)
-                    self.log(f"📋 Arquivo copiado para temporário", "INFO")
-                
-                    output_path = os.path.join(pasta_saida_txt, f"{p['NOMEFIC']}.pdf")
-                    w_pt, h_pt = p["LARGURA_MM"] * MM, p["ALTURA_MM"] * MM
-                
                     etapa_atual = 'Montagem'
-                    self.log(f"⚙️ Gerando PDF montado...", "INFO")
-                
-                    if p["MODO"] == "dois_na_folha":
-                        dois_na_folha(local, output_path, w_pt, h_pt, espacamento_mm=p["ESPACAMENTO"], sangria_mm=sangria_mm)
-                    elif p["MODO"] == "grampo":
-                        grampo(local, output_path, w_pt, h_pt, sangria_mm=sangria_mm)
-                    elif p["MODO"] == "Corta_empilha":
-                        Corta_empilha(local, output_path, w_pt, h_pt, sangria_mm=sangria_mm, comprimir_entrada=self.comprimir_pdf_var.get())
-                    elif p["MODO"] == "corta_empilha_rotacionado":
-                        corta_empilha_rotacionado(local, output_path, w_pt, h_pt, sangria_mm=sangria_mm, comprimir_entrada=self.comprimir_pdf_var.get())
-                    elif p["MODO"] == "dois_na_folha_rotacionado":
-                        dois_na_folha_rotacionado(local, output_path, w_pt, h_pt, espacamento_mm=p["ESPACAMENTO"], sangria_mm=sangria_mm)
-                    elif p["MODO"] == "um_na_folha_atexco":
-                        um_na_folha_atexco(local, output_path, w_pt, h_pt, sangria_mm=sangria_mm, comprimir_entrada=self.comprimir_pdf_var.get())
+                    if executor is None:
+                        montado = gprint_montar_item_miolo(p, sessao_temp, sangria_mm, opcoes['comprimir'])
                     else:
-                        um_na_folha(local, output_path, w_pt, h_pt, sangria_mm=sangria_mm)
-                
-                    if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
-                        raise RuntimeError('A montagem não gerou um PDF válido.')
+                        # Limita também os PDFs prontos aguardando sua vez no envio.
+                        while (proximo < len(self.processos)
+                               and len(futuros) < paralelo
+                               and not self.cancelamento.is_set()):
+                            futuros[proximo] = executor.submit(
+                                gprint_montar_item_miolo, self.processos[proximo],
+                                sessao_temp, sangria_mm, opcoes['comprimir'])
+                            proximo += 1
+                        if self.cancelamento.is_set():
+                            break
+                        futuro = futuros.pop(i)
+                        while not self.cancelamento.is_set():
+                            try:
+                                montado = futuro.result(timeout=0.1)
+                                break
+                            except FutureTimeout:
+                                if futuro.done():
+                                    montado = futuro.result()
+                                    break
+
+                    if self.cancelamento.is_set():
+                        break
+                    retomada = i + 1
+                    # Isola as saídas de TXT diferentes, mesmo com NOMEFIC iguais.
+                    pasta_saida_txt = os.path.join(pasta_lote, f"TXT_{numero_txt:02d}") if varios_txt else pasta_lote
+                    os.makedirs(pasta_saida_txt, exist_ok=True)
+                    pasta_salvos = os.path.join(pasta_saida_txt, "COPIAS_SALVAS")
+                    output_path = os.path.join(pasta_saida_txt, f"{p['NOMEFIC']}.pdf")
+                    if os.path.exists(output_path):
+                        # Mantém o PDF de cada linha disponível para eventual reenvio.
+                        saida_linha = os.path.join(pasta_saida_txt, f"L{p['LINHA']}_{uuid.uuid4().hex[:6]}")
+                        os.makedirs(saida_linha)
+                        output_path = os.path.join(saida_linha, os.path.basename(output_path))
+                        pasta_salvos = os.path.join(saida_linha, "COPIAS_SALVAS")
+                    shutil.move(montado, output_path)
+                    shutil.rmtree(os.path.dirname(montado), ignore_errors=True)
                     montados_count += 1
                     etapa_atual = 'Finalização/envio'
                     self.log(f"✅ PDF gerado: {os.path.basename(output_path)}", "SUCESSO")
                 
                     # Quantidade de envios conforme o modo de montagem
-                    if p["MODO"] == "dois_na_folha" or p["MODO"] == "um_na_folha_atexco" and p["QTD"] >= 10:
+                    job_unico_por_montagem = (
+                        p["MODO"] == "dois_na_folha"
+                        or (p["MODO"] == "um_na_folha_atexco" and p["QTD"] >= 10)
+                    )
+                    if job_unico_por_montagem:
                         qtd_envios = 1
                         self.log(f"🔢 Modo 1 envio/: {p['QTD']} exemplares -> 1 envio", "INFO")
                     else:
@@ -2639,12 +2713,9 @@ class MioloTab(ttk.Frame):
                     }
                     self.registrar_log_sqlite(dados_montagem)
                 
+                    copias_a_conferir = 0
                     # Loop de envios (ou salvamentos)
                     for envio_idx in range(qtd_envios):
-                        if not self.processando:
-                            self.log("⚠️ Cancelando envios...", "INFO")
-                            break
-
                         copia_num = envio_idx + 1
 
                         # Aguarda arquivo liberar
@@ -2662,7 +2733,7 @@ class MioloTab(ttk.Frame):
 
                         if envio_automatico:
                             self.log("🖨️ Impressão automática ativada", "INFO")
-                            sucesso = self.enviar_por_lpr(
+                            sucesso, erro, timeout_lpr = self.enviar_por_lpr(
                                 output_path,
                                 ip_extraido,
                                 formato_base,
@@ -2677,8 +2748,10 @@ class MioloTab(ttk.Frame):
                                 envio_ok_val = 1
                             else:
                                 envio_erro_count += 1
-                                status = "Falha no envio"
-                                erro = "Falha no envio via LPR"
+                                status = "Timeout no envio" if timeout_lpr else "Falha no envio"
+                                if timeout_lpr:
+                                    # Inclui a cópia de aceite incerto e as que ficaram sem tentativa.
+                                    copias_a_conferir = qtd_envios - envio_idx
                                 falhas_resumo.append(
                                     f"TXT {numero_txt} | {p['ARQUIVO']} | envio {copia_num}/{qtd_envios}: {erro}")
                                 envio_ok_val = 0
@@ -2729,13 +2802,40 @@ class MioloTab(ttk.Frame):
                             'envio_ok': envio_ok_val
                         }
                         self.registrar_log_sqlite(dados_log)
+                        if envio_automatico and not sucesso:
+                            pendencias_lpr.append({
+                                'processo': p, 'pdf': output_path, 'job': job_name,
+                                'copia': copia_num, 'total_envios': qtd_envios,
+                                'job_unico': job_unico_por_montagem, 'log': dados_log,
+                                'situacao': 'conferir' if timeout_lpr else 'reenviar',
+                            })
+                            if timeout_lpr:
+                                for numero in range(copia_num + 1, qtd_envios + 1):
+                                    pendencias_lpr.append(dict(
+                                        pendencias_lpr[-1], copia=numero, situacao='aguardando',
+                                        log=dict(dados_log, copia=f"{numero}/{qtd_envios}",
+                                                 erro="Envio não iniciado após timeout da cópia anterior.")
+                                    ))
 
-                        time.sleep(1.5)
-                
-                    if self.processando:
-                        success_count += 1
+
+                        if copias_a_conferir:
+                            self.log(
+                                f"{copias_a_conferir - 1} cópia(s) restante(s) sem tentativa. "
+                                "Confira a cópia com timeout na fila antes de reenviar.", "ERRO"
+                            )
+                            break
+                        # Mantém a pausa entre envios mesmo ao terminar uma linha cancelada.
+                        if envio_automatico:
+                            time.sleep(1.5)
+                        else:
+                            self.cancelamento.wait(1.5)
+
+                    success_count += 1
                
                 except Exception as e:
+                    if self.cancelamento.is_set() and retomada <= i:
+                        break
+                    retomada = i + 1
                     self.log(f"❌ Erro: {str(e)}", "ERRO")
                     error_count += 1
                     falhas_resumo.append(
@@ -2762,6 +2862,8 @@ class MioloTab(ttk.Frame):
                     self.registrar_log_sqlite(dados_erro_montagem)
 
         finally:
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
             # Só remove os insumos temporários desta execução; preserva os PDFs gerados.
             try:
                 shutil.rmtree(sessao_temp)
@@ -2777,7 +2879,8 @@ class MioloTab(ttk.Frame):
             emitir_log=lambda msg: self.log(msg, "INFO")
         )
 
-        cancelado = not self.processando
+        pendentes = self.processos[retomada:] if self.cancelamento.is_set() else []
+        cancelado = bool(pendentes)
         fim_execucao = datetime.now()
         duracao = max(0, int(time.monotonic() - inicio_cronometro))
         resumo_dados = {
@@ -2791,36 +2894,199 @@ class MioloTab(ttk.Frame):
             'ip': ip_extraido, 'usuario': usuario, 'sangria': sangria_mm,
             'automatico': envio_automatico, 'uma_copia': somente_uma_copia,
             'pasta': pasta_lote, 'pastas_salvas': sorted(pastas_salvas),
-            'falhas': falhas_resumo,
+            'falhas': falhas_resumo, 'pendentes': len(pendentes),
+            'pendencias_lpr': pendencias_lpr,
         }
-        resumo_final, situacao = self._gerar_resumo_final_miolo(resumo_dados)
-        nivel = 'ERRO' if falhas_resumo else 'INFO'
-        for linha_resumo in resumo_final.splitlines():
-            self.log(linha_resumo, nivel)
-        self.status_var.set(
-            f"{situacao}: {montados_count}/{len(self.processos)} montados | "
-            f"LPR: {envio_count} OK / {envio_erro_count} falhas | "
-            f"Salvos: {salvos_count} | Tempo: {duracao // 60:02d}:{duracao % 60:02d}")
+        return resumo_dados, pendentes
 
-        self.processando = False
-        self.after(0, self.indicadores_miolo.finalizar)
+    def _atualizar_progresso_miolo(self, feitos, total):
+        self.progress['value'] = feitos
+        self.progress_label.config(text=f"{feitos}/{total}")
+
+    def _finalizar_miolo(self, dados, pendentes, erro=None):
+        self.indicadores_miolo.finalizar()
         self.btn_processar.config(state='normal', text='▶ Processar e Enviar')
         self.btn_select.config(state='normal')
-        # Exibe o andamento concluido ate a proxima execucao.
-        self.progress['value'] = iniciados_count
-        self.progress_label.config(text=f"{iniciados_count}/{len(self.processos)}")
-        
-        for child in self.winfo_children():
-            if isinstance(child, ttk.Frame):
-                for frame in child.winfo_children():
-                    if isinstance(frame, ttk.LabelFrame):
-                        for btn in frame.winfo_children():
-                            if isinstance(btn, ttk.Button) and btn['text'] == '🔄 Cancelar':
-                                btn.config(state='disabled')
-        
-        exibir_resumo = messagebox.showwarning if cancelado or falhas_resumo else messagebox.showinfo
-        exibir_resumo(f'GPrint - Miolo: {situacao}', resumo_final)
+        self.btn_cancelar.config(state='disabled')
+        self.processando = False
+        if erro is not None:
+            self.status_var.set("Falha no processamento do miolo")
+            messagebox.showerror("GPrint - Miolo", erro, parent=self)
+            return
 
+        resumo, situacao = self._gerar_resumo_final_miolo(dados)
+        for linha in resumo.splitlines():
+            self.log(linha, 'ERRO' if dados['falhas'] else 'INFO')
+        self._atualizar_progresso_miolo(dados['total'] - len(pendentes), dados['total'])
+        self.status_var.set(
+            f"{situacao}: {dados['montados']}/{dados['total']} montados | "
+            f"LPR: {dados['envios']} OK / {dados['erros_envio']} falhas | Salvos: {dados['salvos']}"
+        )
+        sessao = os.path.basename(dados['pasta'])
+        if pendentes:
+            # O botão Processar também retoma apenas as linhas restantes nesta sessão.
+            self.processos = pendentes
+            self._atualizar_lista_miolo()
+            if messagebox.askyesno(
+                "GPrint - Miolo cancelado",
+                f"Restam {len(pendentes)} linha(s) na fila. Deseja exportar os TXTs para a pasta cancelados?",
+                parent=self,
+            ):
+                self._exportar_miolo_cancelado(pendentes, sessao)
+
+        exibir = messagebox.showwarning if dados['cancelado'] or dados['falhas'] else messagebox.showinfo
+        exibir(f'GPrint - Miolo: {situacao}', resumo, parent=self)
+
+        itens_lpr = dados['pendencias_lpr']
+        if itens_lpr:
+            relatorio = os.path.join(dados['pasta'], 'erros_envio_lpr.txt')
+            gravado = self._registrar_pendencias_lpr(relatorio, "Envio original", itens_lpr)
+            reenviaveis = sum(item['situacao'] == 'reenviar' for item in itens_lpr)
+            mensagem = (
+                f"{reenviaveis} envio(s) com erro podem ser repetidos usando os PDFs já montados.\n"
+                f"{len(itens_lpr) - reenviaveis} envio(s) precisam de conferência por causa de timeout.\n\n"
+                + (f"Detalhes: {relatorio}" if gravado else "Falha ao salvar os detalhes. Consulte o log.")
+            )
+            if reenviaveis and messagebox.askyesno(
+                "GPrint - Reenviar miolos?", mensagem + "\n\nDeseja reenviar agora os envios com erro?",
+                parent=self,
+            ):
+                self.cancelamento.clear()
+                self.processando = True
+                self.btn_processar.config(state='disabled')
+                self.btn_select.config(state='disabled')
+                self.btn_cancelar.config(state='normal')
+                self.status_var.set("Reenviando PDFs de miolo já montados…")
+                self.thread = threading.Thread(
+                    target=self._reenviar_miolo_lpr, args=(itens_lpr, relatorio, sessao), daemon=True)
+                self.thread.start()
+            else:
+                self._exportar_pendencias_lpr(itens_lpr, sessao)
+
+    def _registrar_pendencias_lpr(self, caminho, etapa, itens):
+        try:
+            with open(caminho, 'a', encoding='utf-8-sig') as arquivo:
+                arquivo.write(f"\n{etapa} | {datetime.now():%d/%m/%Y %H:%M:%S}\n")
+                for item in itens:
+                    log = item['log']
+                    arquivo.write(
+                        f"\nSituação: {item['situacao']} | Envio {item['copia']}/{item['total_envios']}\n"
+                        f"PDF montado: {item['pdf']}\n"
+                        f"Origem: {item['processo']['TXT_ORIGEM']} | Linha {item['processo']['LINHA']}\n"
+                        f"Impressora: {log['maquina']} | IP: {log['ip']} | Fila: {log['formato']}\n"
+                        f"Job: {item['job']}\n"
+                        f"Resultado: {log['erro'] or log['status']}\n"
+                    )
+        except OSError as erro:
+            self.log(f"Falha ao gravar o relatório de LPR em {caminho}: {erro}", "ERRO")
+            return False
+        self.log(f"Relatório de envio LPR: {caminho}")
+        return True
+
+    def _reenviar_miolo_lpr(self, itens, relatorio, sessao):
+        bloqueados = set()
+        aceitos = 0
+        try:
+            for item in itens:
+                if self.cancelamento.is_set():
+                    break
+                if item['situacao'] != 'reenviar':
+                    continue
+                log = item['log']
+                if item['pdf'] in bloqueados:
+                    item['situacao'] = 'aguardando'
+                    item['log'] = dict(log, erro="Reenvio adiado após timeout de outra cópia deste PDF.")
+                    self._registrar_pendencias_lpr(relatorio, "Reenvio adiado", [item])
+                    continue
+                sucesso, erro, timeout = self.enviar_por_lpr(
+                    item['pdf'], log['ip'], log['formato'], item['job'], item['copia'], item['total_envios']
+                )
+                item['situacao'] = 'aceito' if sucesso else 'conferir' if timeout else 'reenviar'
+                status = 'Enviado' if sucesso else 'Timeout no reenvio' if timeout else 'Falha no reenvio'
+                item['log'] = dict(log, status=status, erro=erro, envio_ok=int(sucesso))
+                self._registrar_pendencias_lpr(relatorio, "Tentativa de reenvio", [item])
+                self.registrar_log_sqlite(item['log'])
+                aceitos += int(sucesso)
+                if timeout:
+                    bloqueados.add(item['pdf'])
+                self.cancelamento.wait(1.5)
+        except Exception:
+            logging.exception("Falha ao finalizar o reenvio de miolo")
+        finally:
+            gprint_sincronizar_pendentes(
+                self.log_db_path, root=self.app.root, emitir_log=self.log)
+            self.after(0, self._finalizar_reenvio_miolo, itens, sessao, aceitos)
+
+    def _finalizar_reenvio_miolo(self, itens, sessao, aceitos):
+        self.processando = False
+        self.btn_processar.config(state='normal')
+        self.btn_select.config(state='normal')
+        self.btn_cancelar.config(state='disabled')
+        restantes = sum(item['situacao'] != 'aceito' for item in itens)
+        self.status_var.set(f"Reenvio LPR: {aceitos} aceito(s) | {restantes} pendente(s)")
+        self._exportar_pendencias_lpr(itens, sessao)
+        messagebox.showinfo("GPrint - Reenvio concluído", self.status_var.get(), parent=self)
+
+    def _exportar_pendencias_lpr(self, itens, sessao):
+        por_destino = {'reenvio_lpr': {}, 'conferir_lpr': {}}
+        for item in itens:
+            if item['situacao'] == 'aceito':
+                continue
+            subpasta = 'reenvio_lpr' if item['situacao'] == 'reenviar' else 'conferir_lpr'
+            p = item['processo']
+            chave = (p['TXT_ORIGEM'], p['LINHA'])
+            contagens = por_destino[subpasta]
+            quantidade = p['QTD'] if item['job_unico'] else contagens.get(chave, (p, 0))[1] + 1
+            contagens[chave] = (p, quantidade)
+        titulos = {
+            'reenvio_lpr': "TXTs com cópias que ainda precisam de reenvio",
+            'conferir_lpr': "Confira as cópias com timeout na fila antes de usar estes TXTs",
+        }
+        for subpasta, contagens in por_destino.items():
+            if contagens:
+                self._exportar_miolo_txt(contagens.values(), subpasta, sessao, titulos[subpasta])
+
+    def _exportar_miolo_cancelado(self, pendentes, sessao):
+        self._exportar_miolo_txt(
+            [(p, p['QTD']) for p in pendentes], 'cancelados', sessao, "TXTs pendentes exportados"
+        )
+
+    def _exportar_miolo_txt(self, itens, subpasta, sessao, titulo):
+        por_txt = {}
+        for processo, quantidade in itens:
+            linha = processo['LINHA_ORIGINAL']
+            if quantidade != processo['QTD']:
+                campos = linha.split('|')
+                campos[2] = str(quantidade)
+                linha = '|'.join(campos)
+            por_txt.setdefault(processo['TXT_ORIGEM'], []).append(linha)
+        salvos, falhas = [], []
+        for origem, linhas in por_txt.items():
+            pasta = os.path.join(os.path.dirname(origem), subpasta, sessao)
+            destino = os.path.join(pasta, os.path.basename(origem))
+            temporario = None
+            try:
+                os.makedirs(pasta, exist_ok=True)
+                with tempfile.NamedTemporaryFile(
+                    mode='w', dir=pasta, delete=False, encoding='utf-8-sig', newline=''
+                ) as arquivo:
+                    temporario = arquivo.name
+                    arquivo.writelines(linhas)
+                os.replace(temporario, destino)
+            except OSError as erro:
+                falhas.append(f"{origem}: {erro}")
+                if temporario:
+                    try:
+                        os.remove(temporario)
+                    except OSError:
+                        logging.warning("Não foi possível remover o TXT temporário: %s", temporario)
+            else:
+                salvos.append(destino)
+                self.log(f"TXT de miolo exportado: {destino}")
+        if salvos:
+            messagebox.showinfo(titulo, "\n".join(salvos), parent=self)
+        if falhas:
+            messagebox.showerror("GPrint - Falha na exportação", "\n".join(falhas), parent=self)
 
     def selecionar_txt(self):
         """Seleciona ate MAX_ARQUIVOS_TXT_MIOLO arquivos (0 = ilimitado)."""
@@ -2867,7 +3133,7 @@ class MioloTab(ttk.Frame):
                 encodings = ['utf-8-sig', 'utf-8', 'cp1252', 'latin-1']
                 for enc in encodings:
                     try:
-                        with open(caminho_txt, 'r', encoding=enc) as f:
+                        with open(caminho_txt, 'r', encoding=enc, newline='') as f:
                             lines = f.readlines()
                         self.log(f"TXT {numero_txt}: {os.path.basename(caminho_txt)} (encoding: {enc})", "INFO")
                         break
@@ -2876,8 +3142,8 @@ class MioloTab(ttk.Frame):
                 if lines is None:
                     raise ValueError(f"Nao foi possivel identificar a codificacao do TXT: {caminho_txt}")
 
-                for idx, linha in enumerate(lines):
-                    linha = linha.strip()
+                for idx, linha_original in enumerate(lines):
+                    linha = linha_original.strip()
                     if not linha or linha.startswith('#'):
                         continue
 
@@ -2979,6 +3245,7 @@ class MioloTab(ttk.Frame):
 
                     processo["TXT_ORIGEM"] = caminho_txt
                     processo["TXT_NUMERO"] = numero_txt
+                    processo["LINHA_ORIGINAL"] = linha_original
                     novos_processos.append(processo)
 
 
@@ -2988,24 +3255,8 @@ class MioloTab(ttk.Frame):
             self.arquivo_txt = arquivos[0]  # compatibilidade com fluxo de TXT unico
             self.nome_base_txt = os.path.splitext(os.path.basename(arquivos[0]))[0]
 
-            for item in self.tree.get_children():
-                self.tree.delete(item)
-            for processo in self.processos:
-                self.tree.insert('', 'end', values=(
-                    processo['TXT_NUMERO'],
-                    f"L{processo['LINHA']}",
-                    os.path.basename(processo['ARQUIVO']),
-                    processo['FORMATO'].split('_')[1].upper() if len(processo['FORMATO'].split('_')) >= 2 else processo['FORMATO'].upper(),
-                    processo['CODIGOACAB'],
-                    processo['MODO'],
-                    processo['QTD'],
-                    processo['QTD_total']
-                ))
+            self._atualizar_lista_miolo()
             quantidade = len(arquivos)
-            self.file_label.config(text=(
-                os.path.basename(arquivos[0]) if quantidade == 1
-                else f"{quantidade} TXT selecionados | {len(self.processos)} processos"
-            ))
             self.status_var.set(f"✅ {len(self.processos)} processos de {quantidade} TXT carregados")
             self.log(f"✅ {quantidade} TXT carregado(s), total {len(self.processos)} processos", "SUCESSO")
             for numero, caminho in enumerate(arquivos, start=1):
@@ -3015,6 +3266,26 @@ class MioloTab(ttk.Frame):
             messagebox.showerror("Erro ao carregar TXT", f"Nao foi possivel carregar todos os TXT:\n{e}")
             self.log(f"ERRO ao carregar TXT: {e}", "ERRO")
             return False
+
+    def _atualizar_lista_miolo(self):
+        self.tree.delete(*self.tree.get_children())
+        for processo in self.processos:
+            partes = processo['FORMATO'].split('_')
+            self.tree.insert('', 'end', values=(
+                processo['TXT_NUMERO'],
+                f"L{processo['LINHA']}",
+                os.path.basename(processo['ARQUIVO']),
+                partes[min(1, len(partes) - 1)].upper(),
+                processo['CODIGOACAB'],
+                processo['MODO'],
+                processo['QTD'],
+                processo['QTD_total'],
+            ))
+        arquivos = list(dict.fromkeys(p['TXT_ORIGEM'] for p in self.processos))
+        self.file_label.config(text=(
+            os.path.basename(arquivos[0]) if len(arquivos) == 1
+            else f"{len(arquivos)} TXT selecionados | {len(self.processos)} processos"
+        ))
 
 def get_border_pixmap(page, rect, zoom=2.0):
     mat = fitz.Matrix(zoom, zoom)
@@ -4325,6 +4596,22 @@ def gprint_reservar_destino_capa(pasta_destino, identific, fila):
     raise RuntimeError('Nao foi possivel reservar um nome livre para a capa mesclada')
 
 
+def gprint_aplicar_icone(root):
+    pasta_recursos = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    caminhos = (
+        os.path.join(pasta_recursos, 'GPrint.ico'),
+        r"Q:\___LISTA DE PRIORIDADES\GUILHERME\GPrint.ico",
+    )
+    for caminho in caminhos:
+        try:
+            if os.path.isfile(caminho):
+                root.iconbitmap(default=caminho)
+                return
+        except (OSError, tk.TclError) as erro:
+            logging.warning("Falha ao carregar o ícone do GPrint: %s", erro)
+    logging.warning("GPrint.ico indisponível para a janela do GPrint.")
+
+
 class Application:
     def __init__(self, root):
         self.root = root
@@ -4334,18 +4621,7 @@ class Application:
         self.style = Style(theme=self.tema_atual.get())
         self.repositorio_equipamentos = GPrintEquipamentosRepository()
         self.equipamentos_cache = []
-        # Ícone do aplicativo
-        # "Q:\___LISTA DE PRIORIDADES\GUILHERME\GPrint.ico"
-        # Caminhos dos arquivos visuais
-        self.icon_path = r"Q:\___LISTA DE PRIORIDADES\GUILHERME\GPrint.ico"
         self.logo_path = r"Q:\___LISTA DE PRIORIDADES\GUILHERME\GPrint.png"
-
-        # Ícone da janela
-        try:
-            self.root.iconbitmap(self.icon_path)
-        except (OSError, tk.TclError) as e:
-            logging.warning("Icone da rede indisponivel: %s", e)
-
         
         # Controle de progresso
         self.processamento_em_andamento = False
@@ -8092,8 +8368,19 @@ if __name__ == "__main__":
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
 
+    if sys.platform == 'win32':
+        try:
+            resultado = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                ctypes.c_wchar_p('Docuprint.GPrint')
+            )
+            if resultado != 0:
+                logging.warning("Falha ao identificar GPrint na barra de tarefas: %s", resultado)
+        except (AttributeError, OSError) as erro:
+            logging.warning("Falha ao identificar GPrint na barra de tarefas: %s", erro)
+
     if verificar_data_limite():
         root = TkinterDnD.Tk()
+        gprint_aplicar_icone(root)
         style = Style(theme=CONFIG.get('tema', 'darkly'))
         app = Application(root)
         root.mainloop()
