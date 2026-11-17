@@ -1,5 +1,7 @@
 from builtins import super
 import os
+import ntpath
+from pathlib import Path
 import sys
 import multiprocessing
 
@@ -451,6 +453,16 @@ def gprint_ler_pendentes(limite=GPRINT_TAMANHO_LOTE_BANCO,
             raise
 
 
+def gprint_criar_schema_impressoes(conexao):
+    conexao.execute(_GPRINT_CRIAR_LOGS)
+    conexao.execute("""
+        CREATE TABLE IF NOT EXISTS gprint_ids_recebidos (
+            evento_id TEXT PRIMARY KEY,
+            data_hora TEXT NOT NULL
+        )
+    """)
+
+
 def gprint_gravar_lote_central(caminho_central, eventos):
     """Uma trava / uma transacao por lote, compatível com a tabela existente.
 
@@ -465,13 +477,7 @@ def gprint_gravar_lote_central(caminho_central, eventos):
         try:
             conexao.execute('PRAGMA busy_timeout=15000')
             conexao.execute('BEGIN IMMEDIATE')
-            conexao.execute(_GPRINT_CRIAR_LOGS)
-            conexao.execute("""
-                CREATE TABLE IF NOT EXISTS gprint_ids_recebidos (
-                    evento_id TEXT PRIMARY KEY,
-                    data_hora TEXT NOT NULL
-                )
-            """)
+            gprint_criar_schema_impressoes(conexao)
             novos = 0
             for evento_id, instante, dados_json in eventos:
                 dados = json.loads(dados_json)
@@ -595,7 +601,6 @@ MAX_MONTAGENS_SIMULTANEAS_MIOLO = 61  # Limite do ProcessPoolExecutor no Windows
 TIMEOUT_LPR_MIOLO_SEGUNDOS = 300
 
 DATA_LIMITE = "29/07/2027"
-PASTA_BASE = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\UICLAP\LOTES"
 PASTA_TRABALHO = os.path.join(os.environ.get('TEMP', os.path.expanduser("~")), "UICLAP_TEMP")
 CONFIG_FILE = os.path.expanduser("~/uiclap_config.json")
 MM = 2.83465 # Fator de conversão mm para pontos
@@ -831,6 +836,22 @@ class GPrintIndicadoresAndamento:
 # ============================================================================
 # CADASTRO CENTRAL DE EQUIPAMENTOS E FILAS (SQLite independente do historico)
 # ============================================================================
+GPRINT_MODOS_PASTAS_REFAZER = {
+    'clientes': 'Pastas de clientes',
+    'planilha': 'Lotes com planilha',
+    'pdf': 'Lotes com PDFs',
+    'uiclap_legado': 'Planilha UICLAP antiga',
+}
+GPRINT_PASTAS_REFAZER_INICIAIS = (
+    (0, 'POD', r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\_CAPAS DE POD AGRUPADAS", 'clientes'),
+    (1, 'uiclap', r"\\Sp-dek-srvap-07\api_docuprint", 'pdf'),
+    (2, 'uiclap antigo', r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\UICLAP\LOTES", 'uiclap_legado'),
+    (3, '', '', 'clientes'),
+    (4, '', '', 'clientes'),
+    (5, '', '', 'clientes'),
+)
+
+
 class GPrintCadastroErro(Exception):
     pass
 
@@ -858,7 +879,7 @@ class GPrintEquipamentosRepository:
             if conexao is not None:
                 conexao.close()
 
-    def preparar_banco(self):
+    def preparar_banco(self, pastas_iniciais=True):
         '''Cria apenas equipamentos.db se a pasta central ja estiver online.'''
         with self._conectar() as conn:
             with conn:
@@ -886,6 +907,60 @@ class GPrintEquipamentosRepository:
                     ativo INTEGER NOT NULL DEFAULT 1,
                     criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )''')
+
+                conn.execute("""CREATE TABLE IF NOT EXISTS pastas_clientes_refazer (
+                    slot INTEGER PRIMARY KEY CHECK(slot BETWEEN 0 AND 5),
+                    nome TEXT NOT NULL,
+                    caminho TEXT NOT NULL,
+                    modo TEXT NOT NULL CHECK(modo IN ('clientes', 'planilha', 'pdf', 'uiclap_legado'))
+                )""")
+                conn.executemany(
+                    'INSERT OR IGNORE INTO pastas_clientes_refazer(slot, nome, caminho, modo) VALUES (?, ?, ?, ?)',
+                    GPRINT_PASTAS_REFAZER_INICIAIS if pastas_iniciais
+                    else [(slot, '', '', 'clientes') for slot in range(6)])
+
+    def listar_pastas_refazer(self):
+        with self._conectar() as conn:
+            return [dict(linha) for linha in conn.execute(
+                'SELECT slot, nome, caminho, modo FROM pastas_clientes_refazer ORDER BY slot')]
+
+    def salvar_pastas_refazer(self, pastas, versao_anterior):
+        """Salva os seis espaços como um conjunto, sem sobrescrever edição de outra estação."""
+        if [p['slot'] for p in pastas] != list(range(6)):
+            raise ValueError('Informe a pasta principal e os cinco espaços adicionais.')
+        caminhos = set()
+        nomes = set()
+        valores = []
+        for pasta in pastas:
+            slot, nome, caminho, modo = (pasta[k] for k in ('slot', 'nome', 'caminho', 'modo'))
+            nome, caminho = nome.strip(), caminho.strip()
+            if not caminho:
+                if slot == 0:
+                    raise ValueError('Informe o caminho da pasta principal.')
+                valores.append(('', '', 'clientes', slot))
+                continue
+            caminho = ntpath.normpath(caminho)
+            if not ntpath.splitdrive(caminho)[0] or not ntpath.isabs(caminho):
+                raise ValueError(f'{nome or "Pasta adicional"}: informe um caminho completo de rede ou disco.')
+            if modo not in GPRINT_MODOS_PASTAS_REFAZER or (slot == 0 and modo != 'clientes'):
+                raise ValueError('Selecione uma estrutura válida para a pasta.')
+            if not nome:
+                raise ValueError(f'Informe o nome da pasta no espaço {slot}.')
+            chave = ntpath.normcase(caminho)
+            if chave in caminhos or nome.casefold() in nomes:
+                raise ValueError('Cada pasta deve ter um nome e um caminho diferentes.')
+            caminhos.add(chave)
+            nomes.add(nome.casefold())
+            valores.append((nome, caminho, modo, slot))
+        with self._conectar() as conn, conn:
+            conn.execute('BEGIN IMMEDIATE')
+            atual = [dict(linha) for linha in conn.execute(
+                'SELECT slot, nome, caminho, modo FROM pastas_clientes_refazer ORDER BY slot')]
+            if atual != versao_anterior:
+                raise ValueError('Outra estação alterou o cadastro. Recarregue antes de salvar.')
+            conn.executemany('UPDATE pastas_clientes_refazer SET nome=?, caminho=?, modo=? WHERE slot=?',
+                             valores)
+
 
     def listar_equipamentos(self, tipo=None, incluir_inativos=False):
         sql = 'SELECT id,nome,ip,tipo,ativo FROM equipamentos WHERE 1=1'
@@ -1577,142 +1652,353 @@ class GPrintCadastroOperadoresTab(ttk.Frame):
             self._erro(exc)
 
 
+class GPrintCadastroPastasRefazerTab(ttk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, padding=14)
+        self.app = app
+        self.repo = app.repositorio_equipamentos
+        self.versao = None
+        self.campos = []
+        self.columnconfigure(2, weight=1)
+        ttk.Label(
+            self, text='A pasta principal contém as pastas dos clientes. Cadastre até cinco pastas adicionais.',
+            wraplength=680,
+        ).grid(row=0, column=0, columnspan=5, sticky='w', pady=(0, 14))
+        for coluna, texto in enumerate(('Pasta', 'Nome', 'Caminho', 'Estrutura')):
+            ttk.Label(self, text=texto).grid(row=1, column=coluna, sticky='w', padx=(0, 8))
+        for slot in range(6):
+            linha = slot + 2
+            nome, caminho, modo = tk.StringVar(), tk.StringVar(), tk.StringVar()
+            self.campos.append((nome, caminho, modo))
+            label = 'Principal' if slot == 0 else f'Adicional {slot}'
+            ttk.Label(self, text=label).grid(row=linha, column=0, sticky='w', padx=(0, 8), pady=4)
+            ttk.Entry(self, textvariable=nome, width=16).grid(row=linha, column=1, sticky='ew', padx=(0, 8))
+            ttk.Entry(self, textvariable=caminho, width=22).grid(row=linha, column=2, sticky='ew', padx=(0, 8))
+            tipos = GPRINT_MODOS_PASTAS_REFAZER
+            ttk.Combobox(self, textvariable=modo, values=list(tipos.values()), width=20,
+                         state='readonly' if slot else 'disabled').grid(
+                             row=linha, column=3, sticky='ew', padx=(0, 8))
+            ttk.Button(self, text='Procurar…', command=lambda var=caminho: self._procurar(var)).grid(
+                row=linha, column=4, sticky='w')
+        acoes = ttk.Frame(self)
+        acoes.grid(row=8, column=0, columnspan=5, sticky='ew', pady=(15, 0))
+        self.salvar = ttk.Button(acoes, text='Salvar pastas', command=self._salvar, bootstyle=SUCCESS)
+        self.salvar.pack(side='left', padx=(0, 8))
+        ttk.Button(acoes, text='Recarregar', command=self.atualizar).pack(side='left')
+        ttk.Label(self, text='Para remover uma pasta adicional, limpe o campo Caminho e salve.',
+                  wraplength=680).grid(row=9, column=0, columnspan=5, sticky='w', pady=(8, 0))
+
+    def _procurar(self, caminho):
+        escolhido = filedialog.askdirectory(parent=self, title='Selecionar pasta de clientes ou lotes')
+        if escolhido:
+            caminho.set(escolhido)
+
+    def atualizar(self):
+        try:
+            dados = self.repo.listar_pastas_refazer()
+        except GPrintCadastroErro as erro:
+            self.versao = None
+            self.salvar.configure(state='disabled')
+            messagebox.showerror('GPrint - Pastas de clientes', str(erro), parent=self)
+            return
+        self.versao = dados
+        self.salvar.configure(state='normal')
+        for pasta, (nome, caminho, modo) in zip(dados, self.campos):
+            nome.set(pasta['nome'])
+            caminho.set(pasta['caminho'])
+            modo.set(GPRINT_MODOS_PASTAS_REFAZER[pasta['modo']])
+
+    def _salvar(self):
+        codigos = {rotulo: codigo for codigo, rotulo in GPRINT_MODOS_PASTAS_REFAZER.items()}
+        pastas = [
+            dict(slot=slot, nome=nome.get(), caminho=caminho.get(), modo=codigos.get(modo.get()))
+            for slot, (nome, caminho, modo) in enumerate(self.campos)
+        ]
+        try:
+            self.repo.salvar_pastas_refazer(pastas, self.versao)
+        except (ValueError, GPrintCadastroErro) as erro:
+            messagebox.showerror('GPrint - Pastas de clientes', str(erro), parent=self)
+            return
+        self.atualizar()
+        self.app.aba_refazer.carregar_clientes(recarregar=True)
+        messagebox.showinfo('GPrint - Pastas de clientes', 'Cadastro atualizado.', parent=self)
+
+
+class GPrintBancosAdministrativos:
+    """Backups externos e restauração dos três bancos centrais."""
+    def __init__(self, equipamentos):
+        self.equipamentos = equipamentos
+        self.caminhos = {
+            'equipamentos.db': Path(equipamentos.db_path),
+            'impressoes.db': Path(GPRINT_BANCO_HISTORICO),
+            'refazer.db': Path(GPRINT_BANCO_REFAZER),
+        }
+
+    @staticmethod
+    def _uri_leitura(caminho):
+        caminho = caminho.resolve()
+        uri = caminho.as_uri()
+        if caminho.drive.startswith('\\\\'):
+            # SQLite espera um caminho UNC com autoridade vazia na URI.
+            uri = 'file:////' + uri.removeprefix('file://')
+        return uri + '?mode=ro'
+
+    def gerar_pacote(self, pasta_destino, vazio=False):
+        pasta_destino = Path(pasta_destino)
+        tipo = 'GPrint_bancos_vazios' if vazio else 'GPrint_backup'
+        destino = pasta_destino / f'{tipo}_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:6]}'
+        with tempfile.TemporaryDirectory(prefix='gprint_', dir=pasta_destino) as temporario:
+            pasta = Path(temporario) / 'bancos'
+            pasta.mkdir()
+            if vazio:
+                self._preparar_bancos({nome: pasta / nome for nome in self.caminhos}, vazio=True)
+            else:
+                for nome, central in self.caminhos.items():
+                    if not central.is_file():
+                        raise ValueError(f'Não foi possível localizar {nome} na pasta central LOGS.')
+                    with closing(sqlite3.connect(self._uri_leitura(central), uri=True, timeout=15)) as origem:
+                        with closing(sqlite3.connect(pasta / nome)) as copia:
+                            origem.backup(copia)
+            pasta.rename(destino)
+        return destino
+
+    @staticmethod
+    def _preparar_bancos(caminhos, vazio=False):
+        GPrintEquipamentosRepository(caminhos['equipamentos.db']).preparar_banco(pastas_iniciais=not vazio)
+        for nome, criar_schema in (
+            ('impressoes.db', gprint_criar_schema_impressoes), ('refazer.db', gprint_criar_schema_refazer)
+        ):
+            with closing(sqlite3.connect(caminhos[nome], timeout=15)) as conn, conn:
+                criar_schema(conn)
+
+    def importar_pacote(self, pasta_origem):
+        fontes = {nome: Path(pasta_origem) / nome for nome in self.caminhos}
+        for nome, caminho in fontes.items():
+            if not caminho.is_file():
+                raise ValueError(f'Arquivo obrigatório ausente na pasta selecionada: {nome}.')
+            if any(central.exists() and caminho.samefile(central) for central in self.caminhos.values()):
+                raise ValueError('Selecione uma pasta de backup diferente dos bancos centrais em uso.')
+
+        estruturas = (
+            ('main', 'equipamentos', ('id', 'nome', 'ip', 'tipo', 'ativo', 'criado_em')),
+            ('main', 'filas', ('id', 'equipamento_id', 'nome', 'descricao', 'ignorar_folha_obra', 'ativo')),
+            ('main', 'operadores', ('id', 'nome', 'ativo', 'criado_em')),
+            ('main', 'pastas_clientes_refazer', ('slot', 'nome', 'caminho', 'modo')),
+            ('impressoes', 'logs', (
+                'id', 'data_hora', 'lote', 'pilha', 'arquivo', 'maquina', 'ip', 'formato',
+                'modo', 'quantidade', 'status', 'erro', 'copia', 'usuario', 'montagem_ok', 'envio_ok')),
+            ('impressoes', 'gprint_ids_recebidos', ('evento_id', 'data_hora')),
+            ('refazer', 'refazer_registros', GPRINT_REFAZER_CAMPOS),
+        )
+        aliases = dict(zip(self.caminhos, ('main', 'impressoes', 'refazer')))
+        self._preparar_bancos(self.caminhos)
+        with closing(sqlite3.connect(self.caminhos['equipamentos.db'], uri=True, timeout=15)) as conn, conn:
+            conn.execute('PRAGMA foreign_keys = ON')
+            conn.execute('PRAGMA trusted_schema = OFF')
+            for nome, alias in aliases.items():
+                if alias != 'main':
+                    conn.execute(f'ATTACH DATABASE ? AS {alias}', (str(self.caminhos[nome]),))
+                conn.execute(f'ATTACH DATABASE ? AS origem_{alias}', (self._uri_leitura(fontes[nome]),))
+                modo = conn.execute(f'PRAGMA {alias}.journal_mode').fetchone()[0]
+                if modo not in ('delete', 'truncate', 'persist'):
+                    raise ValueError(f'{nome}: modo de journal {modo} incompatível com restauração conjunta.')
+                conn.execute(f'PRAGMA {alias}.synchronous = FULL')
+            conn.execute('BEGIN IMMEDIATE')
+            operacoes = []
+            for alias, tabela, colunas in estruturas:
+                origem = f'origem_{alias}'
+                objeto = conn.execute(
+                    f'SELECT type FROM {origem}.sqlite_schema WHERE name=?', (tabela,)).fetchone()
+                if objeto is None and tabela == 'pastas_clientes_refazer':
+                    continue  # Preserva pastas atuais quando o backup antecede este cadastro.
+                if objeto is None and tabela == 'gprint_ids_recebidos':
+                    operacoes.append((alias, tabela, None))
+                    continue
+                disponiveis = {r[1] for r in conn.execute(f'PRAGMA {origem}.table_info({tabela})')}
+                if objeto != ('table',) or not set(colunas) <= disponiveis:
+                    raise ValueError(f'O backup não tem uma estrutura compatível para {tabela}.')
+                if tabela == 'pastas_clientes_refazer':
+                    slots = conn.execute(f'SELECT slot FROM {origem}.{tabela} ORDER BY slot').fetchall()
+                    if slots != [(slot,) for slot in range(6)]:
+                        raise ValueError('O backup de pastas precisa ter os seis espaços de cadastro.')
+                operacoes.append((alias, tabela, ', '.join(colunas)))
+
+            for alias, tabela, _ in reversed(operacoes):
+                conn.execute(f'DELETE FROM {alias}.{tabela}')
+            for alias, tabela, colunas in operacoes:
+                if colunas:
+                    conn.execute(f'INSERT INTO {alias}.{tabela} ({colunas}) '
+                                 f'SELECT {colunas} FROM origem_{alias}.{tabela}')
+
+
+class GPrintBancoAdministrativoTab(ttk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, padding=18)
+        self.app = app
+        self.bancos = GPrintBancosAdministrativos(app.repositorio_equipamentos)
+        self.columnconfigure(0, weight=1)
+        ttk.Label(self, text='Bancos centrais da pasta LOGS', font=('Segoe UI', 12, 'bold')).grid(
+            row=0, column=0, columnspan=2, sticky='w')
+        ttk.Label(self, text='equipamentos.db  |  impressoes.db  |  refazer.db').grid(
+            row=1, column=0, columnspan=2, sticky='w', pady=(5, 14))
+        opcoes = (
+            ('Exportar bancos', 'Cria uma pasta de backup com os três arquivos .db.', self._exportar),
+            ('Importar bancos', 'Restaura os três arquivos de uma pasta de backup.', self._importar),
+            ('Gerar bancos vazios', 'Cria os três arquivos com suas tabelas, prontos para uso.',
+             self._gerar_vazios),
+        )
+        for linha, (titulo, descricao, acao) in enumerate(opcoes, 2):
+            ttk.Label(self, text=descricao, wraplength=490).grid(
+                row=linha, column=0, sticky='w', pady=7, padx=(0, 12))
+            ttk.Button(self, text=titulo, command=acao).grid(row=linha, column=1, sticky='ew', pady=7)
+
+    def _exportar(self):
+        self._salvar_pacote('Exportar bancos', vazio=False)
+
+    def _gerar_vazios(self):
+        self._salvar_pacote('Gerar bancos vazios', vazio=True)
+
+    def _salvar_pacote(self, titulo, vazio):
+        destino = filedialog.askdirectory(parent=self, title=f'{titulo} — escolha a pasta de destino')
+        if not destino:
+            return
+        try:
+            pasta = self.bancos.gerar_pacote(destino, vazio=vazio)
+        except (ValueError, GPrintCadastroErro, OSError, sqlite3.Error) as erro:
+            messagebox.showerror(titulo, str(erro), parent=self)
+        else:
+            messagebox.showinfo(titulo, f'Arquivos salvos em:\n{pasta}', parent=self)
+
+    def _importar(self):
+        origem = filedialog.askdirectory(
+            parent=self, title='Selecione a pasta com equipamentos.db, impressoes.db e refazer.db')
+        if not origem or not messagebox.askyesno(
+            'GPrint - Confirmar restauração',
+            'Substituir os cadastros, o histórico de impressões e os registros de retrabalho '
+            'pelos dados da pasta selecionada?\n\n'
+            'A alteração vale para todas as estações que usam os bancos centrais.',
+            parent=self,
+        ):
+            return
+        try:
+            self.bancos.importar_pacote(origem)
+        except (ValueError, GPrintCadastroErro, OSError, sqlite3.Error) as erro:
+            messagebox.showerror('GPrint - Importar bancos', str(erro), parent=self)
+            return
+        self.app.aba_config.atualizar_cadastros_apos_importacao()
+        messagebox.showinfo('GPrint - Importar bancos', 'Os três bancos foram restaurados.', parent=self)
+
+
 class ConfigTab(ttk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
         self._admin_liberado = False
         self._cadastro_widget = None
+        self._widgets_cadastros = []
         self._criar_configuracoes_internas()
         self.setup_ui()
 
     def _criar_configuracoes_internas(self):
-        """Preferencias livres; equipamentos e operadores em abas restritas por senha."""
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
         self.abas_config = ttk.Notebook(self)
         self.abas_config.grid(row=0, column=0, sticky='nsew')
         self.tab_preferencias = ttk.Frame(self.abas_config)
-        self.tab_equipamentos = ttk.Frame(self.abas_config)
-        self.tab_operadores = ttk.Frame(self.abas_config)
-        self.abas_config.add(self.tab_preferencias, text='Preferencias pessoais')
-        self.abas_config.add(self.tab_equipamentos, text='Equipamentos e filas (restrito)')
-        self.abas_config.add(self.tab_operadores, text='Operadores do Refazer (restrito)')
-        self._operadores_widget = None
+        self.tab_administracao = ttk.Frame(self.abas_config)
+        self.abas_config.add(self.tab_preferencias, text='Preferências pessoais')
+        self.abas_config.add(self.tab_administracao, text='Administração central (restrito)')
 
-        for aba, titulo, descricao, desbloquear in (
-            (self.tab_equipamentos, 'Cadastro central de equipamentos',
-             'Cadastre equipamentos, seus IPs e filas de impressao.',
-             self.solicitar_acesso_equipamentos),
-            (self.tab_operadores, 'Cadastro central de operadores',
-             'Cadastre, edite, ative, desative ou exclua operadores do Refazer.',
-             self.solicitar_acesso_operadores),
-        ):
-            aba.columnconfigure(0, weight=1)
-            aba.rowconfigure(1, weight=1)
-            bloqueio = ttk.Frame(aba, padding=22)
-            bloqueio.grid(row=1, column=0, sticky='nsew')
-            ttk.Label(bloqueio, text=titulo,
-                      font=('Segoe UI', 15, 'bold')).pack(anchor='w', pady=(0, 10))
-            ttk.Label(bloqueio,
-                      text=descricao + '\nAcesso protegido pela senha administrativa.',
-                      justify='left').pack(anchor='w', pady=(0, 15))
-            ttk.Button(bloqueio, text='Desbloquear cadastro',
-                       command=desbloquear, bootstyle=PRIMARY).pack(anchor='w')
-            barra = ttk.Frame(aba, padding=(12, 6))
-            ttk.Label(barra,
-                      text='Administracao central — alteracoes afetam todas as estacoes',
-                      bootstyle=SECONDARY).pack(side=tk.LEFT)
-            ttk.Button(barra, text='Bloquear cadastros',
-                       command=self.bloquear_cadastro, bootstyle=WARNING).pack(side=tk.RIGHT)
-            if aba is self.tab_equipamentos:
-                self._acesso_equipamentos = bloqueio
-                self._barra_administrativa = barra
-            else:
-                self._acesso_operadores = bloqueio
-                self._barra_operadores = barra
-
-        self.abas_config.bind('<<NotebookTabChanged>>', self._ao_mudar_configuracao, add='+')
+        self.tab_administracao.columnconfigure(0, weight=1)
+        self.tab_administracao.rowconfigure(0, weight=1)
+        self._bloqueio_admin = ttk.Frame(self.tab_administracao, padding=22)
+        self._bloqueio_admin.grid(row=0, column=0, sticky='nsew')
+        ttk.Label(self._bloqueio_admin, text='Administração central',
+                  font=('Segoe UI', 15, 'bold')).pack(anchor='w')
+        ttk.Label(self._bloqueio_admin, text='Equipamentos, filas, operadores e pastas de clientes.',
+                  wraplength=600).pack(anchor='w', pady=(8, 12))
+        ttk.Button(self._bloqueio_admin, text='Desbloquear cadastros',
+                   command=self.solicitar_acesso_administrativo, bootstyle=PRIMARY).pack(anchor='w')
+        self.abas_config.bind('<<NotebookTabChanged>>', self._ao_mudar_configuracao)
 
     def _ao_mudar_configuracao(self, _event=None):
-        aba = self.abas_config.select()
-        if aba not in (str(self.tab_equipamentos), str(self.tab_operadores)):
-            return
-        if self._admin_liberado:
-            self._mostrar_cadastro_liberado(aba)
-        else:
-            self.after_idle(lambda: self._solicitar_acesso_aba(aba))
-
-    def _solicitar_acesso_aba(self, aba):
-        if aba == str(self.tab_equipamentos):
-            self.solicitar_acesso_equipamentos()
-        elif aba == str(self.tab_operadores):
-            self.solicitar_acesso_operadores()
+        if self.abas_config.select() != str(self.tab_administracao):
+            self.bloquear_cadastro()
 
     def mostrar_equipamentos(self):
-        """Usado durante a configuracao inicial quando nao ha equipamentos."""
-        self.abas_config.select(self.tab_equipamentos)
+        self.abas_config.select(self.tab_administracao)
+        self.solicitar_acesso_administrativo()
 
-    def _mostrar_cadastro_liberado(self, aba):
-        if not self._admin_liberado:
+    def solicitar_acesso_administrativo(self):
+        if self._admin_liberado or self.abas_config.select() != str(self.tab_administracao):
             return
-        if aba == str(self.tab_equipamentos):
-            self._acesso_equipamentos.grid_remove()
-            self._barra_administrativa.grid(row=0, column=0, sticky='ew')
-            if self._cadastro_widget is None:
-                self._cadastro_widget = GPrintCadastroEquipamentosTab(self.tab_equipamentos, self.app)
-            self._cadastro_widget.grid(row=1, column=0, sticky='nsew')
-            self._cadastro_widget.atualizar()
-        elif aba == str(self.tab_operadores):
-            self._acesso_operadores.grid_remove()
-            self._barra_operadores.grid(row=0, column=0, sticky='ew')
-            if self._operadores_widget is None:
-                self._operadores_widget = GPrintCadastroOperadoresTab(self.tab_operadores, self.app)
-            self._operadores_widget.grid(row=1, column=0, sticky='nsew')
-            self._operadores_widget.atualizar()
+        senha_configurada = GPRINT_SENHA_ADMIN_EQUIPAMENTOS
+        if not senha_configurada.strip():
+            messagebox.showwarning('GPrint - Cadastro restrito',
+                                   'Configure a senha administrativa.', parent=self)
+            return
+        senha = simpledialog.askstring('GPrint - Acesso administrativo',
+                                       'Informe a senha da administração central:', show='*', parent=self)
+        if senha is None:
+            return
+        if not hmac.compare_digest(senha.encode('utf-8'), senha_configurada.encode('utf-8')):
+            messagebox.showerror('GPrint - Acesso negado', 'Senha incorreta.', parent=self)
+            return
+        self._admin_liberado = True
+        self._bloqueio_admin.grid_remove()
+        painel = self._cadastro_widget = ttk.Frame(self.tab_administracao, padding=10)
+        painel.grid(row=0, column=0, sticky='nsew')
+        painel.columnconfigure(0, weight=1)
+        painel.rowconfigure(1, weight=1)
+        barra = ttk.Frame(painel)
+        barra.grid(row=0, column=0, sticky='ew', pady=(0, 8))
+        ttk.Label(barra, text='Alterações compartilhadas entre as estações').pack(side='left')
+        ttk.Button(barra, text='Bloquear cadastros', command=self.bloquear_cadastro,
+                   bootstyle=WARNING).pack(side='right')
+        abas = ttk.Notebook(painel)
+        abas.grid(row=1, column=0, sticky='nsew')
+        secoes = {}
+        for titulo, classe in (
+            ('Equipamentos e filas', GPrintCadastroEquipamentosTab),
+            ('Operadores do Refazer', GPrintCadastroOperadoresTab),
+            ('Pastas de clientes', GPrintCadastroPastasRefazerTab),
+            ('Banco de dados', GPrintBancoAdministrativoTab),
+        ):
+            aba = ttk.Frame(abas)
+            abas.add(aba, text=titulo)
+            secoes[str(aba)] = (aba, classe)
 
-    def solicitar_acesso_equipamentos(self):
-        return self.solicitar_acesso_administrativo(self.tab_equipamentos)
+        def abrir_secao(evento=None):
+            secao = secoes.get(abas.select())
+            if not secao:
+                return
+            aba, classe = secao
+            if not aba.winfo_children():
+                widget = classe(aba, self.app)
+                widget.pack(fill='both', expand=True)
+                if not isinstance(widget, GPrintBancoAdministrativoTab):
+                    self._widgets_cadastros.append(widget)
+                    widget.atualizar()
 
-    def solicitar_acesso_operadores(self):
-        return self.solicitar_acesso_administrativo(self.tab_operadores)
+        abas.bind('<<NotebookTabChanged>>', abrir_secao)
+        abrir_secao()
 
-    def solicitar_acesso_administrativo(self, aba):
-        if (self.abas_config.select() != str(aba)
-                or self.app.notebook.select() != str(self)):
-            return False
-        if not self._admin_liberado:
-            senha_configurada = GPRINT_SENHA_ADMIN_EQUIPAMENTOS
-            if not senha_configurada.strip():
-                messagebox.showwarning('GPrint - Cadastro restrito',
-                     'Configure a senha administrativa antes de utilizar os cadastros.',
-                     parent=self)
-                return False
-            senha = simpledialog.askstring('GPrint - Acesso administrativo',
-                    'Informe a senha para acessar o cadastro central:',
-                    show='*', parent=self)
-            if senha is None:
-                return False
-            if not hmac.compare_digest(senha, senha_configurada):
-                messagebox.showerror('GPrint - Acesso negado',
-                     'Senha incorreta. O cadastro permanece bloqueado.', parent=self)
-                return False
-            self._admin_liberado = True
-        self._mostrar_cadastro_liberado(str(aba))
-        return True
+    def atualizar_cadastros_apos_importacao(self):
+        for widget in self._widgets_cadastros:
+            widget.atualizar()
+        self.app.atualizar_listas_equipamentos()
+        self.app.aba_refazer.atualizar_destinos_refazer()
+        self.app.aba_refazer.atualizar_operadores_refazer()
+        self.app.aba_refazer.carregar_clientes(recarregar=True)
 
     def bloquear_cadastro(self):
-        """Ao sair de Configuracoes, revoga acesso a ambas as abas administrativas."""
         self._admin_liberado = False
-        for nome in ('_cadastro_widget', '_operadores_widget'):
-            widget = getattr(self, nome, None)
-            if widget is not None:
-                widget.destroy()
-                setattr(self, nome, None)
-        self._barra_administrativa.grid_remove()
-        self._barra_operadores.grid_remove()
-        self._acesso_equipamentos.grid(row=1, column=0, sticky='nsew')
-        self._acesso_operadores.grid(row=1, column=0, sticky='nsew')
+        self._widgets_cadastros.clear()
+        if self._cadastro_widget is not None:
+            self._cadastro_widget.destroy()
+            self._cadastro_widget = None
+        self._bloqueio_admin.grid()
+
     def setup_ui(self):
         # Preferencias continuam individuais em cada estacao.
         self.tab_preferencias.columnconfigure(0, weight=1)
@@ -4719,7 +5005,7 @@ class Application:
             self.notebook.select(self.aba_config)
             messagebox.showinfo('Configuracao inicial do GPrint',
                 'Nenhum equipamento ativo foi encontrado.\n\n'
-                'Acesse Configuracoes > Equipamentos e filas, entre com a senha '
+                'Acesse Configurações > Administração central > Equipamentos e filas, entre com a senha '
                 'administrativa e cadastre as impressoras e suas filas.\n'
                 'O cadastro sera compartilhado pelas estacoes.', parent=self.root)
             self.aba_config.mostrar_equipamentos()
@@ -4732,6 +5018,7 @@ class Application:
         if aba_atual == str(self.aba_refazer):
             self.aba_refazer.atualizar_destinos_refazer()
             self.aba_refazer.atualizar_operadores_refazer()
+            self.aba_refazer.carregar_clientes()
         if aba_atual in (str(self.aba_principal),str(self.aba_miolo),str(self.aba_hotfolder)):
             try:
                 self.atualizar_listas_equipamentos()
@@ -5295,7 +5582,7 @@ class Application:
         tk.Label(main, text="GPrint", font=("Segoe UI", 18, "bold"),
                 bg="#0f172a", fg="#f8fafc").pack(pady=(10, 0))
 
-        versao_badge = tk.Label(main, text="  v13.0  ", font=("Segoe UI", 10, "bold"),
+        versao_badge = tk.Label(main, text="  v12.0  ", font=("Segoe UI", 10, "bold"),
                                 bg="#3b82f6", fg="white", padx=8, pady=2)
         versao_badge.pack(pady=(4, 12))
 
@@ -6173,12 +6460,45 @@ class GPrintJanelaResumoPerdas(tk.Toplevel):
         self.status.set(f'PDFs preparados: {montados}   |   Envios LPR aceitos: {enviados}   |   Falhas: {falhas}')
 
 
+def gprint_clientes_das_pastas(pastas):
+    candidatos = []
+    avisos = []
+    for pasta in pastas:
+        caminho = pasta['caminho']
+        if not caminho:
+            continue
+        modo = pasta['modo']
+        try:
+            if modo == 'clientes':
+                with os.scandir(caminho) as entradas:
+                    clientes = sorted(
+                        ((e.name, e.path) for e in entradas if e.is_dir()),
+                        key=lambda item: item[0].casefold())
+                candidatos.extend((nome, local, 'planilha', pasta, False) for nome, local in clientes)
+            else:
+                # Verifica o acesso sem carregar todos os lotes antecipadamente.
+                with os.scandir(caminho):
+                    pass
+                candidatos.append((pasta['nome'], caminho, modo, pasta, True))
+        except OSError as erro:
+            avisos.append(f"{pasta['nome']} ({caminho}): {erro}")
+
+    diretos = {nome.casefold() for nome, _, _, _, direto in candidatos if direto}
+    destinos = {}
+    rotulos = set()
+    for nome, caminho, modo, pasta, direto in candidatos:
+        rotulo = nome
+        if rotulo.casefold() in rotulos or (not direto and rotulo.casefold() in diretos):
+            rotulo = f"{nome} — {pasta['nome']}"
+        while rotulo.casefold() in rotulos or (not direto and rotulo.casefold() in diretos):
+            rotulo += f" [{pasta['slot'] + 1}]"
+        rotulos.add(rotulo.casefold())
+        destinos[rotulo] = (caminho, modo)
+    return destinos, avisos
+
+
 class RefazerTab(ttk.Frame):
     # ---------- CONFIGURAÇÕES (agora atributos da classe) ----------
-    CAMINHO_CAPAS_POD_AGRUPADAS = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\_CAPAS DE POD AGRUPADAS"
-    CAMINHO_UICLAP_LOTES = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\UICLAP\LOTES"
-    CAMINHO_UICLAP_LOTES_NOVO = r"\\Sp-dek-srvap-07\api_docuprint"
-    CAMINHO_RELATORIOS_PERDA = r"\\192.168.200.253\producao\____REPOSITORIO GERAL POD\_CAPAS DE POD AGRUPADAS\Z_RELATÓRIOS\RELATÓRIOS DE PERDA.xlsx"
     GS_PATH = r"C:\Ghostscript\gswin64c.exe"
 
     LARGURA_CM = 45
@@ -6225,7 +6545,9 @@ class RefazerTab(ttk.Frame):
         self._refazer_em_execucao = False
 
         self._criar_interface()
-        self.carregar_clientes()
+        self._clientes_por_pasta = {}
+        self._carregando_clientes = False
+        self._recarregar_clientes = False
 
     # ---------- FUNÇÕES AUXILIARES (métodos da classe) ----------
     @staticmethod
@@ -6570,18 +6892,11 @@ class RefazerTab(ttk.Frame):
                 return i
         return -1
 
-    @staticmethod
-    def _cliente_uiclap(cliente):
-        return str(cliente).strip().lower().replace('_', ' ') in ('uiclap', 'uiclap antigo')
+    def _cliente_uiclap(self, cliente):
+        return self._clientes_por_pasta.get(cliente, ('', ''))[1] in ('pdf', 'uiclap_legado')
 
     def _pasta_cliente_refazer(self, cliente):
-        """Uma única regra de caminho para listar, buscar, copiar e processar."""
-        chave = str(cliente).strip().lower().replace('_', ' ')
-        if chave == 'uiclap':
-            return self.CAMINHO_UICLAP_LOTES_NOVO
-        if chave == 'uiclap antigo':
-            return self.CAMINHO_UICLAP_LOTES
-        return os.path.join(self.CAMINHO_CAPAS_POD_AGRUPADAS, cliente)
+        return self._clientes_por_pasta[cliente][0]
 
     def obter_lista_arquivos_da_pasta(self, pasta):
         """UICLAP novo: PDFs na raiz do lote, sem depender de planilha."""
@@ -6748,9 +7063,12 @@ class RefazerTab(ttk.Frame):
         top.grid_columnconfigure(3, weight=2)
 
         ttk.Label(top, text="Cliente").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        self.cb_cliente = ttk.Combobox(top, textvariable=self.pasta_var)
+        self.cb_cliente = ttk.Combobox(top, textvariable=self.pasta_var, state="readonly")
         self.cb_cliente.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
         self.cb_cliente.bind("<<ComboboxSelected>>", self.on_cliente_change)
+        ttk.Button(top, text="Atualizar clientes", command=self.carregar_clientes).grid(
+            row=0, column=4, padx=(0, 5), pady=5)
+
 
         ttk.Label(top, text="Lote").grid(row=0, column=2, padx=5, pady=5, sticky="w")
         campo_lote = ttk.Frame(top)
@@ -7180,8 +7498,8 @@ class RefazerTab(ttk.Frame):
 
     def atualizar_subpastas(self, event=None):
         cliente = self.pasta_var.get()
-        base = self._pasta_cliente_refazer(cliente)
-        self.lotes_disponiveis = self.listar_pastas(base, reverse=True)
+        base = self._clientes_por_pasta.get(cliente)
+        self.lotes_disponiveis = self.listar_pastas(base[0], reverse=True) if base else []
         self.busca_lote_var.set("")
         if self.lotes_disponiveis:
             self.cb_lote.current(0)
@@ -7214,15 +7532,49 @@ class RefazerTab(ttk.Frame):
             messagebox.showinfo('GPrint - Refazer', 'Nenhum lote corresponde à busca.', parent=self)
         return "break"
 
-    def carregar_clientes(self):
-        clientes = self.listar_pastas(self.CAMINHO_CAPAS_POD_AGRUPADAS)
-        # Evita duplicar os atalhos caso exista uma pasta com o mesmo nome.
-        clientes = [c for c in clientes if not self._cliente_uiclap(c)]
-        clientes.extend(["uiclap", "uiclap antigo"])
-        self.cb_cliente["values"] = clientes
-        if clientes:
-            self.cb_cliente.current(0)
-            self.atualizar_subpastas()
+    def carregar_clientes(self, recarregar=False):
+        if self._carregando_clientes:
+            self._recarregar_clientes |= recarregar
+            return
+        if self._refazer_em_execucao:
+            return
+        self._carregando_clientes = True
+
+        def carregar():
+            repositorio = self.app.repositorio_equipamentos if self.app else GPrintEquipamentosRepository()
+            try:
+                # Também funciona se o operador abrir Refazer durante a inicialização.
+                repositorio.preparar_banco()
+                clientes, avisos = gprint_clientes_das_pastas(repositorio.listar_pastas_refazer())
+            except GPrintCadastroErro as erro:
+                clientes, avisos = None, [str(erro)]
+            self.after(0, self._aplicar_clientes, clientes, avisos)
+
+        threading.Thread(target=carregar, daemon=True).start()
+
+    def _aplicar_clientes(self, clientes, avisos):
+        self._carregando_clientes = False
+        if self._recarregar_clientes:
+            self._recarregar_clientes = False
+            self.carregar_clientes()
+            return
+        if self._refazer_em_execucao:
+            return
+        if clientes is not None:
+            escolhido = self.pasta_var.get()
+            anterior = self._clientes_por_pasta.get(escolhido)
+            self._clientes_por_pasta = clientes
+            self.cb_cliente.configure(values=list(clientes))
+            if escolhido not in clientes:
+                self.pasta_var.set(next(iter(clientes), ''))
+            if self.pasta_var.get() != escolhido or clientes.get(escolhido) != anterior:
+                self.on_cliente_change()
+        if avisos:
+            self.status_var.set(f"{len(avisos)} pasta(s) ou cadastro indisponível. Use Atualizar clientes.")
+            for aviso in avisos:
+                logging.warning('Refazer: %s', aviso)
+        else:
+            self.status_var.set(f'{len(clientes)} cliente(s) disponíveis')
 
     def buscar_arquivos(self):
         cliente = self.pasta_var.get()
@@ -7230,7 +7582,7 @@ class RefazerTab(ttk.Frame):
         if not cliente or not lote:
             return
         pasta = os.path.join(self._pasta_cliente_refazer(cliente), lote)
-        if str(cliente).strip().lower() == 'uiclap':
+        if self._clientes_por_pasta[cliente][1] == 'pdf':
             # Não reutiliza índices de uma planilha carregada anteriormente.
             self.idx_capa = self.idx_miolo = self.idx_caminho = -1
             try:
@@ -7523,7 +7875,8 @@ class RefazerTab(ttk.Frame):
 
         if not operador:
             messagebox.showwarning('GPrint - Refazer',
-                'Selecione um operador cadastrado em Configuracoes > Operadores do Refazer.', parent=self)
+                'Selecione um operador cadastrado em Configurações > Administração central > Operadores do Refazer.',
+                parent=self)
             return
         # Inicializa a fila DURAVEL antes de copiar ou montar qualquer PDF.
         try:
