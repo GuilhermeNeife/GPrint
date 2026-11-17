@@ -26,7 +26,6 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 from datetime import datetime, timedelta, date
 from typing import List
 import fitz  
-from PyPDF2 import PdfMerger
 from pikepdf import Pdf, Rectangle
 from reportlab.lib.pagesizes import A3, A4
 from reportlab.pdfgen import canvas
@@ -41,7 +40,7 @@ import random
 import ctypes
 import ipaddress
 import hmac
-from contextlib import closing
+from contextlib import closing, suppress
 from tkinter import simpledialog
 
 # ============================================================================
@@ -2005,6 +2004,107 @@ class ConfigTab(ttk.Frame):
             self.carregar_configuracoes()
             salvar_configuracoes(CONFIG)
             messagebox.showinfo("Sucesso", "Configurações padrão restauradas!")           
+def gprint_enviar_pdf_lpr(log, caminho_arquivo, ip, formato, job_name, copia_numero=1, total_copias=1):
+    arquivo_temp = None
+    try:
+        tamanho_mib = os.path.getsize(caminho_arquivo) / (1024 ** 2)
+        log(
+            f"Enviando cópia {copia_numero}/{total_copias} | {tamanho_mib:.1f} MiB | "
+            f"IP: {ip} | Fila: {formato} | Job: {job_name}", "ENVIO"
+        )
+        arquivo_temp = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.pdf")
+        shutil.copy2(caminho_arquivo, arquivo_temp)
+        time.sleep(1)
+        resultado = subprocess.run(
+            ["lpr", "-S", ip, "-P", formato, "-J", job_name, arquivo_temp],
+            capture_output=True, text=True, timeout=TIMEOUT_LPR_MIOLO_SEGUNDOS,
+            errors="replace",
+        )
+        if resultado.returncode == 0:
+            log(f"Cópia {copia_numero} aceita pelo LPR", "SUCESSO")
+            return True, "", False
+        detalhe = (resultado.stderr or resultado.stdout or "").strip()
+        erro = f"LPR retornou código {resultado.returncode}"
+        if detalhe:
+            erro += f": {detalhe}"
+    except subprocess.TimeoutExpired:
+        erro = f"Timeout LPR de {TIMEOUT_LPR_MIOLO_SEGUNDOS}s; aceite pela fila não confirmado"
+        log(erro, "ERRO")
+        return False, erro, True
+    except Exception as exc:
+        erro = str(exc)
+    finally:
+        if arquivo_temp:
+            try:
+                os.remove(arquivo_temp)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logging.warning("Não foi possível remover temporário LPR: %s", exc)
+    log(erro, "ERRO")
+    return False, erro, False
+
+def gprint_registrar_pendencias_lpr(emitir_log, caminho, etapa, itens):
+    try:
+        with open(caminho, 'a', encoding='utf-8-sig') as arquivo:
+            arquivo.write(f"\n{etapa} | {datetime.now():%d/%m/%Y %H:%M:%S}\n")
+            for item in itens:
+                log = item['log']
+                arquivo.write(
+                    f"\nSituação: {item['situacao']} | Envio {item['copia']}/{item['total_envios']}\n"
+                    f"PDF montado: {item['pdf']}\n"
+                    f"Origem: {item['processo']['TXT_ORIGEM']} | Linha {item['processo']['LINHA']}\n"
+                    f"Impressora: {log['maquina']} | IP: {log['ip']} | Fila: {log['formato']}\n"
+                    f"Job: {item['job']}\n"
+                    f"Resultado: {log['erro'] or log['status']}\n"
+                )
+                if 'linhas' in item:
+                    arquivo.write(f"Total de capas no PDF: {log['quantidade']}\n")
+                    for linha in item['linhas']:
+                        arquivo.write(f"  Linha {linha['LINHA']} | {linha['ARQUIVO']} | QTD {linha['QTD']}\n")
+    except OSError as erro:
+        emitir_log(f"Falha ao gravar o relatório de LPR em {caminho}: {erro}", "ERRO")
+        return False
+    emitir_log(f"Relatório de envio LPR: {caminho}")
+    return True
+
+def gprint_exportar_txt_pendentes(itens, subpasta, sessao, titulo, parent, emitir_log):
+    por_txt = {}
+    for processo, quantidade in itens:
+        linha = processo['LINHA_ORIGINAL']
+        if quantidade != processo['QTD']:
+            campos = linha.split('|')
+            campos[2] = str(quantidade)
+            linha = '|'.join(campos)
+        por_txt.setdefault(processo['TXT_ORIGEM'], []).append(linha)
+    salvos, falhas = [], []
+    for origem, linhas in por_txt.items():
+        pasta = os.path.join(os.path.dirname(origem), subpasta, sessao)
+        destino = os.path.join(pasta, os.path.basename(origem))
+        temporario = None
+        try:
+            os.makedirs(pasta, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode='w', dir=pasta, delete=False, encoding='utf-8-sig', newline=''
+            ) as arquivo:
+                temporario = arquivo.name
+                arquivo.writelines(linhas)
+            os.replace(temporario, destino)
+        except OSError as erro:
+            falhas.append(f"{origem}: {erro}")
+            if temporario:
+                try:
+                    os.remove(temporario)
+                except OSError:
+                    logging.warning("Não foi possível remover o TXT temporário: %s", temporario)
+        else:
+            salvos.append(destino)
+            emitir_log(f"TXT de miolo exportado: {destino}")
+    if salvos:
+        messagebox.showinfo(titulo, "\n".join(salvos), parent=parent)
+    if falhas:
+        messagebox.showerror("GPrint - Falha na exportação", "\n".join(falhas), parent=parent)
+
 def gprint_montar_item_miolo(processo, pasta_temporaria, sangria_mm, comprimir):
     """Monta um PDF em pasta exclusiva, sem acessar Tkinter ou a impressora."""
     p = processo
@@ -2035,6 +2135,19 @@ def gprint_montar_item_miolo(processo, pasta_temporaria, sangria_mm, comprimir):
     if not os.path.isfile(saida) or os.path.getsize(saida) == 0:
         raise RuntimeError("A montagem não gerou um PDF válido.")
     return saida
+
+
+def gprint_criar_seletor_impressao(painel, impressora_var, envio_automatico_var):
+    """Exibe na mesma linha a máquina (nome e IP) e o envio automático."""
+    painel.columnconfigure(1, weight=1)
+    ttk.Label(painel, text="Impressora:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+    seletor = ttk.Combobox(painel, textvariable=impressora_var, values=[], state="readonly")
+    seletor.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+    ttk.Checkbutton(
+        painel, text="Enviar para impressora automaticamente",
+        variable=envio_automatico_var, bootstyle="success-round-toggle",
+    ).grid(row=0, column=2, padx=5, pady=5, sticky="w")
+    return seletor
 
 
 class MioloTab(ttk.Frame):
@@ -2108,79 +2221,30 @@ class MioloTab(ttk.Frame):
         config_frame = ttk.LabelFrame(main_frame, text="⚙️ Configurações de Impressão", bootstyle=(PRIMARY))
         config_frame.grid(row=0, column=0, sticky="ew", pady=5)
 
-        # Agora teremos 3 colunas: label, IP, toggle (e checkboxes ocupam as 3)
-        config_frame.columnconfigure(0, weight=0)  # labels
-        config_frame.columnconfigure(1, weight=1)  # IP
-        config_frame.columnconfigure(2, weight=1)  # toggle
-
-        ttk.Label(config_frame, text="Impressora:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-
-        # Maquinas compativeis sao carregadas de equipamentos.db.
-        impressoras = []
-
-        self.combo_impressora = ttk.Combobox(
-            config_frame,
-            textvariable=self.impressora_var,
-            values=impressoras,
-            state="readonly"
-        )
-        self.combo_impressora.grid(row=0, column=1, columnspan=2, padx=5, pady=5, sticky="ew")
-
-        ttk.Label(config_frame, text="IP selecionado:").grid(row=1, column=0, padx=5, pady=2, sticky="w")
-
-        self.ip_label = ttk.Label(
-            config_frame,
-            text="---",
-            font=("Consolas", 10, "bold"),
-            bootstyle=(PRIMARY)
-        )
-        self.ip_label.grid(row=1, column=1, padx=5, pady=2, sticky="w")
-
-        self.combo_impressora.bind('<<ComboboxSelected>>', self.atualizar_ip_label)
-
-        # Toggle de impressão automática agora na MESMA LINHA do IP (coluna 2)
         self.impressao_auto_var = tk.BooleanVar(value=True)
-        self.toggle_impressao = ttk.Checkbutton(
-            config_frame,
-            text="enviar para impressora automaticamente",
-            variable=self.impressao_auto_var,
-            bootstyle="success-round-toggle"
-        )
-        self.toggle_impressao.grid(
-            row=1, column=2,
-            padx=5, pady=2,
-            sticky="w"
-        )
+        self.combo_impressora = gprint_criar_seletor_impressao(
+            config_frame, self.impressora_var, self.impressao_auto_var)
 
-        # =========================================
-        # CHECKBOX COMPRIMIR PDF
-        # =========================================
+        opcoes_miolo = ttk.Frame(config_frame)
+        opcoes_miolo.grid(row=1, column=0, columnspan=3, sticky="w")
+
         self.comprimir_pdf_var = tk.BooleanVar(value=False)
         self.checkbox_comprimir = ttk.Checkbutton(
-            config_frame,
-            text="comprimir PDF antes do envio (Deixar selecionado somente em casos extremos)",
+            opcoes_miolo,
+            text="Comprimir PDF antes do envio",
             variable=self.comprimir_pdf_var,
             bootstyle="info-square-toggle"
         )
-        self.checkbox_comprimir.grid(
-            row=2, column=0, columnspan=3,
-            padx=5, pady=5, sticky="w"
-        )
+        self.checkbox_comprimir.pack(side="left", padx=(5, 16), pady=5)
 
-        # =========================================
-        # NOVO CHECKBOX "Enviar apenas uma cópia"
-        # =========================================
         self.enviar_uma_copia_var = tk.BooleanVar(value=False)
         self.chk_enviar_uma = ttk.Checkbutton(
-            config_frame,
-            text="Enviar apenas uma cópia (ignora regra padrão de divisão)",
+            opcoes_miolo,
+            text="Enviar apenas uma cópia",
             variable=self.enviar_uma_copia_var,
             bootstyle="info-square-toggle"
         )
-        self.chk_enviar_uma.grid(
-            row=3, column=0, columnspan=3,
-            padx=5, pady=5, sticky="w"
-        )
+        self.chk_enviar_uma.pack(side="left", padx=(0, 5), pady=5)
 
         # ================= ARQUIVO =================
         file_frame = ttk.LabelFrame(
@@ -2342,11 +2406,6 @@ class MioloTab(ttk.Frame):
             self.impressora_var.set(nomes[0])
         else:
             self.impressora_var.set('')
-        self.atualizar_ip_label()
-
-    def atualizar_ip_label(self, event=None):
-        equipamento = getattr(self, 'equipamentos_disponiveis', {}).get(self.impressora_var.get())
-        self.ip_label.config(text=equipamento['ip'] if equipamento else '---')
 
     def atualizar_log_queue(self):
         try:
@@ -2421,44 +2480,8 @@ class MioloTab(ttk.Frame):
             self.log("Cancelamento solicitado. Aguardando as operações em andamento.")
 
     def enviar_por_lpr(self, caminho_arquivo, ip, formato, job_name, copia_numero, total_copias):
-        arquivo_temp = None
-        try:
-            tamanho_mib = os.path.getsize(caminho_arquivo) / (1024 ** 2)
-            self.log(
-                f"Enviando cópia {copia_numero}/{total_copias} | {tamanho_mib:.1f} MiB | "
-                f"IP: {ip} | Fila: {formato} | Job: {job_name}", "ENVIO"
-            )
-            arquivo_temp = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.pdf")
-            shutil.copy2(caminho_arquivo, arquivo_temp)
-            time.sleep(1)
-            resultado = subprocess.run(
-                ["lpr", "-S", ip, "-P", formato, "-J", job_name, arquivo_temp],
-                capture_output=True, text=True, timeout=TIMEOUT_LPR_MIOLO_SEGUNDOS,
-                errors="replace",
-            )
-            if resultado.returncode == 0:
-                self.log(f"Cópia {copia_numero} aceita pelo LPR", "SUCESSO")
-                return True, "", False
-            detalhe = (resultado.stderr or resultado.stdout or "").strip()
-            erro = f"LPR retornou código {resultado.returncode}"
-            if detalhe:
-                erro += f": {detalhe}"
-        except subprocess.TimeoutExpired:
-            erro = f"Timeout LPR de {TIMEOUT_LPR_MIOLO_SEGUNDOS}s; aceite pela fila não confirmado"
-            self.log(erro, "ERRO")
-            return False, erro, True
-        except Exception as exc:
-            erro = str(exc)
-        finally:
-            if arquivo_temp:
-                try:
-                    os.remove(arquivo_temp)
-                except FileNotFoundError:
-                    pass
-                except OSError as exc:
-                    logging.warning("Não foi possível remover temporário LPR: %s", exc)
-        self.log(erro, "ERRO")
-        return False, erro, False
+        return gprint_enviar_pdf_lpr(
+            self.log, caminho_arquivo, ip, formato, job_name, copia_numero, total_copias)
 
     @staticmethod
     def _gerar_resumo_final_miolo(dados):
@@ -2940,7 +2963,7 @@ class MioloTab(ttk.Frame):
         itens_lpr = dados['pendencias_lpr']
         if itens_lpr:
             relatorio = os.path.join(dados['pasta'], 'erros_envio_lpr.txt')
-            gravado = self._registrar_pendencias_lpr(relatorio, "Envio original", itens_lpr)
+            gravado = gprint_registrar_pendencias_lpr(self.log, relatorio, "Envio original", itens_lpr)
             reenviaveis = sum(item['situacao'] == 'reenviar' for item in itens_lpr)
             mensagem = (
                 f"{reenviaveis} envio(s) com erro podem ser repetidos usando os PDFs já montados.\n"
@@ -2963,26 +2986,6 @@ class MioloTab(ttk.Frame):
             else:
                 self._exportar_pendencias_lpr(itens_lpr, sessao)
 
-    def _registrar_pendencias_lpr(self, caminho, etapa, itens):
-        try:
-            with open(caminho, 'a', encoding='utf-8-sig') as arquivo:
-                arquivo.write(f"\n{etapa} | {datetime.now():%d/%m/%Y %H:%M:%S}\n")
-                for item in itens:
-                    log = item['log']
-                    arquivo.write(
-                        f"\nSituação: {item['situacao']} | Envio {item['copia']}/{item['total_envios']}\n"
-                        f"PDF montado: {item['pdf']}\n"
-                        f"Origem: {item['processo']['TXT_ORIGEM']} | Linha {item['processo']['LINHA']}\n"
-                        f"Impressora: {log['maquina']} | IP: {log['ip']} | Fila: {log['formato']}\n"
-                        f"Job: {item['job']}\n"
-                        f"Resultado: {log['erro'] or log['status']}\n"
-                    )
-        except OSError as erro:
-            self.log(f"Falha ao gravar o relatório de LPR em {caminho}: {erro}", "ERRO")
-            return False
-        self.log(f"Relatório de envio LPR: {caminho}")
-        return True
-
     def _reenviar_miolo_lpr(self, itens, relatorio, sessao):
         bloqueados = set()
         aceitos = 0
@@ -2996,7 +2999,7 @@ class MioloTab(ttk.Frame):
                 if item['pdf'] in bloqueados:
                     item['situacao'] = 'aguardando'
                     item['log'] = dict(log, erro="Reenvio adiado após timeout de outra cópia deste PDF.")
-                    self._registrar_pendencias_lpr(relatorio, "Reenvio adiado", [item])
+                    gprint_registrar_pendencias_lpr(self.log, relatorio, "Reenvio adiado", [item])
                     continue
                 sucesso, erro, timeout = self.enviar_por_lpr(
                     item['pdf'], log['ip'], log['formato'], item['job'], item['copia'], item['total_envios']
@@ -3004,7 +3007,7 @@ class MioloTab(ttk.Frame):
                 item['situacao'] = 'aceito' if sucesso else 'conferir' if timeout else 'reenviar'
                 status = 'Enviado' if sucesso else 'Timeout no reenvio' if timeout else 'Falha no reenvio'
                 item['log'] = dict(log, status=status, erro=erro, envio_ok=int(sucesso))
-                self._registrar_pendencias_lpr(relatorio, "Tentativa de reenvio", [item])
+                gprint_registrar_pendencias_lpr(self.log, relatorio, "Tentativa de reenvio", [item])
                 self.registrar_log_sqlite(item['log'])
                 aceitos += int(sucesso)
                 if timeout:
@@ -3052,41 +3055,7 @@ class MioloTab(ttk.Frame):
         )
 
     def _exportar_miolo_txt(self, itens, subpasta, sessao, titulo):
-        por_txt = {}
-        for processo, quantidade in itens:
-            linha = processo['LINHA_ORIGINAL']
-            if quantidade != processo['QTD']:
-                campos = linha.split('|')
-                campos[2] = str(quantidade)
-                linha = '|'.join(campos)
-            por_txt.setdefault(processo['TXT_ORIGEM'], []).append(linha)
-        salvos, falhas = [], []
-        for origem, linhas in por_txt.items():
-            pasta = os.path.join(os.path.dirname(origem), subpasta, sessao)
-            destino = os.path.join(pasta, os.path.basename(origem))
-            temporario = None
-            try:
-                os.makedirs(pasta, exist_ok=True)
-                with tempfile.NamedTemporaryFile(
-                    mode='w', dir=pasta, delete=False, encoding='utf-8-sig', newline=''
-                ) as arquivo:
-                    temporario = arquivo.name
-                    arquivo.writelines(linhas)
-                os.replace(temporario, destino)
-            except OSError as erro:
-                falhas.append(f"{origem}: {erro}")
-                if temporario:
-                    try:
-                        os.remove(temporario)
-                    except OSError:
-                        logging.warning("Não foi possível remover o TXT temporário: %s", temporario)
-            else:
-                salvos.append(destino)
-                self.log(f"TXT de miolo exportado: {destino}")
-        if salvos:
-            messagebox.showinfo(titulo, "\n".join(salvos), parent=self)
-        if falhas:
-            messagebox.showerror("GPrint - Falha na exportação", "\n".join(falhas), parent=self)
+        gprint_exportar_txt_pendentes(itens, subpasta, sessao, titulo, self, self.log)
 
     def selecionar_txt(self):
         """Seleciona ate MAX_ARQUIVOS_TXT_MIOLO arquivos (0 = ilimitado)."""
@@ -4566,10 +4535,20 @@ def grampo(input_path, output_path, output_width, output_height,
             pass
 
     return True
-def gprint_reservar_destino_capa(pasta_destino, identific, fila):
+def gprint_mesclar_capas(itens, destino):
+    """Repete cada documento inteiro para preservar a sequência frente/verso."""
+    with fitz.open() as agrupado:
+        for arquivo, quantidade in itens:
+            with fitz.open(arquivo) as capa:
+                for copia in range(quantidade):
+                    agrupado.insert_pdf(capa, final=copia == quantidade - 1)
+        agrupado.save(destino)
+
+
+def gprint_reservar_destino_capa(pasta_destino, identific, fila, quantidade):
     """Reserva um nome para o PDF final sem sobrescrever arquivos existentes.
 
-    Usa IDENTIFIC_FILA.pdf e acrescenta _1, _2, _3... em caso de colisao.
+    Usa IDENTIFIC_CAPAS_QUANTIDADE_FILA.pdf e acrescenta _1, _2... em caso de colisão.
     A reserva O_EXCL evita que duas estacoes escolham o mesmo destino.
     """
     nome_base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', str(identific)).strip(' .') or 'sem_nome'
@@ -4577,14 +4556,23 @@ def gprint_reservar_destino_capa(pasta_destino, identific, fila):
 
     # Guarda margem para extensao e sufixo, considerando caminhos do Windows.
     limite = min(190, max(32, 240 - len(os.path.abspath(pasta_destino))))
-    # Mantem a fila legivel mesmo quando a identificacao precisa ser truncada.
-    sufixo_fila = f'_{nome_fila[:limite - 8]}' if nome_fila else ''
+    sufixo_capas = f'_CAPAS_{quantidade}'
+    limite_fila = max(0, limite - len(sufixo_capas) - 8)
+    sufixo_fila = f'_{nome_fila[:limite_fila]}' if nome_fila and limite_fila else ''
+    total_lote = re.search(
+        r'(?<![A-Za-z0-9])TOTAL[ _-]+[0-9]+(?![A-Za-z0-9])',
+        nome_base, re.IGNORECASE)
 
     for numero in range(0, 10001):
-        sufixo = sufixo_fila
+        sufixo = sufixo_capas + sufixo_fila
         if numero:
             sufixo += f'_{numero}'
-        nome = f"{nome_base[:limite-len(sufixo)]}{sufixo}.pdf"
+        espaco = limite - len(sufixo)
+        identificacao = nome_base[:espaco]
+        if total_lote and total_lote.end() > espaco and len(total_lote[0]) <= espaco:
+            prefixo = nome_base[:min(total_lote.start(), espaco - len(total_lote[0]) - 1)].rstrip('_ .-')
+            identificacao = f'{prefixo}_{total_lote[0]}' if prefixo else total_lote[0]
+        nome = f"{identificacao}{sufixo}.pdf"
         caminho = os.path.join(pasta_destino, nome)
         try:
             descritor = os.open(caminho, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
@@ -4625,6 +4613,7 @@ class Application:
         
         # Controle de progresso
         self.processamento_em_andamento = False
+        self.cancelamento_capa = threading.Event()
         self.tempo_inicio = 0
         self.log_queue = queue.Queue()
         
@@ -4632,10 +4621,6 @@ class Application:
         self.root.after(600, self.iniciar_cadastro_equipamentos)
         self.setup_drag_and_drop()
         self.atualizar_log_queue()
-
-        # Pasta temporária para envio LPR
-        self.pasta_envio_curto = os.path.join(tempfile.gettempdir(), "UICLAP_LPR")
-        os.makedirs(self.pasta_envio_curto, exist_ok=True)
 
         # Caminhos do banco SQLite (mesmo usado pelo Miolo)
         self.log_db_path = GPRINT_BANCO_HISTORICO
@@ -4800,26 +4785,13 @@ class Application:
         main_frame.rowconfigure(5, weight=0)
         
         # ================= CONFIGURAÇÕES =================
-        config_frame = ttk.LabelFrame(main_frame, text="⚙️ Configurações de Processamento", bootstyle=PRIMARY)
+        config_frame = ttk.LabelFrame(main_frame, text="⚙️ Configurações de Impressão", bootstyle=PRIMARY)
         config_frame.grid(row=0, column=0, sticky="ew", pady=5)
-        config_frame.columnconfigure(0, weight=1)
-        
-        self.checkbox_imprimir = ttk.Checkbutton(
-            config_frame,
-            text="Enviar para impressora automaticamente após processar",
-            variable=self.imprimir_automaticamente,
-            bootstyle="success-round-toggle"
-        )
-        self.checkbox_imprimir.grid(row=0, column=0, padx=5, pady=5, sticky="w")
         self.equipamento_capa_var = tk.StringVar()
         self.equipamentos_capa = {}
-        ttk.Label(config_frame,text='Equipamento de Capa:').grid(row=1,column=0,sticky='w',padx=5)
-        self.combo_equipamento_capa = ttk.Combobox(config_frame,
-            textvariable=self.equipamento_capa_var,values=[],state='readonly',width=40)
-        self.combo_equipamento_capa.grid(row=2,column=0,sticky='w',padx=5,pady=(0,6))
-        ttk.Label(config_frame,text='Fila de impressao: identificada automaticamente em cada TXT e validada no cadastro.',
-                  bootstyle=SECONDARY).grid(row=3,column=0,sticky='w',padx=5,pady=(0,6))
-        
+        self.combo_equipamento_capa = gprint_criar_seletor_impressao(
+            config_frame, self.equipamento_capa_var, self.imprimir_automaticamente)
+
         # ================= SELEÇÃO DE ARQUIVOS =================
         file_frame = ttk.LabelFrame(main_frame, text="📂 Arquivos TXT (Capa)", bootstyle=PRIMARY)
         file_frame.grid(row=1, column=0, sticky="ew", pady=5)
@@ -4888,6 +4860,10 @@ class Application:
         
         self.btn_processar = ttk.Button(status_frame, text="▶ Processar e Enviar", command=self.iniciar_processamento, bootstyle="success", width=22)
         self.btn_processar.grid(row=0, column=1, sticky="e")
+        self.btn_cancelar_capa = ttk.Button(
+            status_frame, text="Cancelar", command=self.cancelar_capa,
+            bootstyle="danger-outline", state=DISABLED)
+        self.btn_cancelar_capa.grid(row=0, column=2, padx=(8, 0))
 
     # ==================== MÉTODOS DE LOG NA INTERFACE ====================
     def atualizar_log_queue(self):
@@ -4916,7 +4892,10 @@ class Application:
             self.processar_arquivos_selecionados(files)
     
     def processar_arquivos_selecionados(self, file_paths: List[str]):
-        txt_files = [f for f in file_paths if f.lower().endswith('.txt')]
+        if self.processamento_em_andamento:
+            return
+        txt_files = list(dict.fromkeys(
+            os.path.abspath(f) for f in file_paths if f.lower().endswith('.txt')))
         if not txt_files:
             messagebox.showwarning("Aviso", "Nenhum arquivo .txt válido foi selecionado!")
             return
@@ -4933,7 +4912,7 @@ class Application:
     
     # ==================== PROCESSAMENTO ====================
     def iniciar_processamento(self):
-        if not verificar_data_limite():
+        if self.processamento_em_andamento or not verificar_data_limite():
             return
         if not self.arquivos_selecionados:
             messagebox.showwarning("Aviso", "Selecione pelo menos um arquivo para processar!")
@@ -4959,7 +4938,11 @@ class Application:
         self.processamento_em_andamento = True
         self.indicadores_capa.iniciar()
         
-        thread = threading.Thread(target=self.processar_arquivos, daemon=True)
+        self.cancelamento_capa.clear()
+        self.btn_cancelar_capa.config(state=NORMAL)
+        arquivos = tuple(self.arquivos_selecionados)
+        automatico = bool(self.imprimir_automaticamente.get())
+        thread = threading.Thread(target=self.processar_arquivos, args=(arquivos, automatico), daemon=True)
         thread.start()
     
     def atualizar_timer_ui(self):
@@ -4973,326 +4956,247 @@ class Application:
         self.adicionar_log(texto)
         self.root.update_idletasks()
     
-    def finalizar_processamento(self, sucesso=True):
+    def cancelar_capa(self):
+        if self.processamento_em_andamento:
+            self.cancelamento_capa.set()
+            self.btn_cancelar_capa.config(state=DISABLED)
+            self.status_label.config(text="Cancelando… aguardando a etapa em andamento")
+
+    def finalizar_processamento(self, sucesso=True, cancelado=False):
         self.processamento_em_andamento = False
         self.indicadores_capa.finalizar()
         self.btn_processar.config(state=NORMAL)
         self.btn_select.config(state=NORMAL)
-        if sucesso:
-            self.status_label.config(text="✅ Processamento concluído!", bootstyle="success")
+        self.btn_cancelar_capa.config(state=DISABLED)
+        texto = "Processamento cancelado" if cancelado else "Concluído" if sucesso else "Concluído com falhas"
+        self.status_label.config(text=texto, bootstyle="success" if sucesso and not cancelado else "warning")
+        if sucesso and not cancelado:
             self.progress_bar['value'] = 100
             self.progress_percent_label.config(text="100%")
-        else:
-            self.status_label.config(text="❌ Erro no processamento", bootstyle="danger")
-    
-    def processar_arquivos(self):
-        # Uma pasta unica por execucao, isolada de outras estacoes/processamentos.
-        pasta_temp = tempfile.mkdtemp(prefix="capa_", dir=PASTA_TRABALHO)
-        
+
+    def _log_lpr_capa(self, mensagem, nivel="INFO"):
+        self.adicionar_log(mensagem)
+        (logging.error if nivel == "ERRO" else logging.info)("Capa: %s", mensagem)
+
+    def processar_arquivos(self, arquivos, automatico):
+        sessao = f"CAPA_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
+        restantes = {}
+        falhas_preparo = []
+        falhas_txt = []
+        falhas_envio = []
+        montados = 0
+        enviados = 0
         try:
-            self.adicionar_log("Iniciando processamento...")
-            self.root.after(0, lambda: self.atualizar_progresso_ui(0, "Preparando processamento..."))
-            
-            total_arquivos = 0
-            for txt in self.arquivos_selecionados:
-                total_arquivos += len(ler_arquivo_txt(txt))
-            
-            arquivos_processados = 0
-            pdfs_para_mesclar = {}
-            # Cada TXT deve gerar sua propria mesclagem, mesmo com IDENTIFIC igual.
-            totais_montagem = {}
-            
-            # Prepara usuário uma vez
-            try:
-                usuario = os.getlogin()
-            except:
-                usuario = 'desconhecido'
-            
-            # Constantes para a Capa
-            MAQUINA_CAPA = self.maquina_capa_execucao
-            IP_CAPA = self.ip_capa_execucao
-            
-            for arquivo_txt in self.arquivos_selecionados:
-                self.adicionar_log(f"Lendo arquivo: {os.path.basename(arquivo_txt)}")
-                dados = ler_arquivo_txt(arquivo_txt)
-                pilha_txt = os.path.splitext(os.path.basename(arquivo_txt))[0]
-                
-                for linha in dados:
+            for txt in arquivos:
+                try:
+                    for linha in ler_arquivo_txt(txt, propagar_erro=True):
+                        restantes[(txt, linha['LINHA'])] = linha
+                except (OSError, UnicodeError) as erro:
+                    falhas_txt.append(f"{txt}: {erro}")
+
+            with tempfile.TemporaryDirectory(prefix="capa_", dir=PASTA_TRABALHO) as pasta:
+                grupos = {}
+                total = len(restantes)
+                usuario = os.environ.get('USERNAME', 'desconhecido')
+                for indice, (chave, linha) in enumerate(restantes.copy().items(), 1):
+                    if self.cancelamento_capa.is_set():
+                        break
                     try:
-                        caminho_origem = os.path.join(linha["CAMINHO"], linha["ARQUIVO"])
-                        if not os.path.exists(caminho_origem):
-                            self.adicionar_log(f"⚠️ Arquivo não encontrado: {caminho_origem}")
-                            continue
-                        
-                        quantidade = linha["QTD"]
-                        identific = linha["IDENTIFIC"]
-                        nomefic = linha["NOMEFIC"]
-                        filacolor = linha["FILACOLOR"]
-                        fila_frente_verso = filacolor.upper().endswith("_FV")
-                        formato_capa = filacolor[:-3] if fila_frente_verso else filacolor
-                        
-                        nome_arquivo, extensao = os.path.splitext(linha["ARQUIVO"])
-                        # Subpasta exclusiva por item evita substituir PDFs de entrada
-                        # e mantém o nome interno esperado pela marcacao original.
-                        pasta_item = tempfile.mkdtemp(prefix="item_", dir=pasta_temp)
-                        temp_file = os.path.join(pasta_item, f"{nomefic}_temp{extensao}")
-                        shutil.copy(caminho_origem, temp_file)
-                        
-                        if temp_file.lower().endswith(".pdf"):
-                            # Conta cada PDF antes de multiplicar as cópias e agrupar as capas.
-                            with fitz.open(temp_file) as capa:
-                                paginas_capa = capa.page_count
-                            if paginas_capa > 1:
-                                filacolor = f"{formato_capa}_FV"
-                                self.adicionar_log(
-                                    f"↔️ Capa frente e verso ({paginas_capa} páginas): "
-                                    f"{linha['ARQUIVO']} → {filacolor}"
-                                )
-                            self.adicionar_log(f"Adicionando marca d'água em {linha['ARQUIVO']}")
-                            pdf_marcado = adicionar_marca_dagua(
-                                temp_file,
-                                linha["LAMINAÇÃO"], 
-                                linha["CODIGOACAB"], 
-                                identific,
-                                formato_capa
-                            )
-                            if pdf_marcado:
-                                chave = (os.path.abspath(arquivo_txt), identific, filacolor)
-                                if chave not in pdfs_para_mesclar:
-                                    pdfs_para_mesclar[chave] = []
-                                    totais_montagem[chave] = 0
-                                pdfs_para_mesclar[chave].extend([pdf_marcado] * quantidade)
-                                totais_montagem[chave] += quantidade
-                                
-                                # Um registro por arquivo de capa preparado.
-                                # A quantidade indica quantas capas deste
-                                # arquivo entraram na mesclagem, nao envios LPR.
-                                dados_montagem = {
-                                    'lote': os.path.dirname(arquivo_txt),
-                                    'pilha': pilha_txt,
-                                    'arquivo': os.path.basename(linha["ARQUIVO"]),
-                                    'maquina': MAQUINA_CAPA,
-                                    'ip': IP_CAPA,
-                                    'formato': filacolor,
-                                    'modo': 'capa_marcacao',
-                                    'quantidade': quantidade,
-                                    'status': 'Montagem OK',
-                                    'erro': '',
-                                    'copia': '',
-                                    'usuario': usuario,
-                                    'montagem_ok': 1,
-                                    'envio_ok': 0
-                                }
-                                self.registrar_log_sqlite(dados_montagem)
-                        
-                        arquivos_processados += 1
-                        percentual = (arquivos_processados / total_arquivos) * 80
-                        texto = f"Processando {linha['ARQUIVO']}... ({arquivos_processados}/{total_arquivos})"
-                        self.root.after(0, lambda p=percentual, t=texto: self.atualizar_progresso_ui(p, t))
-                    
-                    except Exception as e:
-                        self.adicionar_log(f"❌ Erro ao processar {linha['ARQUIVO']}: {e}")
+                        origem = os.path.join(linha['CAMINHO'], linha['ARQUIVO'])
+                        if not origem.lower().endswith('.pdf') or linha['QTD'] < 1:
+                            raise ValueError("A linha precisa indicar um PDF e pelo menos uma capa.")
+                        with fitz.open(origem) as pdf:
+                            frente_verso = pdf.page_count > 1
+                        fila = linha['FILACOLOR']
+                        formato = fila[:-3] if fila.upper().endswith('_FV') else fila
+                        if frente_verso:
+                            fila = f"{formato}_FV"
+                        pasta_item = tempfile.mkdtemp(prefix="item_", dir=pasta)
+                        entrada = os.path.join(pasta_item, f"{linha['NOMEFIC']}_temp.pdf")
+                        shutil.copy2(origem, entrada)
+                        marcado = adicionar_marca_dagua(
+                            entrada, linha['LAMINAÇÃO'], linha['CODIGOACAB'], linha['IDENTIFIC'],
+                            formato, propagar_erro=True)
+                        if not marcado:
+                            raise RuntimeError("A marca d’água não gerou um PDF.")
+                        grupo = grupos.setdefault((chave[0], linha['IDENTIFIC'], fila), [])
+                        grupo.append((chave, linha, marcado))
+                        self.registrar_log_sqlite(self._dados_capa(
+                            chave[0], linha['ARQUIVO'], fila, linha['QTD'], usuario,
+                            'capa_marcacao', 'Montagem OK', montagem_ok=1))
+                    except Exception as erro:
+                        falhas_preparo.append((restantes.pop(chave), str(erro)))
+                    self.root.after(0, self.atualizar_progresso_ui, 80 * indice / total,
+                                    f"Preparando capas: {indice}/{total}")
+
+                for indice, ((txt, identific, fila), itens) in enumerate(grupos.items(), 1):
+                    if self.cancelamento_capa.is_set():
+                        break
+                    quantidade = sum(linha['QTD'] for _, linha, _ in itens)
+                    try:
+                        agrupado = os.path.join(pasta, f"mescla_{indice}.pdf")
+                        gprint_mesclar_capas(((pdf, linha['QTD']) for _, linha, pdf in itens), agrupado)
+                        destino = gprint_reservar_destino_capa(os.path.dirname(txt), identific, fila, quantidade)
+                        try:
+                            shutil.move(agrupado, destino)
+                        except Exception:
+                            with suppress(OSError):
+                                os.remove(destino)
+                            raise
+                    except Exception as erro:
+                        falhas_preparo.extend((linha, str(erro)) for _, linha, _ in itens)
+                        for chave, _, _ in itens:
+                            restantes.pop(chave)
                         continue
-            
-            total_identifics = len(pdfs_para_mesclar)
-            identifics_processados = 0
-            for chave, lista_pdfs in pdfs_para_mesclar.items():
-                arquivo_txt, identific, filacolor = chave
-                pasta_destino = os.path.dirname(arquivo_txt)
-                pilha_txt = os.path.splitext(os.path.basename(arquivo_txt))[0]
-                total_montagens = totais_montagem.get(chave, 0)
-                frente_verso = filacolor.upper().endswith('_FV')
-                total_saida = f'TOTAL_{total_montagens}'
-                identific_saida, total_substituido = re.subn(
-                    r'(?<![A-Za-z0-9])TOTAL[ _-]+[0-9]+(?![A-Za-z0-9])',
-                    total_saida, identific, count=1, flags=re.IGNORECASE)
-                if not total_substituido:
-                    identific_saida = f'{identific}_{total_saida}' if identific else total_saida
-                
-                percentual = 80 + ((identifics_processados / total_identifics) * 20)
-                texto = f"Agrupando PDFs... ({identifics_processados + 1}/{total_identifics})"
-                self.root.after(0, lambda p=percentual, t=texto: self.atualizar_progresso_ui(p, t))
 
-                # O arquivo intermediario permanece em TEMP; somente o PDF final
-                # e salvo junto ao TXT de origem, com nome exclusivo.
-                nome_temp = os.path.join(pasta_temp, f"mescla_{uuid.uuid4().hex}.pdf")
-                self.mesclar_pdfs(lista_pdfs, nome_temp, filacolor)
-                if not os.path.isfile(nome_temp) or os.path.getsize(nome_temp) == 0:
-                    raise RuntimeError(f"Mesclagem nao gerou PDF valido para {pilha_txt}: {identific}")
-                with fitz.open(nome_temp) as pdf_mesclado:
-                    total_paginas = pdf_mesclado.page_count
-
-                nome_final = gprint_reservar_destino_capa(pasta_destino, identific_saida, filacolor)
-                try:
-                    shutil.move(nome_temp, nome_final)
-                except Exception:
-                    # Remove apenas a reserva desta tentativa; nunca outros PDFs.
-                    try:
-                        os.remove(nome_final)
-                    except OSError:
-                        pass
-                    raise
-                self.adicionar_log(f"✅ Arquivo gerado para TXT {pilha_txt}: {nome_final}")
-                self.adicionar_log(
-                    f"   Fila: {filacolor} | Capas: {total_montagens} | Páginas: {total_paginas}"
-                )
-
-                # A mesclagem final e uma etapa separada do preparo das capas
-                # e do envio LPR. Nao altera o arquivo nem a rotina de envio.
-                self.registrar_log_sqlite({
-                    'lote': pasta_destino,
-                    'pilha': pilha_txt,
-                    'arquivo': os.path.basename(nome_final),
-                    'maquina': MAQUINA_CAPA,
-                    'ip': IP_CAPA,
-                    'formato': filacolor,
-                    'modo': 'mesclagem',
-                    'quantidade': total_montagens,
-                    'status': 'Mesclagem OK',
-                    'erro': '',
-                    'copia': '',
-                    'usuario': usuario,
-                    # Mesclagem nao e outra capa montada; evita dupla contagem
-                    # em consultas antigas que somam montagem_ok.
-                    'montagem_ok': 0,
-                    'envio_ok': 0
-                })
-
-                if self.imprimir_automaticamente.get():
-                    titulo_impressao = identific_saida
-                    if frente_verso and not titulo_impressao.upper().endswith('_FV'):
-                        titulo_impressao += '_FV'
-                    sucesso = self.enviar_para_impressora(
-                        nome_final,
-                        f"{titulo_impressao}.pdf",
-                        filacolor
-                    )
-                    
-                    # ===== REGISTRO DO ENVIO (SQLite) – QUANTIDADE = TOTAL DE MONTAGENS =====
-                    status_envio = 'Enviado' if sucesso else 'Falha no envio'
-                    dados_envio = {
-                        'lote': pasta_destino,
-                        'pilha': pilha_txt,
-                        'arquivo': os.path.basename(nome_final),
-                        'maquina': MAQUINA_CAPA,
-                        'ip': IP_CAPA,
-                        'formato': filacolor,
-                        'modo': 'envio',
-                        'quantidade': total_montagens,   # <-- TOTAL DE CAPAS MONTADAS
-                        'status': status_envio,
-                        'erro': '' if sucesso else 'Falha no LPR',
-                        'copia': '1/1',
-                        'usuario': usuario,
-                        'montagem_ok': 0,
-                        'envio_ok': 1 if sucesso else 0
-                    }
-                    self.registrar_log_sqlite(dados_envio)
-                else:
-                    dados_nao_enviado = {
-                        'lote': pasta_destino,
-                        'pilha': pilha_txt,
-                        'arquivo': os.path.basename(nome_final),
-                        'maquina': MAQUINA_CAPA,
-                        'ip': IP_CAPA,
-                        'formato': filacolor,
-                        'modo': 'envio',
-                        'quantidade': total_montagens,
-                        'status': 'Não enviado (manual)',
-                        'erro': '',
-                        'copia': '1/1',
-                        'usuario': usuario,
-                        'montagem_ok': 0,
-                        'envio_ok': 0
-                    }
-                    self.registrar_log_sqlite(dados_nao_enviado)
-                
-                identifics_processados += 1
-                time.sleep(1)
-            
-            self.root.after(0, lambda: self.atualizar_progresso_ui(100, "Processamento concluído!"))
-            self.adicionar_log("🎉 Todos os arquivos foram processados com sucesso!")
-            time.sleep(0.5)
-            self.root.after(0, lambda: self.finalizar_processamento(True))
-            self.root.after(0, lambda: messagebox.showinfo("Sucesso", "Processamento dos arquivos selecionados concluído!"))
-        
-        except Exception as e:
-            self.adicionar_log(f"❌ ERRO CRÍTICO: {e}")
-            logging.error(f"Erro durante o processamento: {e}")
-            self.root.after(0, lambda: self.finalizar_processamento(False))
-            self.root.after(0, lambda: messagebox.showerror("Erro", f"Ocorreu um erro durante o processamento: {e}"))
-        finally:
-            # Historico acumulado localmente durante a execucao:
-            # sincroniza so ao concluir o grupo inteiro, inclusive se houve erro.
-            gprint_sincronizar_pendentes(
-                self.log_db_path, root=self.root,
-                emitir_log=self.adicionar_log
-            )
-            # Limpa apenas a pasta desta execucao, inclusive subpastas de itens.
-            # Repetir a tentativa atende a bloqueios de arquivo momentaneos no Windows.
-            for tentativa in range(3):
-                try:
-                    shutil.rmtree(pasta_temp)
-                    self.adicionar_log(f"🧹 Temporarios da capa removidos: {pasta_temp}")
-                    break
-                except FileNotFoundError:
-                    break
-                except OSError as erro_limpeza:
-                    if tentativa == 2:
-                        self.adicionar_log(f"⚠️ Temporarios nao removidos: {pasta_temp} ({erro_limpeza})")
+                    for chave, _, _ in itens:
+                        restantes.pop(chave)
+                    montados += 1
+                    self.adicionar_log(f"PDF gerado: {destino} | Fila: {fila} | Capas: {quantidade}")
+                    self.registrar_log_sqlite(self._dados_capa(
+                        txt, os.path.basename(destino), fila, quantidade, usuario, 'mesclagem', 'Mesclagem OK'))
+                    titulo = f'{identific}_CAPAS_{quantidade}' if identific else f'CAPAS_{quantidade}'
+                    if fila.upper().endswith('_FV'):
+                        titulo += '_FV'
+                    job = f'{titulo}.pdf'
+                    dados = self._dados_capa(txt, os.path.basename(destino), fila, quantidade, usuario,
+                                             'envio', 'Não enviado (manual)', copia='1/1')
+                    item = {'pdf': destino, 'job': job, 'log': dados, 'copia': 1, 'total_envios': 1,
+                            'processo': itens[0][1], 'linhas': [linha for _, linha, _ in itens]}
+                    if automatico:
+                        if self.cancelamento_capa.is_set():
+                            item['situacao'] = 'reenviar'
+                            dados.update(status='Envio cancelado', erro='Envio não iniciado após cancelamento.')
+                        else:
+                            enviados += self._enviar_capa_pendente(item)
+                        if item['situacao'] != 'aceito':
+                            falhas_envio.append(item)
+                        self.cancelamento_capa.wait(1)
                     else:
-                        time.sleep(0.5)
-
-    # ==================== MESCLAGEM E IMPRESSÃO ====================
-    def mesclar_pdfs(self, lista_pdfs, nome_saida, filacolor):
-        try:
-            merger = PdfMerger()
-            for pdf in lista_pdfs:
-                merger.append(pdf)
-            merger.write(nome_saida)
-            merger.close()
-            self.adicionar_log(f"📄 PDF mesclado: {os.path.basename(nome_saida)}")
-        except Exception as e:
-            self.adicionar_log(f"❌ Erro ao mesclar PDFs: {e}")
-            messagebox.showerror("Erro", f"Falha ao mesclar arquivos: {e}")
-    
-    def enviar_para_impressora(self, arquivo_pdf, nome_arquivo, filacolor):
-        temp_arquivo = None
-        try:
-            nome_simples = f"job_{uuid.uuid4().hex[:8]}.pdf"
-            temp_arquivo = os.path.join(self.pasta_envio_curto, nome_simples)
-            shutil.copy2(arquivo_pdf, temp_arquivo)
-            temp_normalizado = temp_arquivo.replace('\\', '/')
-            
-            titulo = nome_arquivo.replace(filacolor, "").strip()
-            comando = [
-                "lpr", "-S", self.ip_capa_execucao, "-P", filacolor,
-                "-J", titulo,
-                temp_normalizado
-            ]
-            self.adicionar_log(f"🖨️ Enviando: {' '.join(comando)}")
-            resultado = subprocess.run(comando, capture_output=True, text=True, check=False)
-            
-            if resultado.returncode == 0:
-                self.adicionar_log(f"✅ Envio concluído: {nome_arquivo}")
-                return True
-            else:
-                erro_real = resultado.stderr.strip() or resultado.stdout.strip()
-                self.adicionar_log(f"❌ Falha (código {resultado.returncode}): {erro_real}")
-                messagebox.showerror("Erro", f"Falha ao enviar para {filacolor}.\nErro do LPR: {erro_real}")
-                return False
-        except FileNotFoundError:
-            self.adicionar_log("❌ Comando 'lpr' não encontrado.")
-            messagebox.showerror("Erro", "Serviço LPR não instalado.")
-            return False
-        except Exception as e:
-            self.adicionar_log(f"❌ Exceção: {e}")
-            return False
+                        self.registrar_log_sqlite(dados)
+                    self.root.after(0, self.atualizar_progresso_ui, 80 + 20 * indice / len(grupos),
+                                    f"Mesclando capas: {indice}/{len(grupos)}")
+        except Exception as erro:
+            logging.exception("Falha no processamento de capas")
+            falhas_txt.append(str(erro))
         finally:
-            if temp_arquivo and os.path.exists(temp_arquivo):
+            gprint_sincronizar_pendentes(self.log_db_path, root=self.root, emitir_log=self.adicionar_log)
+            self.root.after(0, self._finalizar_lote_capa, sessao, montados, enviados,
+                            list(restantes.values()), falhas_preparo, falhas_txt, falhas_envio)
+
+    def _dados_capa(self, txt, arquivo, fila, quantidade, usuario, modo, status, **campos):
+        return dict({
+            'lote': os.path.dirname(txt), 'pilha': os.path.splitext(os.path.basename(txt))[0],
+            'arquivo': arquivo, 'formato': fila, 'quantidade': quantidade, 'usuario': usuario,
+            'maquina': self.maquina_capa_execucao, 'ip': self.ip_capa_execucao,
+            'modo': modo, 'status': status, 'montagem_ok': 0, 'envio_ok': 0, 'erro': '', 'copia': '',
+        }, **campos)
+
+    def _enviar_capa_pendente(self, item):
+        dados = item['log']
+        aceito, erro, timeout = gprint_enviar_pdf_lpr(
+            self._log_lpr_capa, item['pdf'], dados['ip'], dados['formato'], item['job'])
+        item['situacao'] = 'aceito' if aceito else 'conferir' if timeout else 'reenviar'
+        dados.update(status='Enviado' if aceito else 'Timeout no envio' if timeout else 'Falha no envio',
+                     erro=erro, envio_ok=int(aceito))
+        self.registrar_log_sqlite(dados)
+        return int(aceito)
+
+    def _finalizar_lote_capa(self, sessao, montados, enviados, restantes, falhas_preparo, falhas_txt, falhas_envio):
+        cancelado = self.cancelamento_capa.is_set()
+        if restantes and (not cancelado or messagebox.askyesno(
+            "GPrint - Capa cancelada",
+            f"Restam {len(restantes)} linha(s) sem PDF final. Exportar os TXTs em cancelados?",
+            parent=self.root,
+        )):
+            self._exportar_capa_txt(restantes, 'cancelados', sessao)
+
+        # Evita reabrir todo o lote pelo botão Processar após um cancelamento parcial.
+        if cancelado:
+            self.arquivos_selecionados = []
+            self.tree_arquivos.delete(*self.tree_arquivos.get_children())
+            self.file_label.config(text="Selecione os TXTs para continuar")
+
+        if falhas_preparo:
+            for linha, erro in falhas_preparo:
+                self._log_lpr_capa(f"{linha['TXT_ORIGEM']} | linha {linha['LINHA']}: {erro}", "ERRO")
+            self._exportar_capa_txt(
+                [linha for linha, _ in falhas_preparo], 'erros_preparo_capa', sessao, falhas_preparo)
+        if falhas_txt:
+            messagebox.showwarning("GPrint - Capa", "\n".join(falhas_txt), parent=self.root)
+
+        self._relatorio_envio_capa(falhas_envio, sessao, "Envio original")
+        reenviaveis = sum(item['situacao'] == 'reenviar' for item in falhas_envio)
+        if reenviaveis and not cancelado and messagebox.askyesno(
+            "GPrint - Reenviar capas?",
+            f"Reenviar agora {reenviaveis} PDF(s) agrupado(s) já montado(s), na fila original?",
+            parent=self.root,
+        ):
+            self.status_label.config(text="Reenviando PDFs de capa…")
+            threading.Thread(
+                target=self._reenviar_capas,
+                args=(falhas_envio, sessao, montados, enviados, bool(falhas_preparo or falhas_txt or restantes)),
+                daemon=True).start()
+            return
+        self._encerrar_capas(sessao, montados, enviados, falhas_envio, cancelado,
+                             bool(falhas_preparo or falhas_txt or restantes))
+
+    def _reenviar_capas(self, itens, sessao, montados, enviados, falha_preparo):
+        try:
+            for item in itens:
+                if self.cancelamento_capa.is_set():
+                    break
+                if item['situacao'] == 'reenviar':
+                    enviados += self._enviar_capa_pendente(item)
+                    self._relatorio_envio_capa([item], sessao, "Tentativa de reenvio")
+                    self.cancelamento_capa.wait(1)
+        except Exception:
+            falha_preparo = True
+            logging.exception("Falha ao finalizar o reenvio de capas")
+        finally:
+            gprint_sincronizar_pendentes(self.log_db_path, root=self.root, emitir_log=self.adicionar_log)
+            self.root.after(0, self._encerrar_capas, sessao, montados, enviados, itens,
+                            self.cancelamento_capa.is_set(), falha_preparo)
+
+    def _relatorio_envio_capa(self, itens, sessao, etapa):
+        por_pasta = {}
+        for item in itens:
+            por_pasta.setdefault(os.path.dirname(item['pdf']), []).append(item)
+        for pasta, registros in por_pasta.items():
+            relatorio = os.path.join(pasta, f'{sessao}_erros_envio_lpr.txt')
+            gprint_registrar_pendencias_lpr(self._log_lpr_capa, relatorio, etapa, registros)
+
+    def _encerrar_capas(self, sessao, montados, enviados, itens, cancelado, falha_preparo):
+        reenvio = [linha for item in itens if item['situacao'] == 'reenviar' for linha in item['linhas']]
+        conferir = [linha for item in itens if item['situacao'] == 'conferir' for linha in item['linhas']]
+        for linhas, pasta in ((reenvio, 'reenvio_lpr'), (conferir, 'conferir_lpr')):
+            if linhas:
+                self._exportar_capa_txt(linhas, pasta, sessao)
+        tem_falhas = bool(falha_preparo or reenvio or conferir)
+        self.finalizar_processamento(not tem_falhas, cancelado)
+        aviso = f"PDFs agrupados: {montados} | Envios aceitos pelo LPR: {enviados}."
+        if conferir:
+            aviso += "\nConfira os envios com timeout na impressora antes de reenviar."
+        if reenvio:
+            aviso += "\nOs PDFs agrupados continuam disponíveis para envio manual. Consulte o relatório no log."
+        exibir = messagebox.showwarning if tem_falhas or cancelado else messagebox.showinfo
+        exibir("GPrint - Capa", aviso, parent=self.root)
+
+    def _exportar_capa_txt(self, linhas, subpasta, sessao, falhas=()):
+        itens = [(linha, linha['QTD']) for linha in sorted(linhas, key=lambda p: (p['TXT_ORIGEM'], p['LINHA']))]
+        if falhas:
+            for origem in dict.fromkeys(linha['TXT_ORIGEM'] for linha, _ in falhas):
+                pasta = os.path.join(os.path.dirname(origem), subpasta, sessao)
+                nome = os.path.basename(origem) + '.erros.txt'
                 try:
-                    os.remove(temp_arquivo)
-                except:
-                    pass
+                    os.makedirs(pasta, exist_ok=True)
+                    with open(os.path.join(pasta, nome), 'w', encoding='utf-8-sig') as arquivo:
+                        arquivo.writelines(f"Linha {linha['LINHA']} | {linha['ARQUIVO']}: {erro}\n"
+                                          for linha, erro in falhas if linha['TXT_ORIGEM'] == origem)
+                except OSError as erro:
+                    self._log_lpr_capa(f"Falha ao registrar erros de preparo: {erro}", "ERRO")
+        gprint_exportar_txt_pendentes(itens, subpasta, sessao, f"GPrint - {subpasta}", self.root,
+                                     self.adicionar_log)
 
     def setup_drag_and_drop(self):
         self.root.drop_target_register(DND_FILES)
@@ -5391,7 +5295,7 @@ class Application:
         tk.Label(main, text="GPrint", font=("Segoe UI", 18, "bold"),
                 bg="#0f172a", fg="#f8fafc").pack(pady=(10, 0))
 
-        versao_badge = tk.Label(main, text="  v12.0  ", font=("Segoe UI", 10, "bold"),
+        versao_badge = tk.Label(main, text="  v13.0  ", font=("Segoe UI", 10, "bold"),
                                 bg="#3b82f6", fg="white", padx=8, pady=2)
         versao_badge.pack(pady=(4, 12))
 
@@ -5458,11 +5362,11 @@ def verificar_data_limite():
     except Exception as e:
         logging.error(f"Erro ao verificar data limite: {e}")
         return True
-def ler_arquivo_txt(caminho_txt):
+def ler_arquivo_txt(caminho_txt, propagar_erro=False):
     dados = []
     try:
         # utf-8-sig remove BOM automaticamente
-        with open(caminho_txt, "r", encoding="utf-8-sig") as arquivo:
+        with open(caminho_txt, "r", encoding="utf-8-sig", newline="") as arquivo:
             for idx, linha in enumerate(arquivo, 1):
                 campos = linha.strip().split("|")
                 if len(campos) >= 14:
@@ -5478,6 +5382,9 @@ def ler_arquivo_txt(caminho_txt):
                         # --- Fim da normalização ---
 
                         dados.append({
+                            "TXT_ORIGEM": caminho_txt,
+                            "LINHA_ORIGINAL": linha,
+                            "LINHA": idx,
                             "CAMINHO": caminho,          # agora normalizado
                             "ARQUIVO": campos[1].strip(),
                             "QTD": int(campos[2].strip()) if campos[2].strip().isdigit() else 1,
@@ -5493,6 +5400,8 @@ def ler_arquivo_txt(caminho_txt):
         return dados
     except Exception as e:
         logging.error(f"Erro ao ler arquivo {caminho_txt}: {e}")
+        if propagar_erro:
+            raise
         messagebox.showerror("Erro", f"Não foi possível ler o arquivo {os.path.basename(caminho_txt)}")
         return []
 def referencia_capa(pagina):
@@ -5515,7 +5424,7 @@ def referencia_capa(pagina):
     return area if conteudo.is_empty else conteudo
 
 
-def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific, filacolor):
+def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific, filacolor, *, propagar_erro=False):
     try:
         doc = fitz.open(pdf_path)
         nome_arquivo = os.path.splitext(os.path.basename(pdf_path))[0]
@@ -5631,6 +5540,8 @@ def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific, filacolor)
 
     except Exception as e:
         logging.error(f"Erro ao adicionar marca d'água em {pdf_path}: {e}")
+        if propagar_erro:
+            raise
         messagebox.showerror("Erro", f"Falha ao montar {os.path.basename(pdf_path)}\n\n{e}")
         return None
 # --- INICIALIZAÇÃO ---
@@ -6564,11 +6475,7 @@ class RefazerTab(ttk.Frame):
     def adicionar_marca_dagua(self, caminho_pdf, texto, distancia_mm=3, caminho_saida=None):
         if not caminho_pdf.lower().endswith('.pdf'):
             return
-        try:
-            doc = fitz.open(caminho_pdf)
-        except Exception as e:
-            print(f"Erro ao abrir PDF {caminho_pdf}: {e}")
-            return
+        doc = fitz.open(caminho_pdf)
 
         margem_pt = distancia_mm * 2.83464567
         fonte_tamanho = 11
@@ -6596,6 +6503,7 @@ class RefazerTab(ttk.Frame):
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
             doc.close()
+            raise
 
     def comprimir_pdf(self, entrada, saida):
         if not os.path.exists(self.GS_PATH):
@@ -6998,7 +6906,7 @@ class RefazerTab(ttk.Frame):
         opcoes_envio.grid(row=4, column=0, sticky='ew', padx=12, pady=(0, 5))
         ttk.Checkbutton(opcoes_envio, text='Enviar os PDFs preparados às impressoras após o refazer',
                         variable=self.enviar_refazer_var, bootstyle='info-square-toggle').pack(side='left')
-        ttk.Label(opcoes_envio, text='(1 trabalho por PDF final; quantidade é registrada no banco)',
+        ttk.Label(opcoes_envio, text='(capas repetidas no PDF conforme a quantidade)',
                   bootstyle=SECONDARY).pack(side='left', padx=12)
 
         # ================= ANDAMENTO (PROGRESSBAR) =================
@@ -7586,6 +7494,11 @@ class RefazerTab(ttk.Frame):
     def _executar_refazer_impl(self):
         self._finalizar_editor_refazer()
         try:
+            for iid in self.tree_edicao.get_children():
+                valores = self.tree_edicao.item(iid, "values")
+                if self._tipo_linha_refazer(iid) == "CAPA":
+                    if not str(valores[2]).isdecimal() or int(valores[2]) < 1:
+                        raise ValueError(f"{valores[0]}: informe uma quantidade de capas maior que zero.")
             plano_destinos = self._validar_destinos_refazer()
         except ValueError as exc:
             messagebox.showwarning('GPrint - Refazer: destino de impressão', str(exc), parent=self)
@@ -7595,8 +7508,7 @@ class RefazerTab(ttk.Frame):
                     f'Serão preparados e enviados {len(plano_destinos)} arquivo(s), '
                     'um trabalho LPR por PDF final.\n\n'
                     'Confirme se máquina e fila estão corretas.\n'
-                    'A quantidade informada no Refazer será registrada no banco, '
-                    'não como multiplicador do envio.', parent=self):
+                    'Cada PDF de capa terá a quantidade informada na sua linha.', parent=self):
                 return
         cliente = self.pasta_var.get()
         lote = self.subpasta_var.get()
@@ -7667,7 +7579,7 @@ class RefazerTab(ttk.Frame):
                 erro='' if destino else 'Arquivo original nao localizado ou copia falhou')
 
             if tipo_atual == "CAPA" and destino and destino.lower().endswith('.pdf'):
-                copias_capas.append((destino, os.path.splitext(nome)[0], setor, plano_destinos.get(iid), registro_id))
+                copias_capas.append((destino, os.path.splitext(nome)[0], setor, plano_destinos.get(iid), registro_id, int(qtd)))
             elif tipo_atual == "MIOLO" and destino and destino.lower().endswith('.pdf'):
                 miolos_info.append((
                     destino,
@@ -7711,13 +7623,18 @@ class RefazerTab(ttk.Frame):
             self.progress["value"] = 0
             self.progress_label.config(text=f"Capas: 0/{total_capas}")
             self.update_idletasks()
-            for idx, (destino, nome_base, setor_capa, destino_impressao, registro_id) in enumerate(copias_capas, start=1):
+            for idx, (destino, nome_base, setor_capa, destino_impressao, registro_id, quantidade) in enumerate(copias_capas, start=1):
                 try:
                     self.adicionar_marca_dagua(destino, f'LOTE {self._identificacao_lote(lote)} - {nome_base}')
                     if setor_capa == "PROBLEMA DE FONTE":
                         temp_outlines = os.path.splitext(destino)[0] + '_TEMP_OUTLINES.pdf'
                         self.converter_em_contornos(destino, temp_outlines)
                         os.replace(temp_outlines, destino)
+                    if quantidade > 1:
+                        with tempfile.TemporaryDirectory(prefix="capas_", dir=os.path.dirname(destino)) as pasta:
+                            agrupado = os.path.join(pasta, "capas.pdf")
+                            gprint_mesclar_capas([(destino, quantidade)], agrupado)
+                            os.replace(agrupado, destino)
                     self.repositorio_refazer.registrar(
                         id=registro_id, montagem_status='PREPARADO', pdf_resultado=destino)
                     processados += 1
