@@ -3706,162 +3706,159 @@ class MioloTab(ttk.Frame):
             else f"{len(arquivos)} TXT selecionados | {len(self.processos)} processos"
         ))
 
-def get_border_pixmap(page, rect, zoom=2.0):
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, clip=rect)
-    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-    return img
-def espelhar_borda(img, flip_horizontal=False, flip_vertical=False):
+def inserir_recorte_pdf_espelhado(origem, saida, recorte, destino, rotate=0,
+                                  flip_horizontal=False, flip_vertical=False):
+    """Copia conteúdo PDF vetorial e reflete a matriz, sem rasterizar as cores."""
+    existentes = {
+        item[0] for item in saida.get_xobjects()
+        if len(item) >= 3 and item[2] == 0
+    }
+    saida.show_pdf_page(
+        destino,
+        origem.parent,
+        origem.number,
+        clip=recorte,
+        rotate=rotate % 360,
+        overlay=True,
+    )
+
+    novos = [
+        item for item in saida.get_xobjects()
+        if len(item) >= 4 and item[2] == 0 and item[0] not in existentes
+    ]
+    if not novos:
+        raise RuntimeError("Não foi possível localizar o recorte vetorial da sangria.")
+
+    xref = novos[-1][0]
+    tipo, matriz_txt = saida.parent.xref_get_key(xref, "Matrix")
+    numeros = [float(n) for n in re.findall(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?", matriz_txt)]
+    if tipo != "array" or len(numeros) != 6:
+        raise RuntimeError("A matriz do recorte vetorial está em formato inesperado.")
+
+    a, b, c, d, e, f = numeros
     if flip_horizontal:
-        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+        # Reflexão no eixo vertical central do retângulo de destino.
+        a, c, e = -a, -c, destino.x0 + destino.x1 - e
     if flip_vertical:
-        img = img.transpose(Image.FLIP_TOP_BOTTOM)
-    return img
-def rotacionar_imagem(img, angle):
-    """Rotaciona a imagem PIL por um ângulo múltiplo de 90°."""
-    if angle == 90:
-        return img.transpose(Image.ROTATE_90)
-    elif angle == 180:
-        return img.transpose(Image.ROTATE_180)
-    elif angle == 270:
-        return img.transpose(Image.ROTATE_270)
-    return img
-def inserir_imagem_na_pagina(page, img, rect):
-    with io.BytesIO() as output:
-        img.save(output, format='PNG')
-        data = output.getvalue()
-    page.insert_image(rect, stream=data)
-def desenhar_marcas(page, trim, tam, gap=2*MM, lado=None):
-    x0, y0, x1, y1 = trim
-    s = page.new_shape()
-    if lado in (None, 'esquerda'):
-        s.draw_line((x0, y0 - tam), (x0, y0 - gap))
-        s.draw_line((x0 - tam, y0), (x0 - gap, y0))
-        s.draw_line((x0, y1 + tam), (x0, y1 + gap))
-        s.draw_line((x0 - tam, y1), (x0 - gap, y1))
-    if lado in (None, 'direita'):
-        s.draw_line((x1, y0 - tam), (x1, y0 - gap))
-        s.draw_line((x1 + tam, y0), (x1 + gap, y0))
-        s.draw_line((x1, y1 + tam), (x1, y1 + gap))
-        s.draw_line((x1 + tam, y1), (x1 + gap, y1))
-    s.finish(width=0.5)
-    s.commit()
-def desenhar_marca_central_vertical(page, x, y0, y1, tam=5*MM, gap=2*MM):
-    s = page.new_shape()
-    s.draw_line((x, y0 - tam), (x, y0 - gap))
-    s.draw_line((x, y1 + tam), (x, y1 + gap))
-    s.finish(width=0.5)
-    s.commit()
+        # Reflexão no eixo horizontal central; converte Y da página para PDF.
+        b, d, f = -b, -d, 2 * saida.rect.height - destino.y0 - destino.y1 - f
+
+    matriz = "[{} {} {} {} {} {}]".format(*(f"{v:.10g}" for v in (a, b, c, d, e, f)))
+    saida.parent.xref_set_key(xref, "Matrix", matriz)
+
+
+
 def aplicar_sangria_espelhada_externa(page, nova, trim_original, destino, sangria_pt, bordas, rotate=0):
     """
-    Extensão de sangria com espelhamento externo, com suporte a rotação (0, 90, 180, 270).
-    Para rotate=180, as bordas e cantos são mapeados de forma invertida.
+    Cria a sangria espelhada copiando os vetores e imagens originais do PDF.
+    Assim, não renderiza os recortes em RGB/CMYK nem recalcula suas separações.
     """
-    zoom = 2.0
+    mapa_bordas = {
+        0:   {'top': 'top', 'bottom': 'bottom', 'left': 'left', 'right': 'right'},
+        90:  {'top': 'left', 'bottom': 'right', 'left': 'bottom', 'right': 'top'},
+        180: {'top': 'bottom', 'bottom': 'top', 'left': 'right', 'right': 'left'},
+        270: {'top': 'right', 'bottom': 'left', 'left': 'top', 'right': 'bottom'}
+    }
+    mapa = mapa_bordas.get(rotate % 360, mapa_bordas[0])
 
-    # Mapeamento de bordas para rotação 180°
-    mapa_bordas = {}
-    if rotate == 180:
-        mapa_bordas = {'top': 'bottom', 'bottom': 'top', 'left': 'right', 'right': 'left'}
-
-    # Processa cada borda solicitada
-    for borda_destino in bordas:
-        # Determina qual borda da página original deve ser usada
-        borda_orig = mapa_bordas.get(borda_destino, borda_destino)
-
-        # Define retângulo de extração e flips de espelhamento conforme a borda original
+    for borda_dest in bordas:
+        borda_orig = mapa[borda_dest]
         if borda_orig == 'top':
             rect = fitz.Rect(trim_original.x0, trim_original.y0,
                              trim_original.x1, trim_original.y0 + sangria_pt)
-            flip_v, flip_h = True, False
         elif borda_orig == 'bottom':
             rect = fitz.Rect(trim_original.x0, trim_original.y1 - sangria_pt,
                              trim_original.x1, trim_original.y1)
-            flip_v, flip_h = True, False
         elif borda_orig == 'left':
             rect = fitz.Rect(trim_original.x0, trim_original.y0,
                              trim_original.x0 + sangria_pt, trim_original.y1)
-            flip_v, flip_h = False, True
         elif borda_orig == 'right':
             rect = fitz.Rect(trim_original.x1 - sangria_pt, trim_original.y0,
                              trim_original.x1, trim_original.y1)
-            flip_v, flip_h = False, True
         else:
             continue
 
-        img = get_border_pixmap(page, rect, zoom)
-
-        # Aplica rotação se necessário (depois da extração)
-        if rotate != 0:
-            img = rotacionar_imagem(img, rotate)
-
-        # Espelha conforme a borda original
-        img = espelhar_borda(img, flip_horizontal=flip_h, flip_vertical=flip_v)
-        img = img.resize((int(rect.width), int(rect.height)), Image.Resampling.LANCZOS)
-
-        # Define o retângulo de destino na página nova (já considera a orientação final)
-        if borda_destino == 'top':
+        if borda_dest == 'top':
             dest_rect = fitz.Rect(destino.x0, destino.y0 - sangria_pt, destino.x1, destino.y0)
-        elif borda_destino == 'bottom':
+            flip_h, flip_v = False, True
+        elif borda_dest == 'bottom':
             dest_rect = fitz.Rect(destino.x0, destino.y1, destino.x1, destino.y1 + sangria_pt)
-        elif borda_destino == 'left':
+            flip_h, flip_v = False, True
+        elif borda_dest == 'left':
             dest_rect = fitz.Rect(destino.x0 - sangria_pt, destino.y0, destino.x0, destino.y1)
-        elif borda_destino == 'right':
+            flip_h, flip_v = True, False
+        elif borda_dest == 'right':
             dest_rect = fitz.Rect(destino.x1, destino.y0, destino.x1 + sangria_pt, destino.y1)
+            flip_h, flip_v = True, False
         else:
             continue
 
-        inserir_imagem_na_pagina(nova, img, dest_rect)
+        inserir_recorte_pdf_espelhado(
+            page, nova, rect, dest_rect, rotate=rotate,
+            flip_horizontal=flip_h, flip_vertical=flip_v,
+        )
 
-    # --- Cantos ---
-    mapa_cantos = {}
-    if rotate == 180:
-        mapa_cantos = {
-            ('top', 'left'): ('bottom', 'right'),
-            ('top', 'right'): ('bottom', 'left'),
-            ('bottom', 'left'): ('top', 'right'),
-            ('bottom', 'right'): ('top', 'left')
-        }
+    cantos = [
+        ('top', 'left'),
+        ('top', 'right'),
+        ('bottom', 'left'),
+        ('bottom', 'right')
+    ]
+    for b1, b2 in cantos:
+        if b1 in bordas and b2 in bordas:
+            borda_orig1 = mapa[b1]
+            borda_orig2 = mapa[b2]
+            lados_originais = {borda_orig1, borda_orig2}
+            x0 = trim_original.x0 if 'left' in lados_originais else trim_original.x1 - sangria_pt
+            x1 = x0 + sangria_pt
+            y0 = trim_original.y0 if 'top' in lados_originais else trim_original.y1 - sangria_pt
+            y1 = y0 + sangria_pt
+            rect = fitz.Rect(x0, y0, x1, y1)
 
-    combinacoes = [('top','left'), ('top','right'), ('bottom','left'), ('bottom','right')]
-    for borda1, borda2 in combinacoes:
-        if borda1 in bordas and borda2 in bordas:
-            b1_orig, b2_orig = mapa_cantos.get((borda1, borda2), (borda1, borda2))
-
-            if b1_orig == 'top' and b2_orig == 'left':
-                rect = fitz.Rect(trim_original.x0, trim_original.y0,
-                                 trim_original.x0 + sangria_pt, trim_original.y0 + sangria_pt)
-            elif b1_orig == 'top' and b2_orig == 'right':
-                rect = fitz.Rect(trim_original.x1 - sangria_pt, trim_original.y0,
-                                 trim_original.x1, trim_original.y0 + sangria_pt)
-            elif b1_orig == 'bottom' and b2_orig == 'left':
-                rect = fitz.Rect(trim_original.x0, trim_original.y1 - sangria_pt,
-                                 trim_original.x0 + sangria_pt, trim_original.y1)
-            elif b1_orig == 'bottom' and b2_orig == 'right':
-                rect = fitz.Rect(trim_original.x1 - sangria_pt, trim_original.y1 - sangria_pt,
-                                 trim_original.x1, trim_original.y1)
-            else:
-                continue
-
-            img = get_border_pixmap(page, rect, zoom)
-            if rotate != 0:
-                img = rotacionar_imagem(img, rotate)
-            # Cantos sempre usam ambos os flips
-            img = espelhar_borda(img, flip_horizontal=True, flip_vertical=True)
-            img = img.resize((int(sangria_pt), int(sangria_pt)), Image.Resampling.LANCZOS)
-
-            if borda1 == 'top' and borda2 == 'left':
+            if b1 == 'top' and b2 == 'left':
                 dest_rect = fitz.Rect(destino.x0 - sangria_pt, destino.y0 - sangria_pt, destino.x0, destino.y0)
-            elif borda1 == 'top' and borda2 == 'right':
+            elif b1 == 'top' and b2 == 'right':
                 dest_rect = fitz.Rect(destino.x1, destino.y0 - sangria_pt, destino.x1 + sangria_pt, destino.y0)
-            elif borda1 == 'bottom' and borda2 == 'left':
+            elif b1 == 'bottom' and b2 == 'left':
                 dest_rect = fitz.Rect(destino.x0 - sangria_pt, destino.y1, destino.x0, destino.y1 + sangria_pt)
-            elif borda1 == 'bottom' and borda2 == 'right':
+            elif b1 == 'bottom' and b2 == 'right':
                 dest_rect = fitz.Rect(destino.x1, destino.y1, destino.x1 + sangria_pt, destino.y1 + sangria_pt)
             else:
                 continue
 
-            inserir_imagem_na_pagina(nova, img, dest_rect)
+            inserir_recorte_pdf_espelhado(
+                page, nova, rect, dest_rect, rotate=rotate,
+                flip_horizontal=True, flip_vertical=True,
+            )
+
+
+def desenhar_marcas(page, trim, tam, gap=2*MM, lado=None):
+    """Desenha marcas de corte vetoriais ao redor do retângulo de corte."""
+    x0, y0, x1, y1 = trim
+    shape = page.new_shape()
+    if lado in (None, 'esquerda'):
+        shape.draw_line((x0, y0 - tam), (x0, y0 - gap))
+        shape.draw_line((x0 - tam, y0), (x0 - gap, y0))
+        shape.draw_line((x0, y1 + tam), (x0, y1 + gap))
+        shape.draw_line((x0 - tam, y1), (x0 - gap, y1))
+    if lado in (None, 'direita'):
+        shape.draw_line((x1, y0 - tam), (x1, y0 - gap))
+        shape.draw_line((x1 + tam, y0), (x1 + gap, y0))
+        shape.draw_line((x1, y1 + tam), (x1, y1 + gap))
+        shape.draw_line((x1 + tam, y1), (x1 + gap, y1))
+    shape.finish(width=0.5)
+    shape.commit()
+
+
+def desenhar_marca_central_vertical(page, x, y0, y1, tam=5*MM, gap=2*MM):
+    """Desenha as marcas de dobra no centro, acima e abaixo da página."""
+    shape = page.new_shape()
+    shape.draw_line((x, y0 - tam), (x, y0 - gap))
+    shape.draw_line((x, y1 + tam), (x, y1 + gap))
+    shape.finish(width=0.5)
+    shape.commit()
+
+
 def pagina_tem_conteudo(page):
     if page.get_contents(): return True
     if page.get_text("text").strip(): return True
