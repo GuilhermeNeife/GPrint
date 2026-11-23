@@ -5729,51 +5729,98 @@ class Application:
     
     def mostrar_sobre(self):
         import tkinter as tk
+        from PIL import Image, ImageTk
 
         about_window = tk.Toplevel(self.root)
         about_window.title("Sobre o GPrint")
-        about_window.geometry("450x350")
+        largura, altura = 460, 540
+        about_window.geometry(f"{largura}x{altura}")
         about_window.resizable(False, False)
-        about_window.configure(bg="#0f172a")
+        about_window.configure(bg="#101a2d")
+        about_window.transient(self.root)
+        gprint_aplicar_icone(about_window)
 
-        # Centraliza em relacao ao GPrint (sem alterar botoes/menus).
-        gprint_centralizar_janela(about_window, self.root, 450, 350)
+        # Mostra a janela centralizada na tela, independentemente da posicao principal.
+        gprint_centralizar_janela(about_window, None, largura, altura)
 
-        main = tk.Frame(about_window, bg="#0f172a", padx=30, pady=20)
+        main = tk.Frame(about_window, bg="#101a2d", padx=34, pady=24)
         main.pack(fill="both", expand=True)
 
-        tk.Label(main, text="GPrint", font=("Segoe UI", 18, "bold"),
-                bg="#0f172a", fg="#f8fafc").pack(pady=(10, 0))
+        tk.Frame(main, bg="#e11d2e", height=4).pack(fill="x", pady=(0, 18))
 
-        versao_badge = tk.Label(main, text="  v14.0  ", font=("Segoe UI", 10, "bold"),
-                                bg="#3b82f6", fg="white", padx=8, pady=2)
-        versao_badge.pack(pady=(4, 12))
+        # Tenta o logo configurado no GPrint e depois os recursos locais do EXE/script.
+        pasta_recursos = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        caminhos_logo = (
+            getattr(self, "logo_path", ""),
+            os.path.join(pasta_recursos, "GPrint.png"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "GPrint.png"),
+        )
+        logo = None
+        for caminho in caminhos_logo:
+            if not caminho or not os.path.isfile(caminho):
+                continue
+            try:
+                with Image.open(caminho) as imagem:
+                    imagem = imagem.convert("RGBA")
+                    imagem.thumbnail((180, 180), Image.Resampling.LANCZOS)
+                    logo = ImageTk.PhotoImage(imagem.copy())
+                break
+            except (OSError, tk.TclError) as erro:
+                logging.warning("Não foi possível carregar o logo do Sobre: %s", erro)
 
-        tk.Frame(main, height=1, bg="#334155").pack(fill="x", pady=10)
+        if logo:
+            logo_label = tk.Label(main, image=logo, bg="#101a2d", borderwidth=0)
+            logo_label.image = logo
+            logo_label.pack(pady=(2, 8))
+        else:
+            marca = tk.Label(main, text="G", font=("Segoe UI", 48, "bold"),
+                             bg="#101a2d", fg="#f8fafc", width=3, height=2)
+            marca.pack(pady=(0, 8))
 
-        tk.Label(main, text="Automação de processamento e envio\nde arquivos para POD com eficiência.",
-                font=("Segoe UI", 10), bg="#0f172a", fg="#cbd5e1", justify="center").pack(pady=5)
+        tk.Label(main, text="GPrint", font=("Segoe UI", 25, "bold"),
+                 bg="#101a2d", fg="#f8fafc").pack(pady=(0, 2))
+        tk.Label(main, text="Montagem e fluxo de produção gráfica",
+                 font=("Segoe UI", 10), bg="#101a2d", fg="#8ebcff").pack()
 
-        dev_frame = tk.Frame(main, bg="#0f172a")
-        dev_frame.pack(pady=20)
-        tk.Label(dev_frame, text="Desenvolvido por", font=("Segoe UI", 9),
-                bg="#0f172a", fg="#94a3b8").pack()
-        tk.Label(dev_frame, text="Guilherme Neife", font=("Segoe UI", 13, "bold"),
-                bg="#0f172a", fg="#facc15").pack()
+        versao_badge = tk.Label(main, text="VERSÃO 14.0", font=("Segoe UI", 9, "bold"),
+                                bg="#1d4ed8", fg="#ffffff", padx=13, pady=6)
+        versao_badge.pack(pady=(14, 18))
 
-        tk.Label(main, text="© 2026 • Todos os direitos reservados", font=("Segoe UI", 7),
-                bg="#0f172a", fg="#64748b").pack(side="bottom", pady=(5, 0))
+        cartao = tk.Frame(main, bg="#17243a", padx=18, pady=15,
+                          highlightthickness=1, highlightbackground="#263954")
+        cartao.pack(fill="x", pady=(0, 15))
+        tk.Label(cartao,
+                 text="Automação de montagem, identificação e envio\nde arquivos para produção POD.",
+                 font=("Segoe UI", 10), bg="#17243a", fg="#d7e1ef",
+                 justify="center", wraplength=340).pack()
 
-        btn_fechar = tk.Button(main, text="✕  Fechar", font=("Segoe UI", 10, "bold"),
-                            bg="#1e293b", fg="#f8fafc", activebackground="#334155",
-                            activeforeground="white", relief="flat", bd=0, padx=20, pady=6,
-                            cursor="hand2", command=about_window.destroy)
-        btn_fechar.pack(pady=(10, 5))
+        tk.Label(main, text="Desenvolvido por", font=("Segoe UI", 9),
+                 bg="#101a2d", fg="#91a0b5").pack(pady=(2, 1))
+        tk.Label(main, text="Guilherme Neife", font=("Segoe UI", 13, "bold"),
+                 bg="#101a2d", fg="#f5c451").pack()
 
-        def on_enter(e): btn_fechar.config(bg="#334155")
-        def on_leave(e): btn_fechar.config(bg="#1e293b")
+        tk.Label(main, text="© 2026  •  Todos os direitos reservados",
+                 font=("Segoe UI", 8), bg="#101a2d", fg="#64748b").pack(
+                     side="bottom", pady=(10, 0))
+
+        btn_fechar = tk.Button(main, text="Fechar", font=("Segoe UI", 10, "bold"),
+                               bg="#243550", fg="#f8fafc", activebackground="#344967",
+                               activeforeground="white", relief="flat", bd=0,
+                               padx=28, pady=9, cursor="hand2",
+                               command=about_window.destroy)
+        btn_fechar.pack(pady=(15, 2))
+
+        def on_enter(_event):
+            btn_fechar.config(bg="#344967")
+
+        def on_leave(_event):
+            btn_fechar.config(bg="#243550")
+
         btn_fechar.bind("<Enter>", on_enter)
         btn_fechar.bind("<Leave>", on_leave)
+        about_window.bind("<Escape>", lambda _event: about_window.destroy())
+        about_window.grab_set()
+        about_window.focus_set()
 def carregar_configuracoes():
     try:
         if os.path.exists(CONFIG_FILE):
