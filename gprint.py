@@ -5437,9 +5437,10 @@ class Application:
         montados = 0
         enviados = 0
         try:
-            for txt in arquivos:
+            for numero_txt, txt in enumerate(arquivos, start=1):
                 try:
                     for linha in ler_arquivo_txt(txt, propagar_erro=True):
+                        linha["TXT_NUMERO"] = numero_txt
                         restantes[(txt, linha['LINHA'])] = linha
                 except (OSError, UnicodeError) as erro:
                     falhas_txt.append(f"{txt}: {erro}")
@@ -5466,7 +5467,8 @@ class Application:
                         shutil.copy2(origem, entrada)
                         marcado = adicionar_marca_dagua(
                             entrada, linha['LAMINAÇÃO'], linha['CODIGOACAB'], linha['IDENTIFIC'],
-                            formato, propagar_erro=True)
+                            formato, propagar_erro=True,
+                            origem_txt=f"TXT{linha['TXT_NUMERO']:02d}_L{linha['LINHA']}")
                         if not marcado:
                             raise RuntimeError("A marca d’água não gerou um PDF.")
                         grupo = grupos.setdefault((chave[0], linha['IDENTIFIC'], fila), [])
@@ -5921,10 +5923,14 @@ def referencia_capa(pagina):
     return area if conteudo.is_empty else conteudo
 
 
-def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific, filacolor, *, propagar_erro=False):
+def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific, filacolor, *, propagar_erro=False, origem_txt=""):
     try:
         doc = fitz.open(pdf_path)
         nome_arquivo = os.path.splitext(os.path.basename(pdf_path))[0]
+
+        texto_marca = f"{nome_arquivo} - {identific}"
+        if origem_txt:
+            texto_marca = f"{origem_txt} - {texto_marca}"
 
         cor_marca = CONFIG['cor_fosco'] if laminacao.upper() == "FOSCO" else CONFIG['cor_brilho']
 
@@ -6021,7 +6027,7 @@ def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific, filacolor,
             )
             nova_pagina.insert_textbox(
                 posicao_marca,
-                f"{nome_arquivo} - {identific}",
+                texto_marca,
                 fontsize=CONFIG['tamanho_fonte'],
                 color=cor_marca,
                 fontname=CONFIG['fonte'],
