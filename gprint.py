@@ -5923,7 +5923,11 @@ def referencia_capa(pagina):
     return area if conteudo.is_empty else conteudo
 
 
-def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific, filacolor, *, propagar_erro=False, origem_txt=""):
+def adicionar_marca_dagua(
+    pdf_path, laminacao, codigoacab, identific, filacolor, *,
+    propagar_erro=False, origem_txt="", texto_refazer=None, caminho_saida=None,
+):
+    doc = novo_doc = None
     try:
         doc = fitz.open(pdf_path)
         nome_arquivo = os.path.splitext(os.path.basename(pdf_path))[0]
@@ -5957,6 +5961,16 @@ def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific, filacolor,
             "Capas_32X48": (48, 32)
         }
 
+        if texto_refazer is not None:
+            fila_base = filacolor.strip().upper().removesuffix("_FV")
+            filacolor = next(
+                (formato for formato in formatos_cm if formato.upper() == fila_base),
+                "Capas_32X60",
+            )
+            texto_marca = texto_refazer
+            cor_marca = (1, 0, 0)
+            recuo_topo_pt = 0.4 * 28.3465
+
         mm = 72 / 25.4
         novo_doc = fitz.open()
 
@@ -5966,7 +5980,8 @@ def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific, filacolor,
             # O fluxo de capa pronta é o original de 32 × 60, incluindo
             # o recorte de 20 mm por lado e 40 mm no topo para a fila 28 × 56.
             capa_pronta = (
-                filacolor in ("Capas_32X60", "Capas_28X56")
+                texto_refazer is None
+                and filacolor in ("Capas_32X60", "Capas_28X56")
                 and abs(largura_pt / mm - 600) <= 5
                 and abs(altura_pt / mm - 320) <= 5
             )
@@ -5994,6 +6009,12 @@ def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific, filacolor,
 
             if not capa_pronta:
                 referencia = referencia_capa(pagina) * para_visual
+                if texto_refazer is not None and referencia.width - visivel.width > 0.01 * mm:
+                    raise ValueError(
+                        f"Página {pagina.number + 1}: a área da capa tem "
+                        f"{referencia.width / mm:.2f} mm de largura e excede "
+                        f"os {visivel.width / mm:.2f} mm da folha."
+                    )
                 x = (visivel.width - referencia.x0 - referencia.x1) / 2
                 y_maximo = visivel.y1 - referencia.y1
                 y = y_maximo - 10 * mm
@@ -6025,7 +6046,7 @@ def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific, filacolor,
             posicao_marca = fitz.Rect(
                 x_marca, y0_marca, x_marca + largura_marca, y0_marca + altura_caixa_texto
             )
-            nova_pagina.insert_textbox(
+            restante = nova_pagina.insert_textbox(
                 posicao_marca,
                 texto_marca,
                 fontsize=CONFIG['tamanho_fonte'],
@@ -6033,12 +6054,14 @@ def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific, filacolor,
                 fontname=CONFIG['fonte'],
                 align=1
             )
+            if texto_refazer is not None and restante < 0:
+                raise ValueError(f"Página {pagina.number + 1}: a identificação não cabe na folha.")
 
         # Salva o documento final
-        novo_caminho = os.path.splitext(pdf_path)[0] + "_marcado.pdf"
+        novo_caminho = caminho_saida if caminho_saida is not None else (
+            os.path.splitext(pdf_path)[0] + "_marcado.pdf"
+        )
         novo_doc.save(novo_caminho)
-        novo_doc.close()
-        doc.close()
         return novo_caminho
 
     except Exception as e:
@@ -6047,6 +6070,11 @@ def adicionar_marca_dagua(pdf_path, laminacao, codigoacab, identific, filacolor,
             raise
         messagebox.showerror("Erro", f"Falha ao montar {os.path.basename(pdf_path)}\n\n{e}")
         return None
+    finally:
+        if novo_doc is not None:
+            novo_doc.close()
+        if doc is not None:
+            doc.close()
 # --- INICIALIZAÇÃO ---
 CONFIG = carregar_configuracoes()
 # Equipamentos e filas são administrados exclusivamente em equipamentos.db.
@@ -7167,6 +7195,7 @@ class RefazerTab(ttk.Frame):
             acabamento = 'Grampo' if re.search(r'\b(?:grampo|grampeado)\b', nome, re.IGNORECASE) else 'Brochura'
             lista.append({
                 'nome': nome, 'tipo': tipo, 'linha': (), 'codigo': codigo,
+                'origem_pdf': True,
                 'caminho_fisico': os.path.join(pasta, nome),
                 'acabamento': acabamento,
                 'formato_miolo': formato.group(0) if formato else None,
@@ -8264,7 +8293,11 @@ class RefazerTab(ttk.Frame):
                 erro='' if destino else 'Arquivo original nao localizado ou copia falhou')
 
             if tipo_atual == "CAPA" and destino and destino.lower().endswith('.pdf'):
-                copias_capas.append((destino, os.path.splitext(nome)[0], tratamento, destino_impressao, registro_id, int(qtd), lote))
+                copias_capas.append((
+                    destino, os.path.splitext(nome)[0], tratamento,
+                    destino_impressao, registro_id, int(qtd), lote,
+                    item_original.get('origem_pdf', False), str(valores[5]),
+                ))
             elif tipo_atual == "MIOLO" and destino and destino.lower().endswith('.pdf'):
                 miolos_info.append((
                     destino,
@@ -8293,16 +8326,27 @@ class RefazerTab(ttk.Frame):
                 self.copiar_para_refazer(origem, pasta_lote, tipo)
                 destinos_ocupados.add(chave_destino)
 
-        # Etapa 2: marca d'água nas capas
+        # Etapa 2: montagem e identificação das capas
         total_capas = len(copias_capas)
         if total_capas > 0:
             self.progress["maximum"] = total_capas
             self.progress["value"] = 0
             self.progress_label.config(text=f"Capas: 0/{total_capas}")
             self.update_idletasks()
-            for idx, (destino, nome_base, tratamento, destino_impressao, registro_id, quantidade, lote) in enumerate(copias_capas, start=1):
+            for idx, (destino, nome_base, tratamento, destino_impressao, registro_id,
+                      quantidade, lote, origem_pdf, fila) in enumerate(copias_capas, start=1):
                 try:
-                    self.adicionar_marca_dagua(destino, f'LOTE {self._identificacao_lote(lote)} - {nome_base}')
+                    texto_marca = f'LOTE {self._identificacao_lote(lote)} - {nome_base}'
+                    if origem_pdf:
+                        with tempfile.TemporaryDirectory(prefix="capas_", dir=os.path.dirname(destino)) as pasta:
+                            montado = os.path.join(pasta, "capa.pdf")
+                            adicionar_marca_dagua(
+                                destino, "", "", "", fila, propagar_erro=True,
+                                texto_refazer=texto_marca, caminho_saida=montado,
+                            )
+                            os.replace(montado, destino)
+                    else:
+                        self.adicionar_marca_dagua(destino, texto_marca)
                     if tratamento == "curvas":
                         temp_outlines = os.path.splitext(destino)[0] + '_TEMP_OUTLINES.pdf'
                         self.converter_em_contornos(destino, temp_outlines)
