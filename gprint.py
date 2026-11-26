@@ -851,7 +851,8 @@ class GPrintIndicadoresAndamento:
 # CADASTRO CENTRAL DE EQUIPAMENTOS E FILAS (SQLite independente do historico)
 # ============================================================================
 GPRINT_MODOS_PASTAS_REFAZER = {
-    'clientes': 'Pastas de clientes',
+    'clientes': 'Clientes com planilhas',
+    'clientes_pdf': 'Clientes com PDFs',
     'planilha': 'Lotes com planilha',
     'pdf': 'Lotes com PDFs',
     'uiclap_legado': 'Planilha UICLAP antiga',
@@ -918,6 +919,7 @@ class GPrintEquipamentosRepository:
         '''Cria apenas equipamentos.db se a pasta central ja estiver online.'''
         with self._conectar() as conn:
             with conn:
+                conn.execute('BEGIN IMMEDIATE')
                 conn.execute('''CREATE TABLE IF NOT EXISTS equipamentos (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     nome TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -943,12 +945,22 @@ class GPrintEquipamentosRepository:
                     criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )''')
 
+                schema_pastas = conn.execute(
+                    "SELECT sql FROM sqlite_schema WHERE type='table' AND name='pastas_clientes_refazer'"
+                ).fetchone()
+                migrar_pastas = schema_pastas is not None and "'clientes_pdf'" not in schema_pastas['sql']
+                if migrar_pastas:
+                    conn.execute('ALTER TABLE pastas_clientes_refazer RENAME TO pastas_clientes_refazer_anterior')
                 conn.execute("""CREATE TABLE IF NOT EXISTS pastas_clientes_refazer (
                     slot INTEGER PRIMARY KEY CHECK(slot BETWEEN 0 AND 5),
                     nome TEXT NOT NULL,
                     caminho TEXT NOT NULL,
-                    modo TEXT NOT NULL CHECK(modo IN ('clientes', 'planilha', 'pdf', 'uiclap_legado'))
+                    modo TEXT NOT NULL CHECK(modo IN ('clientes', 'clientes_pdf', 'planilha', 'pdf', 'uiclap_legado'))
                 )""")
+                if migrar_pastas:
+                    conn.execute("""INSERT INTO pastas_clientes_refazer(slot, nome, caminho, modo)
+                                    SELECT slot, nome, caminho, modo FROM pastas_clientes_refazer_anterior""")
+                    conn.execute('DROP TABLE pastas_clientes_refazer_anterior')
                 conn.executemany(
                     'INSERT OR IGNORE INTO pastas_clientes_refazer(slot, nome, caminho, modo) VALUES (?, ?, ?, ?)',
                     GPRINT_PASTAS_REFAZER_INICIAIS if pastas_iniciais
@@ -1016,7 +1028,7 @@ class GPrintEquipamentosRepository:
             caminho = ntpath.normpath(caminho)
             if not ntpath.splitdrive(caminho)[0] or not ntpath.isabs(caminho):
                 raise ValueError(f'{nome or "Pasta adicional"}: informe um caminho completo de rede ou disco.')
-            if modo not in GPRINT_MODOS_PASTAS_REFAZER or (slot == 0 and modo != 'clientes'):
+            if modo not in GPRINT_MODOS_PASTAS_REFAZER or (slot == 0 and modo not in ('clientes', 'clientes_pdf')):
                 raise ValueError('Selecione uma estrutura válida para a pasta.')
             if not nome:
                 raise ValueError(f'Informe o nome da pasta no espaço {slot}.')
@@ -1836,8 +1848,9 @@ class GPrintCadastroPastasRefazerTab(ttk.Frame):
             ttk.Entry(self, textvariable=nome, width=16).grid(row=linha, column=1, sticky='ew', padx=(0, 8))
             ttk.Entry(self, textvariable=caminho, width=22).grid(row=linha, column=2, sticky='ew', padx=(0, 8))
             tipos = GPRINT_MODOS_PASTAS_REFAZER
-            ttk.Combobox(self, textvariable=modo, values=list(tipos.values()), width=20,
-                         state='readonly' if slot else 'disabled').grid(
+            estruturas = list(tipos.values()) if slot else [tipos['clientes'], tipos['clientes_pdf']]
+            ttk.Combobox(self, textvariable=modo, values=estruturas, width=22,
+                         state='readonly').grid(
                              row=linha, column=3, sticky='ew', padx=(0, 8))
             ttk.Button(self, text='Procurar…', command=lambda var=caminho: self._procurar(var)).grid(
                 row=linha, column=4, sticky='w')
@@ -5969,9 +5982,13 @@ def adicionar_marca_dagua(
             )
             texto_marca = texto_refazer
             cor_marca = (1, 0, 0)
-            recuo_topo_pt = 0.4 * 28.3465
 
         mm = 72 / 25.4
+        estilo_marca = dict(
+            fontsize=CONFIG['tamanho_fonte'], color=cor_marca,
+            fontname=CONFIG['fonte'], align=1,
+        )
+        altura_marca = None
         novo_doc = fitz.open()
 
         for pagina in doc:
@@ -6046,14 +6063,30 @@ def adicionar_marca_dagua(
             posicao_marca = fitz.Rect(
                 x_marca, y0_marca, x_marca + largura_marca, y0_marca + altura_caixa_texto
             )
-            restante = nova_pagina.insert_textbox(
-                posicao_marca,
-                texto_marca,
-                fontsize=CONFIG['tamanho_fonte'],
-                color=cor_marca,
-                fontname=CONFIG['fonte'],
-                align=1
-            )
+            if texto_refazer is not None:
+                # Mede o fim da última linha com a fonte e a quebra reais do PDF.
+                if altura_marca is None:
+                    with fitz.open() as medicao:
+                        amostra = medicao.new_page(width=visivel.width, height=visivel.height)
+                        sobra = amostra.insert_textbox(posicao_marca, texto_marca, **estilo_marca)
+                        if sobra < 0:
+                            raise ValueError("A identificação não cabe na caixa de texto.")
+                        altura_marca = max(
+                            limites[3] for tipo, limites in amostra.get_bboxlog() if tipo == "fill-text"
+                        ) - posicao_marca.y0
+
+                topo_arte = (referencia * deslocamento).y0
+                topo_marca = topo_arte - 4 * mm - altura_marca
+                if topo_marca < visivel.y0:
+                    topo_marca = visivel.y0
+                    logging.info(
+                        "Capa %s, página %d: espaço acima da arte insuficiente para o recuo de 4 mm da identificação.",
+                        nome_arquivo, pagina.number + 1,
+                    )
+                ajuste_y = topo_marca - y0_marca
+                posicao_marca += (0, ajuste_y, 0, ajuste_y)
+
+            restante = nova_pagina.insert_textbox(posicao_marca, texto_marca, **estilo_marca)
             if texto_refazer is not None and restante < 0:
                 raise ValueError(f"Página {pagina.number + 1}: a identificação não cabe na folha.")
 
@@ -6741,12 +6774,13 @@ def gprint_clientes_das_pastas(pastas):
             continue
         modo = pasta['modo']
         try:
-            if modo == 'clientes':
+            if modo in ('clientes', 'clientes_pdf'):
+                modo_lotes = 'pdf' if modo == 'clientes_pdf' else 'planilha'
                 with os.scandir(caminho) as entradas:
                     clientes = sorted(
                         ((e.name, e.path) for e in entradas if e.is_dir()),
                         key=lambda item: item[0].casefold())
-                candidatos.extend((nome, local, 'planilha', pasta, False) for nome, local in clientes)
+                candidatos.extend((nome, local, modo_lotes, pasta, False) for nome, local in clientes)
             else:
                 # Verifica o acesso sem carregar todos os lotes antecipadamente.
                 with os.scandir(caminho):
@@ -7173,20 +7207,21 @@ class RefazerTab(ttk.Frame):
         return self._clientes_por_pasta[cliente][0]
 
     def obter_lista_arquivos_da_pasta(self, pasta):
-        """UICLAP novo: PDFs na raiz do lote, sem depender de planilha."""
+        """Lista as capas e os miolos em PDF na pasta do lote."""
         lista = []
         with os.scandir(pasta) as entradas:
             nomes = sorted((e.name for e in entradas
                             if e.is_file() and e.name.lower().endswith('.pdf')),
                            key=str.casefold)
         for nome in nomes:
+            nome_base = os.path.splitext(nome)[0]
             tipo_match = re.search(r'(?:^|[\s_()\-])(capa|miolo)(?=$|[\s_()\-])',
-                                   os.path.splitext(nome)[0], re.IGNORECASE)
+                                   nome_base, re.IGNORECASE)
             if not tipo_match:
                 continue
             tipo = tipo_match.group(1).upper()
-            prefixo = nome[:tipo_match.start(1)].strip(' -_').casefold()
-            restante = nome[tipo_match.end(1):].lstrip(' -_')
+            prefixo = nome_base[:tipo_match.start(1)].strip(' -_').casefold()
+            restante = nome_base[tipo_match.end(1):].lstrip(' -_')
             codigo_match = re.match(r'(\d+)(?:v\d+)?(?=$|[\s_\-])', restante, re.IGNORECASE)
             codigo = codigo_match.group(1) if codigo_match else 'N/A'
             formato = re.search(r'(\d+(?:[.,]\d+)?)\s*[xX]\s*(\d+(?:[.,]\d+)?)', restante)
